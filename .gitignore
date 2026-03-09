@@ -3,3 +3,5 @@ __pycache__/
 *.pyo
 .venv311/
 .fingerflow_models/
+match_outputs/
+.venv/

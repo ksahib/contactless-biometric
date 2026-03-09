@@ -1,14 +1,21 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import json
 import os
 import sys
+import time
+import traceback
+from importlib import metadata as importlib_metadata
 from pathlib import Path
 from urllib import error as urlerror
 from urllib import request as urlrequest
+import pandas as pd
 import cv2
 import numpy as np
+import math
+from descriptor import MCCCylinder, MCCCell
 
 try:
     from rembg import new_session, remove
@@ -19,12 +26,15 @@ except Exception:
     _HAS_REMBG = False
 
 
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "0")
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
+os.environ.setdefault("TF_FORCE_GPU_ALLOW_GROWTH", "true")
+os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
 
 REPO_ROOT = Path(__file__).resolve().parent
 OUTPUT_NOBG_DIR = REPO_ROOT / "output_nobg"
 OUTPUT_CROPPED_DIR = REPO_ROOT / "output_cropped"
+MATCH_OUTPUTS_DIR = REPO_ROOT / "match_outputs"
 REMBG_MODEL = os.environ.get("FINGER_REMBG_MODEL", "u2netp")
 DEFAULT_ENHANCED_IMAGE = REPO_ROOT / "filtered_cropped.png"
 DEFAULT_MINUTIAE_JSON = REPO_ROOT / "fingerflow_minutiae.json"
@@ -64,6 +74,177 @@ FINGERFLOW_MODEL_SOURCES = {
 }
 
 _REMBG_SESSION = None
+_PIPELINE_TIMINGS: dict[str, float] = {}
+_PIPELINE_START = time.perf_counter()
+_EXTRACTOR_CACHE: dict[tuple[str, str, str, str], "Extractor"] = {}
+_MODEL_PATH_CACHE: dict[Path, tuple[Path, Path, Path, Path]] = {}
+
+
+def _installed_version(package_name: str) -> str | None:
+    try:
+        return importlib_metadata.version(package_name)
+    except Exception:
+        return None
+
+
+def _directml_diagnosis_message(tf_version: str) -> str:
+    if not sys.platform.startswith("win"):
+        return ""
+
+    plugin_version = _installed_version("tensorflow-directml-plugin")
+    if plugin_version:
+        return (
+            "Windows native TensorFlow>=2.11 is CPU-only; a DirectML plugin is installed "
+            f"(tensorflow-directml-plugin=={plugin_version}), but no TF GPU is visible. "
+            f"Verify plugin compatibility with TensorFlow {tf_version} in this same venv."
+        )
+
+    return (
+        "Windows native TensorFlow>=2.11 is CPU-only. Install TensorFlow-DirectML plugin or run under WSL2.\n"
+        "For DirectML, run:\n"
+        "  pip install tensorflow-directml-plugin\n"
+        "Then rerun:\n"
+        "  python -c \"import tensorflow as tf; print(tf.config.list_physical_devices('GPU'))\"\n"
+        "If no GPU is shown after install, install a DirectML-compatible TensorFlow build/version."
+    )
+
+
+def _log_tensorflow_environment() -> None:
+    try:
+        import tensorflow as tf
+    except Exception as exc:
+        print(f"TensorFlow import error while checking GPU diagnostics: {exc}", file=sys.stderr)
+        return
+
+    print(f"TensorFlow version: {getattr(tf, '__version__', 'unknown')}")
+    try:
+        print(f"TensorFlow built with CUDA: {tf.test.is_built_with_cuda()}")
+    except Exception:
+        pass
+    try:
+        print(f"TensorFlow built with GPU support: {tf.test.is_built_with_gpu_support()}")
+    except Exception:
+        pass
+    try:
+        print(f"TensorFlow build info: {tf.sysconfig.get_build_info()}")
+    except Exception:
+        pass
+
+    try:
+        gpus = tf.config.list_physical_devices("GPU")
+        logical = tf.config.list_logical_devices("GPU")
+        print(f"Visible TF physical GPU devices: {[str(device) for device in gpus]}")
+        print(f"Visible TF logical GPU devices: {[str(device) for device in logical]}")
+    except Exception as exc:
+        print(f"Error reading TensorFlow devices: {exc}", file=sys.stderr)
+
+    print(f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}")
+
+
+def _print_runtime_context() -> None:
+    print(f"Python executable: {sys.executable}")
+    print(f"Python version: {sys.version}")
+    try:
+        import site
+
+        print(f"site-packages: {', '.join(site.getsitepackages())}")
+        print(f"user site-packages: {site.getusersitepackages()}")
+        in_venv = sys.prefix != getattr(sys, "base_prefix", sys.prefix)
+        print(f"venv active: {in_venv}")
+        if not in_venv:
+            print(
+                "Warning: venv is not active. GPU packages installed in .venv may be ignored."
+                " Activate venv with: .\\.venv\\Scripts\\Activate.ps1",
+                file=sys.stderr,
+            )
+    except Exception:
+        pass
+
+
+def _ensure_tensorflow_gpu_available() -> None:
+    if os.environ.get("FINGERFLOW_ALLOW_CPU", "").lower() in {"1", "true", "yes", "on"}:
+        return
+
+    try:
+        import tensorflow as tf
+    except Exception as exc:
+        raise RuntimeError(f"TensorFlow import failed: {exc}") from exc
+
+    gpus = tf.config.list_physical_devices("GPU")
+    if not gpus:
+        _log_tensorflow_environment()
+        tf_version = getattr(tf, "__version__", "unknown")
+        platform_hint = []
+        if sys.platform.startswith("win"):
+            platform_hint.append(
+                "Windows TensorFlow wheels may be CPU-only for this TensorFlow version."
+            )
+
+        platform_hint_text = " ".join(platform_hint)
+
+        raise RuntimeError(
+            "No TensorFlow-visible GPU found. This run is configured for GPU-only."
+            f"{' ' + platform_hint_text if platform_hint_text else ''}"
+            f" {_directml_diagnosis_message(tf_version)}"
+            " Install/configure CUDA-enabled TensorFlow + NVIDIA drivers, and set"
+            " CUDA_VISIBLE_DEVICES to an available GPU, or set FINGERFLOW_ALLOW_CPU=1 to allow fallback."
+        )
+
+    for gpu in gpus:
+        try:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        except Exception:
+            pass
+
+
+def _record_timing(stage: str, start_time: float) -> None:
+    _PIPELINE_TIMINGS[stage] = time.perf_counter() - start_time
+
+
+def _format_timing_summary() -> str:
+    ordered_stages = (
+        "gpu_check",
+        "process_image",
+        "normalise_brightness",
+        "filter",
+        "model_load",
+        "extract_minutiae",
+        "fingerflow_total",
+        "total",
+    )
+    chunks = []
+    for stage in ordered_stages:
+        value = _PIPELINE_TIMINGS.get(stage)
+        if value is not None:
+            chunks.append(f"{stage}={value:.3f}s")
+    return ", ".join(chunks)
+
+
+def _configure_inference_toggles() -> None:
+    if getattr(_configure_inference_toggles, "_configured", False):
+        return
+    _configure_inference_toggles._configured = True
+    if os.environ.get("FINGERFLOW_DISABLE_TF_ONEDNN", "").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
+
+    enable_xla = os.environ.get("FINGERFLOW_ENABLE_XLA", "").lower()
+    if enable_xla not in {"1", "true", "yes", "on"}:
+        return
+
+    try:
+        import tensorflow as tf
+    except Exception:
+        return
+
+    try:
+        tf.config.optimizer.set_jit(True)
+    except Exception:
+        return
 
 
 def _install_numpy_lib_pad_compat() -> None:
@@ -125,6 +306,28 @@ def _install_scipy_signal_gaussian_compat() -> None:
         return
 
     signal.gaussian = windows.gaussian  # type: ignore[attr-defined]
+
+
+def _install_fingerflow_distance_compat() -> None:
+    try:
+        from fingerflow.extractor.MinutiaeNet.CoarseNet import minutiae_net_utils
+        from scipy.spatial import distance as spatial_distance
+    except Exception:
+        return
+
+    if getattr(minutiae_net_utils.distance, "_biometric_scalar_compat", False):
+        return
+
+    def _distance(y_true, y_pred, max_d=16, max_o=np.pi / 6):
+        d = spatial_distance.cdist(y_true[:, :2], y_pred[:, :2], "euclidean")
+        y_true_angles = np.reshape(y_true[:, 2], [-1, 1])
+        y_pred_angles = np.reshape(y_pred[:, 2], [1, -1])
+        o = np.abs(y_true_angles - y_pred_angles)
+        o = np.minimum(o, (2 * np.pi) - o)
+        return (d <= max_d) * (o <= max_o)
+
+    _distance._biometric_scalar_compat = True  # type: ignore[attr-defined]
+    minutiae_net_utils.distance = _distance  # type: ignore[assignment]
 
 
 def _disable_model_compile_on_load() -> None:
@@ -338,7 +541,6 @@ def _install_keras_tensor_math_compat() -> None:
 
 _install_conv2d_legacy_weights_compat()
 _install_lambda_output_shape_compat()
-_force_cpu_mode()
 _disable_model_compile_on_load()
 _normalize_optimizer_learning_rate_compat()
 _normalize_optimizer_constructor_args_compat()
@@ -347,13 +549,37 @@ _install_numpy_lib_pad_compat()
 _install_numpy_scalar_aliases_compat()
 _install_skimage_gaussian_compat()
 _install_scipy_signal_gaussian_compat()
+_configure_inference_toggles()
+_install_fingerflow_distance_compat()
 
 from fingerflow.extractor import Extractor
 
 def parse_args() -> argparse.Namespace:
+    if len(sys.argv) > 1 and sys.argv[1] == "match":
+        parser = argparse.ArgumentParser(
+            description="Match two fingerprint images with the MCC pipeline."
+        )
+        parser.add_argument("command", choices=["match"])
+        parser.add_argument("image_a", type=Path, help="Path to the first fingerprint image")
+        parser.add_argument("image_b", type=Path, help="Path to the second fingerprint image")
+        parser.add_argument(
+            "--method",
+            default="LSA-R",
+            choices=("LSS", "LSA", "LSS-R", "LSA-R"),
+            help="MCC consolidation method.",
+        )
+        parser.add_argument(
+            "--fingerflow-model-dir",
+            type=Path,
+            default=DEFAULT_FINGERFLOW_MODEL_DIR,
+            help="Directory to cache FingerFlow model files.",
+        )
+        return parser.parse_args()
+
     parser = argparse.ArgumentParser(
         description="Crop a finger to the distal phalanx and remove its background."
     )
+    parser.set_defaults(command="extract")
     parser.add_argument("input_image", type=Path, help="Path to the source finger image")
     parser.add_argument(
         "--fingerflow-model-dir",
@@ -620,14 +846,14 @@ def compute_distal_crop_bbox(mask: np.ndarray) -> tuple[int, int, int, int]:
     axis_u, axis_v, length_l, _ = estimate_finger_axis(contour)
     tip_center, tip_to_base = select_fingertip_end(contour, axis_u, axis_v, length_l)
 
-    width_near_tip = local_width_from_mask(mask, tip_center, tip_to_base, axis_v, length_l, 0.20)
-    width_stable = local_width_from_mask(mask, tip_center, tip_to_base, axis_v, length_l, 0.34)
-    distal_width = max(width_near_tip, 0.92 * width_stable)
+    width_near_tip = local_width_from_mask(mask, tip_center, tip_to_base, axis_v, length_l, 0.16)
+    width_stable = local_width_from_mask(mask, tip_center, tip_to_base, axis_v, length_l, 0.28)
+    distal_width = max(width_near_tip, 0.88 * width_stable)
 
-    inward_extension = min(0.66 * length_l, max(2.35 * distal_width, 0.50 * length_l))
-    outward_extension = 0.10 * length_l
+    inward_extension = min(0.58 * length_l, max(1.95 * distal_width, 0.44 * length_l))
+    outward_extension = min(0.07 * length_l, 0.32 * distal_width)
     half_width = 0.82 * distal_width
-    margin_px = max(20, int(round(0.10 * max(length_l, distal_width))))
+    margin_px = max(12, int(round(0.05 * max(length_l, distal_width))))
 
     outer_center = tip_center - (tip_to_base * outward_extension)
     inner_center = tip_center + (tip_to_base * inward_extension)
@@ -676,6 +902,7 @@ def save_png(path: Path, image: np.ndarray) -> None:
 
 
 def process_image(input_path: Path) -> tuple[Path, Path]:
+    start = time.perf_counter()
     full_bgr = load_bgr_image(input_path)
 
     coarse_mask = rembg_mask_from_bgr(full_bgr)
@@ -694,9 +921,11 @@ def process_image(input_path: Path) -> tuple[Path, Path]:
 
     save_png(cropped_path, cropped_bgr)
     save_png(nobg_path, cropped_rgba)
+    _record_timing("process_image", start)
     return nobg_path, cropped_path
 
 def normalise_brightness(input_path: Path, output_path: Path) -> None:
+    start = time.perf_counter()
     image = load_image_unchanged(input_path)
     if image.ndim == 2:
         img_grey = image
@@ -732,6 +961,7 @@ def normalise_brightness(input_path: Path, output_path: Path) -> None:
         output = cv2.cvtColor(masked_grey, cv2.COLOR_GRAY2BGRA)
         output[:, :, 3] = alpha
         cv2.imwrite(str(output_path), output)
+        _record_timing("normalise_brightness", start)
         return
 
     clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(4, 4))
@@ -739,8 +969,10 @@ def normalise_brightness(input_path: Path, output_path: Path) -> None:
     clahe2 = cv2.createCLAHE(clipLimit=1.0, tileGridSize=(10, 10))
     img_clahe = clahe2.apply(img_clahe)
     cv2.imwrite(str(output_path), img_clahe)
+    _record_timing("normalise_brightness", start)
 
 def filter(input_path: Path, output_path: Path) -> None:
+    start = time.perf_counter()
     image, mask, alpha = load_gray_and_mask(input_path)
     if not np.any(mask):
         raise RuntimeError("foreground mask is empty")
@@ -858,9 +1090,11 @@ def filter(input_path: Path, output_path: Path) -> None:
         output[:, :, 3] = alpha
         output[alpha == 0, :3] = 0
         cv2.imwrite(str(output_path), output)
+        _record_timing("filter", start)
         return
 
     cv2.imwrite(str(output_path), stitched)
+    _record_timing("filter", start)
     
 
 def _is_downloadable_model(path: Path) -> bool:
@@ -924,6 +1158,11 @@ def _ensure_model_file(model_name: str, model_dir: Path, filename: str, urls: tu
 
 def ensure_fingerflow_models(model_dir: Path) -> tuple[Path, Path, Path, Path]:
     model_dir = model_dir.expanduser().resolve()
+    cached_paths = _MODEL_PATH_CACHE.get(model_dir)
+    if cached_paths is not None:
+        if all(_is_downloadable_model(path) for path in cached_paths):
+            return cached_paths
+
     coarse = _ensure_model_file(
         "coarse",
         model_dir,
@@ -948,6 +1187,7 @@ def ensure_fingerflow_models(model_dir: Path) -> tuple[Path, Path, Path, Path]:
         FINGERFLOW_MODEL_SOURCES["core"]["filename"],
         FINGERFLOW_MODEL_SOURCES["core"]["urls"],
     )
+    _MODEL_PATH_CACHE[model_dir] = (coarse, fine, classify, core)
     return coarse, fine, classify, core
 
 
@@ -1000,21 +1240,33 @@ def extract_minutiae_with_fingerflow(
 ) -> tuple[int, int]:
     coarse_path, fine_path, classify_path, core_path = model_paths
     image = load_bgr_for_fingerflow(enhanced_image_path)
+    cache_key = (
+        str(coarse_path),
+        str(fine_path),
+        str(classify_path),
+        str(core_path),
+    )
 
-    try:
-        extractor = Extractor(
-            str(coarse_path), str(fine_path), str(classify_path), str(core_path)
-        )
-    except Exception as exc:
-        if "A KerasTensor cannot be used as input to a TensorFlow function" in str(exc):
-            _install_core_net_compat_fallback()
+    extractor = _EXTRACTOR_CACHE.get(cache_key)
+    if extractor is None:
+        try:
             extractor = Extractor(
                 str(coarse_path), str(fine_path), str(classify_path), str(core_path)
             )
-        else:
-            raise
+            _EXTRACTOR_CACHE[cache_key] = extractor
+        except Exception as exc:
+            if "A KerasTensor cannot be used as input to a TensorFlow function" in str(exc):
+                _install_core_net_compat_fallback()
+                extractor = Extractor(
+                    str(coarse_path), str(fine_path), str(classify_path), str(core_path)
+                )
+                _EXTRACTOR_CACHE[cache_key] = extractor
+            else:
+                raise
 
+    extract_start = time.perf_counter()
     extracted = extractor.extract_minutiae(image)
+    _record_timing("extract_minutiae", extract_start)
 
     minutiae_df = extracted.get("minutiae")
     core_df = extracted.get("core")
@@ -1044,9 +1296,859 @@ def extract_minutiae_with_fingerflow(
     core_count = int(getattr(core_df, "shape", [0])[0]) if core_df is not None else 0
     return minutiae_count, core_count
 
+MCC_RADIUS = 70.0
+MCC_NS = 16
+MCC_ND = 6
+MCC_SIGMA_S = 28.0 / 3.0
+MCC_SIGMA_D = 2.0 * math.pi / 9.0
+MCC_MU_PSI = 1.0 / 100.0
+MCC_TAU_PSI = 400.0
+MCC_HULL_OFFSET = 50.0
+MCC_MIN_M = 2
+MCC_SPARSE_MINUTIAE_COUNT = 12
+MCC_DELTA_THETA = math.pi / 2.0
+MCC_MIN_NP = 4
+MCC_MAX_NP = 12
+MCC_MU_P = 20.0
+MCC_TAU_P = 2.0 / 5.0
+MCC_W_R = 0.5
+MCC_NREL = 5
+MCC_RHO_PARAMS = (
+    (5.0, -8.0 / 5.0),
+    (math.pi / 12.0, -30.0),
+    (math.pi / 12.0, -30.0),
+)
+
+
+def wrap_angle(angle: float) -> float:
+    return (angle + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def _sigmoid(value: float, mu: float, tau: float) -> float:
+    exponent = -tau * (value - mu)
+    if exponent > 60.0:
+        return 0.0
+    if exponent < -60.0:
+        return 1.0
+    return 1.0 / (1.0 + math.exp(exponent))
+
+
+def _gaussian(distance: float, sigma: float) -> float:
+    return math.exp(-(distance * distance) / (2.0 * sigma * sigma)) / (
+        sigma * math.sqrt(2.0 * math.pi)
+    )
+
+
+def _gaussian_area(alpha: float, delta: float, sigma: float) -> float:
+    lower = (alpha - (delta / 2.0)) / (sigma * math.sqrt(2.0))
+    upper = (alpha + (delta / 2.0)) / (sigma * math.sqrt(2.0))
+    return 0.5 * (math.erf(upper) - math.erf(lower))
+
+
+def _max_valid_cells(ns: int, nd: int, delta_s: float, radius: float) -> int:
+    count = 0
+    center = (ns + 1) / 2.0
+    for i in range(ns):
+        for j in range(ns):
+            dx = delta_s * ((i + 1) - center)
+            dy = delta_s * ((j + 1) - center)
+            if (dx * dx + dy * dy) <= (radius * radius):
+                count += nd
+    return count
+
+
+def _build_convex_hull(minutiae: list[dict]) -> np.ndarray | None:
+    if len(minutiae) < 3:
+        return None
+    points = np.array(
+        [[float(minutia["x"]), float(minutia["y"])] for minutia in minutiae],
+        dtype=np.float32,
+    )
+    return cv2.convexHull(points)
+
+
+def _point_in_enlarged_hull(
+    hull: np.ndarray | None,
+    x: float,
+    y: float,
+    offset: float,
+) -> bool:
+    if hull is None:
+        return True
+    distance = cv2.pointPolygonTest(hull, (float(x), float(y)), True)
+    return distance >= -offset
+
+
+def _load_validity_mask(mask_path: Path | None) -> np.ndarray | None:
+    if mask_path is None:
+        return None
+    mask = cv2.imread(str(mask_path), cv2.IMREAD_UNCHANGED)
+    if mask is None:
+        raise FileNotFoundError(f"validity mask not found: {mask_path}")
+    if mask.ndim == 3:
+        if mask.shape[2] == 4:
+            mask = mask[:, :, 3]
+        else:
+            mask = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
+    return np.where(mask > 0, 255, 0).astype(np.uint8)
+
+
+def _point_in_validity_mask(mask: np.ndarray | None, x: float, y: float) -> bool:
+    if mask is None:
+        return False
+    xi = int(round(float(x)))
+    yi = int(round(float(y)))
+    if yi < 0 or yi >= mask.shape[0] or xi < 0 or xi >= mask.shape[1]:
+        return False
+    return bool(mask[yi, xi] > 0)
+
+
+def _resolve_validity_mode(
+    validity_mode: str,
+    validity_mask: np.ndarray | None,
+) -> str:
+    if validity_mode == "auto":
+        return "mask" if validity_mask is not None else "hull"
+    if validity_mode not in {"mask", "hull", "hybrid"}:
+        raise ValueError(f"unsupported MCC validity mode: {validity_mode}")
+    if validity_mode in {"mask", "hybrid"} and validity_mask is None:
+        raise ValueError(
+            f"validity mode '{validity_mode}' requires a validity mask"
+        )
+    return validity_mode
+
+
+def _cell_is_valid(
+    dx: float,
+    dy: float,
+    x_cell: float,
+    y_cell: float,
+    radius: float,
+    hull: np.ndarray | None,
+    validity_mask: np.ndarray | None,
+    validity_mode: str,
+) -> bool:
+    if (dx * dx + dy * dy) > (radius * radius):
+        return False
+
+    if validity_mode == "hull":
+        return _point_in_enlarged_hull(hull, x_cell, y_cell, MCC_HULL_OFFSET)
+
+    in_mask = _point_in_validity_mask(validity_mask, x_cell, y_cell)
+    if validity_mode == "mask":
+        return in_mask
+
+    return in_mask or _point_in_enlarged_hull(
+        hull, x_cell, y_cell, MCC_HULL_OFFSET
+    )
+
+
+def _required_neighbor_count(
+    raw_minutiae_count: int,
+    adaptive_neighbor_support: bool = True,
+) -> int:
+    if not adaptive_neighbor_support:
+        return MCC_MIN_M
+    if raw_minutiae_count <= MCC_SPARSE_MINUTIAE_COUNT:
+        return 1
+    return MCC_MIN_M
+
+
+def _descriptor_to_vectors(descriptor: MCCCylinder) -> tuple[np.ndarray, np.ndarray]:
+    n_cells = descriptor.ns * descriptor.ns * descriptor.nd
+    values = np.zeros(n_cells, dtype=np.float32)
+    validities = np.zeros(n_cells, dtype=np.uint8)
+
+    for cell in descriptor.cells:
+        index = (cell.k * descriptor.ns * descriptor.ns) + (cell.j * descriptor.ns) + cell.i
+        values[index] = float(cell.contribution)
+        validities[index] = 1 if cell.valid else 0
+
+    return values, validities
+
+
+def _flatten_descriptors(
+    descriptors: list[MCCCylinder],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if not descriptors:
+        return (
+            np.zeros((0, 0), dtype=np.float32),
+            np.zeros((0, 0), dtype=np.uint8),
+            np.zeros((0,), dtype=np.float32),
+        )
+
+    n_cells = descriptors[0].ns * descriptors[0].ns * descriptors[0].nd
+    values = np.zeros((len(descriptors), n_cells), dtype=np.float32)
+    validities = np.zeros((len(descriptors), n_cells), dtype=np.uint8)
+    angles = np.zeros((len(descriptors),), dtype=np.float32)
+
+    for index, descriptor in enumerate(descriptors):
+        values[index], validities[index] = _descriptor_to_vectors(descriptor)
+        angles[index] = float(descriptor.center_theta)
+
+    return values, validities, angles
+
+
+def build_descriptors(
+    path: Path,
+    validity_mask_path: Path | None = None,
+    validity_mode: str = "auto",
+    adaptive_neighbor_support: bool = True,
+) -> list[MCCCylinder]:
+    minutiae_df = pd.read_csv(path)
+    minutiae_df = minutiae_df.dropna(subset=["x", "y", "angle"])
+    minutiae = minutiae_df.to_dict(orient="records")
+    if not minutiae:
+        return []
+
+    radius = MCC_RADIUS
+    angle_height = 2.0 * math.pi
+    ns = MCC_NS
+    nd = MCC_ND
+    delta_s = (2.0 * radius) / ns
+    delta_d = angle_height / nd
+    sigma_s = MCC_SIGMA_S
+    sigma_d = MCC_SIGMA_D
+    min_valid_cells = math.ceil(0.75 * _max_valid_cells(ns, nd, delta_s, radius))
+    hull = _build_convex_hull(minutiae)
+    validity_mask = _load_validity_mask(validity_mask_path)
+    resolved_validity_mode = _resolve_validity_mode(validity_mode, validity_mask)
+    required_neighbor_count = _required_neighbor_count(
+        len(minutiae),
+        adaptive_neighbor_support=adaptive_neighbor_support,
+    )
+    descriptors: list[MCCCylinder] = []
+    center = (ns + 1) / 2.0
+
+    for c_i, minutia in enumerate(minutiae):
+        x_m = float(minutia["x"])
+        y_m = float(minutia["y"])
+        theta_m = float(minutia["angle"])
+        cos_t = math.cos(theta_m)
+        sin_t = math.sin(theta_m)
+
+        contributing_minutiae = 0
+        for t, neighbor in enumerate(minutiae):
+            if t == c_i:
+                continue
+            x_t = float(neighbor["x"])
+            y_t = float(neighbor["y"])
+            if math.hypot(x_t - x_m, y_t - y_m) <= (radius + (3.0 * sigma_s)):
+                contributing_minutiae += 1
+
+        descriptor = MCCCylinder(
+            center_index=c_i,
+            center_x=x_m,
+            center_y=y_m,
+            center_theta=theta_m,
+            radius=radius,
+            angle_height=angle_height,
+            ns=ns,
+            nd=nd,
+            delta_s=delta_s,
+            delta_d=delta_d,
+            sigma_s=sigma_s,
+            sigma_d=sigma_d,
+            cells=[],
+        )
+
+        valid_cell_count = 0
+        for i in range(ns):
+            for j in range(ns):
+                dx = delta_s * ((i + 1) - center)
+                dy = delta_s * ((j + 1) - center)
+                x_cell = x_m + (dx * cos_t) - (dy * sin_t)
+                y_cell = y_m + (dx * sin_t) + (dy * cos_t)
+                is_valid = _cell_is_valid(
+                    dx=dx,
+                    dy=dy,
+                    x_cell=x_cell,
+                    y_cell=y_cell,
+                    radius=radius,
+                    hull=hull,
+                    validity_mask=validity_mask,
+                    validity_mode=resolved_validity_mode,
+                )
+
+                if is_valid:
+                    valid_cell_count += nd
+
+                for k in range(nd):
+                    angle_center = -math.pi + ((k + 0.5) * delta_d)
+                    contribution = 0.0
+
+                    if is_valid:
+                        accumulator = 0.0
+                        for t, neighbor in enumerate(minutiae):
+                            if t == c_i:
+                                continue
+
+                            x_t = float(neighbor["x"])
+                            y_t = float(neighbor["y"])
+                            theta_t = float(neighbor["angle"])
+                            distance = math.hypot(x_t - x_cell, y_t - y_cell)
+                            if distance > (3.0 * sigma_s):
+                                continue
+
+                            spatial = _gaussian(distance, sigma_s)
+                            relative_angle = wrap_angle(theta_m - theta_t)
+                            alpha = wrap_angle(angle_center - relative_angle)
+                            directional = _gaussian_area(alpha, delta_d, sigma_d)
+                            accumulator += spatial * directional
+
+                        contribution = _sigmoid(accumulator, MCC_MU_PSI, MCC_TAU_PSI)
+
+                    descriptor.cells.append(
+                        MCCCell(
+                            i=i,
+                            j=j,
+                            k=k,
+                            x=x_cell,
+                            y=y_cell,
+                            angle_center=angle_center,
+                            contribution=contribution,
+                            valid=is_valid,
+                        )
+                    )
+
+        if (
+            valid_cell_count < min_valid_cells
+            or contributing_minutiae < required_neighbor_count
+        ):
+            continue
+
+        descriptors.append(descriptor)
+
+    return descriptors
+
+
+def _cylinder_similarity_from_vectors(
+    value_a: np.ndarray,
+    value_b: np.ndarray,
+    valid_a: np.ndarray,
+    valid_b: np.ndarray,
+    theta_a: float,
+    theta_b: float,
+) -> float:
+    max_matchable = _max_valid_cells(
+        MCC_NS,
+        MCC_ND,
+        (2.0 * MCC_RADIUS) / MCC_NS,
+        MCC_RADIUS,
+    )
+    min_matchable = math.ceil(0.60 * max_matchable)
+
+    if abs(wrap_angle(theta_a - theta_b)) > MCC_DELTA_THETA:
+        return 0.0
+
+    matchable_mask = (valid_a == 1) & (valid_b == 1)
+    if int(np.count_nonzero(matchable_mask)) < min_matchable:
+        return 0.0
+
+    a_masked = value_a[matchable_mask]
+    b_masked = value_b[matchable_mask]
+    denominator = np.linalg.norm(a_masked + b_masked)
+    if denominator == 0.0:
+        return 0.0
+
+    score = 1.0 - (np.linalg.norm(a_masked - b_masked) / denominator)
+    return float(np.clip(score, 0.0, 1.0))
+
+
+def cylinder_similarity(cylinder_a: MCCCylinder, cylinder_b: MCCCylinder) -> float:
+    value_a, valid_a = _descriptor_to_vectors(cylinder_a)
+    value_b, valid_b = _descriptor_to_vectors(cylinder_b)
+    return _cylinder_similarity_from_vectors(
+        value_a=value_a,
+        value_b=value_b,
+        valid_a=valid_a,
+        valid_b=valid_b,
+        theta_a=cylinder_a.center_theta,
+        theta_b=cylinder_b.center_theta,
+    )
+
+
+def _compute_n_pairs(n_a: int, n_b: int) -> int:
+    if n_a == 0 or n_b == 0:
+        return 0
+    scaled = _sigmoid(float(min(n_a, n_b)), MCC_MU_P, MCC_TAU_P)
+    return int(round(MCC_MIN_NP + (scaled * (MCC_MAX_NP - MCC_MIN_NP))))
+
+
+def _select_lss_pairs(sim_matrix: np.ndarray, n_pairs: int) -> list[tuple[int, int, float]]:
+    if sim_matrix.size == 0 or n_pairs <= 0:
+        return []
+
+    rows, cols = sim_matrix.shape
+    total = rows * cols
+    n_pairs = min(n_pairs, total)
+    flat_indices = np.argsort(sim_matrix, axis=None)[::-1][:n_pairs]
+    return [
+        (int(index // cols), int(index % cols), float(sim_matrix.flat[index]))
+        for index in flat_indices
+    ]
+
+
+class _FlowEdge:
+    __slots__ = ("to", "rev", "capacity", "cost")
+
+    def __init__(self, to: int, rev: int, capacity: int, cost: float):
+        self.to = to
+        self.rev = rev
+        self.capacity = capacity
+        self.cost = cost
+
+
+def _add_flow_edge(
+    graph: list[list[_FlowEdge]],
+    source: int,
+    target: int,
+    capacity: int,
+    cost: float,
+) -> None:
+    graph[source].append(_FlowEdge(target, len(graph[target]), capacity, cost))
+    graph[target].append(_FlowEdge(source, len(graph[source]) - 1, 0, -cost))
+
+
+def _select_lsa_pairs(sim_matrix: np.ndarray, n_pairs: int) -> list[tuple[int, int, float]]:
+    rows, cols = sim_matrix.shape
+    if rows == 0 or cols == 0 or n_pairs <= 0:
+        return []
+
+    source = 0
+    row_offset = 1
+    col_offset = row_offset + rows
+    sink = col_offset + cols
+    graph: list[list[_FlowEdge]] = [[] for _ in range(sink + 1)]
+
+    for row in range(rows):
+        _add_flow_edge(graph, source, row_offset + row, 1, 0.0)
+    for row in range(rows):
+        for col in range(cols):
+            _add_flow_edge(graph, row_offset + row, col_offset + col, 1, -float(sim_matrix[row, col]))
+    for col in range(cols):
+        _add_flow_edge(graph, col_offset + col, sink, 1, 0.0)
+
+    target_flow = min(n_pairs, rows, cols)
+    flow = 0
+    while flow < target_flow:
+        distances = [float("inf")] * len(graph)
+        in_queue = [False] * len(graph)
+        previous_node = [-1] * len(graph)
+        previous_edge = [-1] * len(graph)
+
+        distances[source] = 0.0
+        queue = deque([source])
+        in_queue[source] = True
+
+        while queue:
+            node = queue.popleft()
+            in_queue[node] = False
+            for edge_index, edge in enumerate(graph[node]):
+                if edge.capacity <= 0:
+                    continue
+                next_cost = distances[node] + edge.cost
+                if next_cost + 1e-12 < distances[edge.to]:
+                    distances[edge.to] = next_cost
+                    previous_node[edge.to] = node
+                    previous_edge[edge.to] = edge_index
+                    if not in_queue[edge.to]:
+                        queue.append(edge.to)
+                        in_queue[edge.to] = True
+
+        if previous_node[sink] == -1:
+            break
+
+        node = sink
+        while node != source:
+            parent = previous_node[node]
+            edge = graph[parent][previous_edge[node]]
+            edge.capacity -= 1
+            graph[node][edge.rev].capacity += 1
+            node = parent
+
+        flow += 1
+
+    pairs: list[tuple[int, int, float]] = []
+    for row in range(rows):
+        for edge in graph[row_offset + row]:
+            if col_offset <= edge.to < sink and edge.capacity == 0:
+                col = edge.to - col_offset
+                pairs.append((row, col, float(sim_matrix[row, col])))
+
+    pairs.sort(key=lambda pair: pair[2], reverse=True)
+    return pairs[:target_flow]
+
+
+def _pair_distance(a: MCCCylinder, b: MCCCylinder) -> float:
+    return math.hypot(a.center_x - b.center_x, a.center_y - b.center_y)
+
+
+def _pair_direction_difference(a: MCCCylinder, b: MCCCylinder) -> float:
+    return wrap_angle(a.center_theta - b.center_theta)
+
+
+def _pair_radial_angle(a: MCCCylinder, b: MCCCylinder) -> float:
+    return wrap_angle(
+        a.center_theta - math.atan2(a.center_y - b.center_y, b.center_x - a.center_x)
+    )
+
+
+def _pair_compatibility(
+    a_t: MCCCylinder,
+    a_k: MCCCylinder,
+    b_t: MCCCylinder,
+    b_k: MCCCylinder,
+) -> float:
+    d1 = abs(_pair_distance(a_t, a_k) - _pair_distance(b_t, b_k))
+    d2 = abs(
+        wrap_angle(
+            _pair_direction_difference(a_t, a_k)
+            - _pair_direction_difference(b_t, b_k)
+        )
+    )
+    d3 = abs(
+        wrap_angle(_pair_radial_angle(a_t, a_k) - _pair_radial_angle(b_t, b_k))
+    )
+
+    compatibility = 1.0
+    for value, (mu, tau) in zip((d1, d2, d3), MCC_RHO_PARAMS):
+        compatibility *= _sigmoid(value, mu, tau)
+    return compatibility
+
+
+def _relax_pairs_with_details(
+    descriptors_a: list[MCCCylinder],
+    descriptors_b: list[MCCCylinder],
+    pairs: list[tuple[int, int, float]],
+) -> tuple[np.ndarray, np.ndarray, dict]:
+    if not pairs:
+        empty = np.zeros((0,), dtype=np.float32)
+        return empty, empty, {
+            "compatibility_summary": {
+                "min": 0.0,
+                "median": 0.0,
+                "max": 0.0,
+                "mean": 0.0,
+                "nonzero_ratio": 0.0,
+            },
+            "iteration_summaries": [],
+            "support_summaries": [],
+        }
+
+    relaxed = np.array([pair[2] for pair in pairs], dtype=np.float32)
+    initial = relaxed.copy()
+    compatibility_matrix = np.zeros((len(pairs), len(pairs)), dtype=np.float32)
+
+    for t, (row_t, col_t, _) in enumerate(pairs):
+        for k, (row_k, col_k, _) in enumerate(pairs):
+            if k == t:
+                continue
+            compatibility_matrix[t, k] = _pair_compatibility(
+                descriptors_a[row_t],
+                descriptors_a[row_k],
+                descriptors_b[col_t],
+                descriptors_b[col_k],
+            )
+
+    compatibility_values = compatibility_matrix[compatibility_matrix > 0]
+    if compatibility_values.size == 0:
+        compatibility_summary = {
+            "min": 0.0,
+            "median": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "nonzero_ratio": 0.0,
+        }
+    else:
+        compatibility_summary = {
+            "min": float(np.min(compatibility_values)),
+            "median": float(np.median(compatibility_values)),
+            "max": float(np.max(compatibility_values)),
+            "mean": float(np.mean(compatibility_values)),
+            "nonzero_ratio": float(
+                np.count_nonzero(compatibility_matrix > 0) / max(1, compatibility_matrix.size - len(pairs))
+            ),
+        }
+
+    if len(pairs) == 1:
+        return relaxed, np.ones((1,), dtype=np.float32), {
+            "compatibility_summary": compatibility_summary,
+            "iteration_summaries": [
+                {
+                    "iteration": 0,
+                    "min": float(relaxed[0]),
+                    "median": float(relaxed[0]),
+                    "max": float(relaxed[0]),
+                    "mean": float(relaxed[0]),
+                }
+            ],
+            "support_summaries": [
+                {"iteration": 0, "support_mean": 1.0, "support_median": 1.0}
+            ],
+        }
+
+    iteration_summaries: list[dict] = []
+    support_summaries: list[dict] = []
+
+    for iteration in range(MCC_NREL):
+        previous = relaxed.copy()
+        support_values = []
+        for t, (row_t, col_t, _) in enumerate(pairs):
+            weights = compatibility_matrix[t]
+            weight_sum = float(np.sum(weights))
+            support_values.append(weight_sum)
+            if weight_sum > 1e-12:
+                compatible_average = float(np.dot(weights, previous) / weight_sum)
+            else:
+                compatible_average = float(previous[t])
+
+            relaxed[t] = (MCC_W_R * previous[t]) + (
+                (1.0 - MCC_W_R) * compatible_average
+            )
+
+        iteration_summaries.append(
+            {
+                "iteration": iteration + 1,
+                "min": float(np.min(relaxed)),
+                "median": float(np.median(relaxed)),
+                "max": float(np.max(relaxed)),
+                "mean": float(np.mean(relaxed)),
+            }
+        )
+        support_summaries.append(
+            {
+                "iteration": iteration + 1,
+                "support_mean": float(np.mean(support_values)),
+                "support_median": float(np.median(support_values)),
+                "support_min": float(np.min(support_values)),
+                "support_max": float(np.max(support_values)),
+            }
+        )
+
+    efficiency = np.zeros_like(relaxed)
+    nonzero = initial > 0
+    efficiency[nonzero] = relaxed[nonzero] / initial[nonzero]
+    return relaxed, efficiency, {
+        "compatibility_summary": compatibility_summary,
+        "iteration_summaries": iteration_summaries,
+        "support_summaries": support_summaries,
+    }
+
+
+def _relax_pairs(
+    descriptors_a: list[MCCCylinder],
+    descriptors_b: list[MCCCylinder],
+    pairs: list[tuple[int, int, float]],
+) -> tuple[np.ndarray, np.ndarray]:
+    relaxed, efficiency, _ = _relax_pairs_with_details(
+        descriptors_a,
+        descriptors_b,
+        pairs,
+    )
+    return relaxed, efficiency
+
+
+def match_descriptors(
+    descriptors_a: list[MCCCylinder],
+    descriptors_b: list[MCCCylinder],
+    method: str = "LSA-R",
+) -> tuple[float, np.ndarray]:
+    values_a, validities_a, angles_a = _flatten_descriptors(descriptors_a)
+    values_b, validities_b, angles_b = _flatten_descriptors(descriptors_b)
+    sim_matrix = np.zeros((len(descriptors_a), len(descriptors_b)), dtype=np.float32)
+
+    for i in range(len(descriptors_a)):
+        for j in range(len(descriptors_b)):
+            sim_matrix[i, j] = _cylinder_similarity_from_vectors(
+                value_a=values_a[i],
+                value_b=values_b[j],
+                valid_a=validities_a[i],
+                valid_b=validities_b[j],
+                theta_a=float(angles_a[i]),
+                theta_b=float(angles_b[j]),
+            )
+
+    n_pairs = _compute_n_pairs(len(descriptors_a), len(descriptors_b))
+    if n_pairs == 0:
+        return 0.0, sim_matrix
+
+    normalized_method = method.upper()
+    if normalized_method == "LSS":
+        pairs = _select_lss_pairs(sim_matrix, n_pairs)
+        return (
+            float(np.mean([pair[2] for pair in pairs])) if pairs else 0.0,
+            sim_matrix,
+        )
+
+    if normalized_method == "LSA":
+        pairs = _select_lsa_pairs(sim_matrix, n_pairs)
+        return (
+            float(np.mean([pair[2] for pair in pairs])) if pairs else 0.0,
+            sim_matrix,
+        )
+
+    n_rel_pairs = min(len(descriptors_a), len(descriptors_b))
+    if normalized_method == "LSS-R":
+        pairs = _select_lss_pairs(sim_matrix, n_rel_pairs)
+    elif normalized_method == "LSA-R":
+        pairs = _select_lsa_pairs(sim_matrix, n_rel_pairs)
+    else:
+        raise ValueError(f"unsupported MCC matching method: {method}")
+
+    relaxed, efficiency = _relax_pairs(descriptors_a, descriptors_b, pairs)
+    if relaxed.size == 0:
+        return 0.0, sim_matrix
+
+    top_indices = np.argsort(efficiency)[::-1][: min(n_pairs, len(pairs))]
+    score = float(np.mean(relaxed[top_indices])) if len(top_indices) > 0 else 0.0
+    return score, sim_matrix
+
+
+def match_minutiae_csv(
+    path_a: Path,
+    path_b: Path,
+    method: str = "LSA-R",
+) -> tuple[float, np.ndarray]:
+    descriptors_a = build_descriptors(path_a)
+    descriptors_b = build_descriptors(path_b)
+    return match_descriptors(descriptors_a, descriptors_b, method=method)
+
+
+def _extract_minutiae_csv_from_image(
+    image_path: Path,
+    workspace_dir: Path,
+    model_paths: tuple[Path, Path, Path, Path],
+) -> tuple[Path, Path]:
+    image_root = workspace_dir / image_path.stem
+    image_root.mkdir(parents=True, exist_ok=True)
+
+    nobg_path = image_root / "nobg.png"
+    cropped_path = image_root / "cropped.png"
+    cropped_mask_path = image_root / "cropped_mask.png"
+    normalised_path = image_root / "normalised.png"
+    enhanced_path = image_root / "enhanced.png"
+    minutiae_json_path = image_root / "minutiae.json"
+    minutiae_csv_path = image_root / "minutiae.csv"
+    core_csv_path = image_root / "core.csv"
+
+    full_bgr = load_bgr_image(image_path)
+    coarse_mask = rembg_mask_from_bgr(full_bgr)
+    validate_foreground_area(coarse_mask, minimum_ratio=0.03)
+
+    crop_bbox = compute_distal_crop_bbox(coarse_mask)
+    cropped_bgr = crop_image(full_bgr, crop_bbox)
+
+    cropped_mask = rembg_mask_from_bgr(cropped_bgr)
+    validate_foreground_area(cropped_mask, minimum_ratio=0.08)
+    cropped_rgba = compose_rgba(cropped_bgr, cropped_mask)
+
+    save_png(cropped_path, cropped_bgr)
+    save_png(nobg_path, cropped_rgba)
+    save_png(cropped_mask_path, cropped_mask)
+    normalise_brightness(nobg_path, normalised_path)
+    filter(normalised_path, enhanced_path)
+
+    if not enhanced_path.exists() or enhanced_path.stat().st_size == 0:
+        raise RuntimeError(f"enhanced image was not created: {enhanced_path}")
+
+    extract_minutiae_with_fingerflow(
+        image_path.resolve(),
+        enhanced_path.resolve(),
+        model_paths,
+        minutiae_json_path.resolve(),
+        minutiae_csv_path.resolve(),
+        core_csv_path.resolve(),
+    )
+    return minutiae_csv_path, cropped_mask_path
+
+
+def match_fingerprint_images(
+    image_a: Path,
+    image_b: Path,
+    method: str = "LSA-R",
+    fingerflow_model_dir: Path = DEFAULT_FINGERFLOW_MODEL_DIR,
+) -> tuple[float, np.ndarray]:
+    image_a = Path(image_a)
+    image_b = Path(image_b)
+    if not image_a.exists():
+        raise FileNotFoundError(f"image not found: {image_a}")
+    if not image_b.exists():
+        raise FileNotFoundError(f"image not found: {image_b}")
+
+    score, sim_matrix, _ = _match_fingerprint_images_with_workspace(
+        image_a=image_a,
+        image_b=image_b,
+        method=method,
+        fingerflow_model_dir=fingerflow_model_dir,
+    )
+    return score, sim_matrix
+
+
+def _match_fingerprint_images_with_workspace(
+    image_a: Path,
+    image_b: Path,
+    method: str = "LSA-R",
+    fingerflow_model_dir: Path = DEFAULT_FINGERFLOW_MODEL_DIR,
+) -> tuple[float, np.ndarray, Path]:
+    image_a = Path(image_a)
+    image_b = Path(image_b)
+    if not image_a.exists():
+        raise FileNotFoundError(f"image not found: {image_a}")
+    if not image_b.exists():
+        raise FileNotFoundError(f"image not found: {image_b}")
+
+    model_paths = ensure_fingerflow_models(fingerflow_model_dir)
+    run_dir = MATCH_OUTPUTS_DIR / f"match_{int(time.time())}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    csv_a, mask_a = _extract_minutiae_csv_from_image(image_a, run_dir / "a", model_paths)
+    csv_b, mask_b = _extract_minutiae_csv_from_image(image_b, run_dir / "b", model_paths)
+    descriptors_a = build_descriptors(
+        csv_a,
+        validity_mask_path=mask_a,
+        validity_mode="mask",
+    )
+    descriptors_b = build_descriptors(
+        csv_b,
+        validity_mask_path=mask_b,
+        validity_mode="mask",
+    )
+    score, sim_matrix = match_descriptors(descriptors_a, descriptors_b, method=method)
+    return score, sim_matrix, run_dir
+    
+
+
 def main() -> int:
+    start = time.perf_counter()
     args = parse_args()
+    _print_runtime_context()
     try:
+        if args.command == "match":
+            gpu_check_start = time.perf_counter()
+            _ensure_tensorflow_gpu_available()
+            _record_timing("gpu_check", gpu_check_start)
+            score, sim_matrix, run_dir = _match_fingerprint_images_with_workspace(
+                args.image_a.resolve(),
+                args.image_b.resolve(),
+                method=args.method,
+                fingerflow_model_dir=args.fingerflow_model_dir.resolve(),
+            )
+            _record_timing("total", start)
+            print(f"MCC match score ({args.method}): {score:.6f}")
+            print(f"Similarity matrix shape: {sim_matrix.shape}")
+            print(f"Saved match outputs: {run_dir}")
+            print(f"Stage timings: {_format_timing_summary()}")
+            return 0
+
+        gpu_check_start = time.perf_counter()
+        _ensure_tensorflow_gpu_available()
+        _record_timing("gpu_check", gpu_check_start)
+        try:
+            import tensorflow as tf
+
+            print(f"TensorFlow GPU devices visible: {[gpu.name for gpu in tf.config.list_physical_devices('GPU')]}")
+        except Exception:
+            pass
         nobg_path, cropped_path = process_image(args.input_image)
         normalised_path = REPO_ROOT / "normalised_cropped.png"
         enhanced_path = DEFAULT_ENHANCED_IMAGE
@@ -1055,7 +2157,9 @@ def main() -> int:
         if not enhanced_path.exists() or enhanced_path.stat().st_size == 0:
             raise RuntimeError(f"enhanced image was not created: {enhanced_path}")
 
+        model_start = time.perf_counter()
         model_paths = ensure_fingerflow_models(args.fingerflow_model_dir)
+        _record_timing("model_load", model_start)
         minutiae_count, core_count = extract_minutiae_with_fingerflow(
             args.input_image.resolve(),
             enhanced_path.resolve(),
@@ -1064,8 +2168,10 @@ def main() -> int:
             args.minutiae_csv.resolve(),
             args.core_csv.resolve(),
         )
+        _record_timing("fingerflow_total", model_start)
     except Exception as exc:
         print(f"Error: {exc}", file=sys.stderr)
+        traceback.print_exc()
         return 1
 
     print(f"Saved background-removed image: {nobg_path}")
@@ -1076,6 +2182,8 @@ def main() -> int:
     print(f"Saved FingerFlow minutiae CSV: {args.minutiae_csv.resolve()}")
     print(f"Saved FingerFlow core CSV: {args.core_csv.resolve()}")
     print(f"FingerFlow extracted minutiae: {minutiae_count}, cores: {core_count}")
+    _record_timing("total", start)
+    print(f"Stage timings: {_format_timing_summary()}")
     return 0
 
 

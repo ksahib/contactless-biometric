@@ -1,0 +1,60 @@
+{
+  "mode": "smoke",
+  "source_csv": "D:\\contactless biome\\contactless-biometric\\fingerflow_minutiae.csv",
+  "methods": [
+    "LSS",
+    "LSA",
+    "LSS-R",
+    "LSA-R"
+  ],
+  "results": {
+    "LSS": {
+      "descriptor_count": 13,
+      "self_score": 1.0,
+      "self_matrix_shape": [
+        13,
+        13
+      ],
+      "perturbed_score": 0.8409010618925095,
+      "perturbed_reverse_score": 0.8409010618925095,
+      "randomized_score": 0.0,
+      "symmetry_gap": 0.0
+    },
+    "LSA": {
+      "descriptor_count": 13,
+      "self_score": 1.0,
+      "self_matrix_shape": [
+        13,
+        13
+      ],
+      "perturbed_score": 0.8409010618925095,
+      "perturbed_reverse_score": 0.8409010618925095,
+      "randomized_score": 0.0,
+      "symmetry_gap": 0.0
+    },
+    "LSS-R": {
+      "descriptor_count": 13,
+      "self_score": 1.0,
+      "self_matrix_shape": [
+        13,
+        13
+      ],
+      "perturbed_score": 0.7708296179771423,
+      "perturbed_reverse_score": 0.7708296179771423,
+      "randomized_score": 0.0,
+      "symmetry_gap": 0.0
+    },
+    "LSA-R": {
+      "descriptor_count": 13,
+      "self_score": 1.0,
+      "self_matrix_shape": [
+        13,
+        13
+      ],
+      "perturbed_score": 0.7708296179771423,
+      "perturbed_reverse_score": 0.7708296179771423,
+      "randomized_score": 0.0,
+      "symmetry_gap": 0.0
+    }
+  }
+}

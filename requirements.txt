@@ -15,7 +15,7 @@ fsspec==2025.12.0
 gast==0.7.0
 google-pasta==0.2.0
 grpcio==1.78.0
-h5py==3.15.1
+h5py==3.14.0
 idna==3.11
 ImageIO==2.37.2
 jax==0.9.0.1
@@ -34,7 +34,7 @@ markdown-it-py==4.0.0
 MarkupSafe==3.0.3
 matplotlib==3.10.8
 mdurl==0.1.2
-mediapipe==0.10.14
+mediapipe==0.10.32
 ml_dtypes==0.5.4
 mpmath==1.3.0
 namex==0.1.0
@@ -51,7 +51,7 @@ pandas==3.0.1
 pillow==12.1.1
 platformdirs==4.9.2
 pooch==1.9.0
-protobuf==7.34.0
+protobuf==6.31.1
 pycparser==3.0
 pyfing==0.6
 Pygments==2.19.2
@@ -70,7 +70,11 @@ sounddevice==0.5.5
 sympy==1.14.0
 tensorboard==2.20.0
 tensorboard-data-server==0.7.2
-tensorflow==2.20.0
+tensorflow==2.21.0; sys_platform != "win32"
+# Native Windows TensorFlow wheels (>=2.11) are not CUDA-enabled.
+# For this project, use WSL/Linux for GPU execution. Keep Windows fallback out.
+# If you must run on Windows, use an explicit DirectML/WSL flow outside this requirements file.
+tensorflow-cpu==2.21.0; sys_platform == "win32"
 termcolor==3.3.0
 tifffile==2026.2.24
 tqdm==4.67.3
