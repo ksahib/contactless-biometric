@@ -1,10 +1,47 @@
-export LD_LIBRARY_PATH="/usr/lib/wsl/lib:$(python - <<'PY'
+#!/usr/bin/env sh
+set -eu
+
+if [ "${PYTHON_BIN:-}" ]; then
+  :
+elif [ "${VIRTUAL_ENV:-}" ] && [ -x "${VIRTUAL_ENV}/bin/python" ]; then
+  PYTHON_BIN="${VIRTUAL_ENV}/bin/python"
+elif [ -x "${HOME:-}/.venvs/contactless-biometric/bin/python" ]; then
+  PYTHON_BIN="${HOME}/.venvs/contactless-biometric/bin/python"
+elif [ -x ".venv/bin/python" ]; then
+  PYTHON_BIN=".venv/bin/python"
+elif [ -x ".venv/Scripts/python.exe" ]; then
+  PYTHON_BIN=".venv/Scripts/python.exe"
+elif command -v python3 >/dev/null 2>&1; then
+  PYTHON_BIN="$(command -v python3)"
+elif command -v python >/dev/null 2>&1; then
+  PYTHON_BIN="$(command -v python)"
+else
+  echo "No usable Python interpreter found. Set PYTHON_BIN explicitly." >&2
+  exit 1
+fi
+
+IMAGE_A="${1:-sahibind4.jpeg}"
+IMAGE_B="${2:-sahibind5.jpeg}"
+METHOD="${3:-${METHOD:-LSA-R}}"
+
+GPU_LIB_PATHS="$("$PYTHON_BIN" - <<'PY'
 import site
 from pathlib import Path
-p = Path(site.getsitepackages()[0])
-print(':'.join(str(x) for x in sorted(p.glob('nvidia/*/lib'))))
+
+paths = []
+for base in site.getsitepackages():
+    paths.extend(sorted(str(path) for path in Path(base).glob('nvidia/*/lib')))
+print(':'.join(paths))
 PY
 )"
-#python -c "import tensorflow as tf; print(tf.config.list_physical_devices('GPU'))"
-#python main.py finger.jpeg
-python main.py match sahibind4.jpeg sahibind5.jpeg
+
+export FINGERFLOW_ALLOW_CPU="${FINGERFLOW_ALLOW_CPU:-0}"
+export LD_LIBRARY_PATH="/usr/lib/wsl/lib${GPU_LIB_PATHS:+:$GPU_LIB_PATHS}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+echo "Running fresh full pipeline:"
+echo "  Python: $PYTHON_BIN"
+echo "  A: $IMAGE_A"
+echo "  B: $IMAGE_B"
+echo "  Method: $METHOD"
+
+exec "$PYTHON_BIN" main.py match "$IMAGE_A" "$IMAGE_B" --method "$METHOD"

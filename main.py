@@ -15,7 +15,7 @@ import pandas as pd
 import cv2
 import numpy as np
 import math
-from descriptor import MCCCylinder, MCCCell
+from descriptor import MCCCell, MCCCylinder, MCCOverlapContext
 
 try:
     from rembg import new_session, remove
@@ -767,7 +767,11 @@ def estimate_finger_axis(
 
 
 def select_fingertip_end(
-    contour: np.ndarray, axis_u: np.ndarray, axis_v: np.ndarray, length_l: float
+    contour: np.ndarray,
+    axis_u: np.ndarray,
+    axis_v: np.ndarray,
+    length_l: float,
+    mask_shape: tuple[int, int],
 ) -> tuple[np.ndarray, np.ndarray]:
     points = contour.reshape(-1, 2).astype(np.float32)
     proj_u = points @ axis_u
@@ -775,29 +779,41 @@ def select_fingertip_end(
     min_u = float(proj_u.min())
     max_u = float(proj_u.max())
     band = max(2.0, 0.14 * length_l)
+    height, width = mask_shape
 
     min_selector = proj_u <= (min_u + band)
     max_selector = proj_u >= (max_u - band)
 
-    def stats(selector: np.ndarray) -> tuple[float, float, float]:
+    def stats(selector: np.ndarray) -> tuple[float, float, float, bool]:
         chosen = points[selector]
         if chosen.shape[0] < 6:
             raise RuntimeError("insufficient contour support to localize fingertip")
         local_v = proj_v[selector]
+        border_margin = max(6.0, 0.02 * max(width, height))
+        min_border_distance = min(
+            float(np.min(chosen[:, 0])),
+            float(np.min(chosen[:, 1])),
+            float((width - 1) - np.max(chosen[:, 0])),
+            float((height - 1) - np.max(chosen[:, 1])),
+        )
         return (
             float(local_v.max() - local_v.min()),
             float(np.mean(local_v)),
             float(np.mean(chosen[:, 1])),
+            min_border_distance <= border_margin,
         )
 
-    min_width, min_center_v, min_mean_y = stats(min_selector)
-    max_width, max_center_v, max_mean_y = stats(max_selector)
+    min_width, min_center_v, min_mean_y, min_border_attached = stats(min_selector)
+    max_width, max_center_v, max_mean_y, max_border_attached = stats(max_selector)
 
-    width_delta = abs(min_width - max_width) / max(min_width, max_width, 1.0)
-    if width_delta >= 0.08:
-        choose_min = min_width < max_width
+    if min_border_attached != max_border_attached:
+        choose_min = not min_border_attached
     else:
-        choose_min = min_mean_y <= max_mean_y
+        width_delta = abs(min_width - max_width) / max(min_width, max_width, 1.0)
+        if width_delta >= 0.08:
+            choose_min = min_width < max_width
+        else:
+            choose_min = min_mean_y <= max_mean_y
 
     if choose_min:
         tip_proj = min_u
@@ -844,7 +860,13 @@ def compute_distal_crop_bbox(mask: np.ndarray) -> tuple[int, int, int, int]:
     contour = max(contours, key=cv2.contourArea)
 
     axis_u, axis_v, length_l, _ = estimate_finger_axis(contour)
-    tip_center, tip_to_base = select_fingertip_end(contour, axis_u, axis_v, length_l)
+    tip_center, tip_to_base = select_fingertip_end(
+        contour,
+        axis_u,
+        axis_v,
+        length_l,
+        mask.shape[:2],
+    )
 
     width_near_tip = local_width_from_mask(mask, tip_center, tip_to_base, axis_v, length_l, 0.16)
     width_stable = local_width_from_mask(mask, tip_center, tip_to_base, axis_v, length_l, 0.28)
@@ -1403,6 +1425,80 @@ def _point_in_validity_mask(mask: np.ndarray | None, x: float, y: float) -> bool
     return bool(mask[yi, xi] > 0)
 
 
+def _build_overlap_context(validity_mask: np.ndarray | None) -> MCCOverlapContext | None:
+    if validity_mask is None:
+        return None
+    return MCCOverlapContext(mask=validity_mask)
+
+
+def _descriptor_has_overlap_context(descriptor: MCCCylinder) -> bool:
+    return descriptor.overlap_context is not None and descriptor.overlap_context.mask is not None
+
+
+def _transform_point(
+    x: float,
+    y: float,
+    rotation: float,
+    translation_x: float,
+    translation_y: float,
+) -> tuple[float, float]:
+    cos_r = math.cos(rotation)
+    sin_r = math.sin(rotation)
+    projected_x = (cos_r * float(x)) - (sin_r * float(y)) + float(translation_x)
+    projected_y = (sin_r * float(x)) + (cos_r * float(y)) + float(translation_y)
+    return projected_x, projected_y
+
+
+def _descriptor_pair_alignment(
+    cylinder_a: MCCCylinder,
+    cylinder_b: MCCCylinder,
+) -> tuple[float, float, float]:
+    rotation = wrap_angle(float(cylinder_a.center_theta) - float(cylinder_b.center_theta))
+    projected_center_x, projected_center_y = _transform_point(
+        cylinder_b.center_x,
+        cylinder_b.center_y,
+        rotation,
+        0.0,
+        0.0,
+    )
+    translation_x = float(cylinder_a.center_x) - projected_center_x
+    translation_y = float(cylinder_a.center_y) - projected_center_y
+    return rotation, translation_x, translation_y
+
+
+def _overlap_valid_cell_mask(
+    cylinder_a: MCCCylinder,
+    cylinder_b: MCCCylinder,
+    valid_a: np.ndarray,
+    valid_b: np.ndarray,
+) -> np.ndarray | None:
+    if not _descriptor_has_overlap_context(cylinder_a) or not _descriptor_has_overlap_context(cylinder_b):
+        return None
+
+    mask_a = cylinder_a.overlap_context.mask
+    mask_b = cylinder_b.overlap_context.mask
+    rotation, translation_x, translation_y = _descriptor_pair_alignment(cylinder_a, cylinder_b)
+    overlap_valid = np.zeros(valid_a.shape, dtype=bool)
+
+    for index, cell_b in enumerate(cylinder_b.cells):
+        if valid_a[index] != 1 or valid_b[index] != 1:
+            continue
+        projected_x, projected_y = _transform_point(
+            cell_b.x,
+            cell_b.y,
+            rotation,
+            translation_x,
+            translation_y,
+        )
+        if not _point_in_validity_mask(mask_a, projected_x, projected_y):
+            continue
+        if not _point_in_validity_mask(mask_b, cell_b.x, cell_b.y):
+            continue
+        overlap_valid[index] = True
+
+    return overlap_valid
+
+
 def _resolve_validity_mode(
     validity_mode: str,
     validity_mask: np.ndarray | None,
@@ -1512,6 +1608,7 @@ def build_descriptors(
     min_valid_cells = math.ceil(0.75 * _max_valid_cells(ns, nd, delta_s, radius))
     hull = _build_convex_hull(minutiae)
     validity_mask = _load_validity_mask(validity_mask_path)
+    overlap_context = _build_overlap_context(validity_mask)
     resolved_validity_mode = _resolve_validity_mode(validity_mode, validity_mask)
     required_neighbor_count = _required_neighbor_count(
         len(minutiae),
@@ -1550,6 +1647,7 @@ def build_descriptors(
             sigma_s=sigma_s,
             sigma_d=sigma_d,
             cells=[],
+            overlap_context=overlap_context,
         )
 
         valid_cell_count = 0
@@ -1629,6 +1727,9 @@ def _cylinder_similarity_from_vectors(
     valid_b: np.ndarray,
     theta_a: float,
     theta_b: float,
+    cylinder_a: MCCCylinder | None = None,
+    cylinder_b: MCCCylinder | None = None,
+    overlap_mode: str = "auto",
 ) -> float:
     max_matchable = _max_valid_cells(
         MCC_NS,
@@ -1642,6 +1743,13 @@ def _cylinder_similarity_from_vectors(
         return 0.0
 
     matchable_mask = (valid_a == 1) & (valid_b == 1)
+    if overlap_mode == "auto" and cylinder_a is not None and cylinder_b is not None:
+        overlap_mask = _overlap_valid_cell_mask(cylinder_a, cylinder_b, valid_a, valid_b)
+        if overlap_mask is not None:
+            matchable_mask = matchable_mask & overlap_mask
+    elif overlap_mode != "off":
+        raise ValueError(f"unsupported overlap mode: {overlap_mode}")
+
     if int(np.count_nonzero(matchable_mask)) < min_matchable:
         return 0.0
 
@@ -1665,6 +1773,9 @@ def cylinder_similarity(cylinder_a: MCCCylinder, cylinder_b: MCCCylinder) -> flo
         valid_b=valid_b,
         theta_a=cylinder_a.center_theta,
         theta_b=cylinder_b.center_theta,
+        cylinder_a=cylinder_a,
+        cylinder_b=cylinder_b,
+        overlap_mode="auto",
     )
 
 
@@ -1953,6 +2064,7 @@ def match_descriptors(
     descriptors_a: list[MCCCylinder],
     descriptors_b: list[MCCCylinder],
     method: str = "LSA-R",
+    overlap_mode: str = "auto",
 ) -> tuple[float, np.ndarray]:
     values_a, validities_a, angles_a = _flatten_descriptors(descriptors_a)
     values_b, validities_b, angles_b = _flatten_descriptors(descriptors_b)
@@ -1967,6 +2079,9 @@ def match_descriptors(
                 valid_b=validities_b[j],
                 theta_a=float(angles_a[i]),
                 theta_b=float(angles_b[j]),
+                cylinder_a=descriptors_a[i],
+                cylinder_b=descriptors_b[j],
+                overlap_mode=overlap_mode,
             )
 
     n_pairs = _compute_n_pairs(len(descriptors_a), len(descriptors_b))
@@ -2009,10 +2124,18 @@ def match_minutiae_csv(
     path_a: Path,
     path_b: Path,
     method: str = "LSA-R",
+    mask_path_a: Path | None = None,
+    mask_path_b: Path | None = None,
+    overlap_mode: str = "auto",
 ) -> tuple[float, np.ndarray]:
-    descriptors_a = build_descriptors(path_a)
-    descriptors_b = build_descriptors(path_b)
-    return match_descriptors(descriptors_a, descriptors_b, method=method)
+    descriptors_a = build_descriptors(path_a, validity_mask_path=mask_path_a)
+    descriptors_b = build_descriptors(path_b, validity_mask_path=mask_path_b)
+    return match_descriptors(
+        descriptors_a,
+        descriptors_b,
+        method=method,
+        overlap_mode=overlap_mode,
+    )
 
 
 def _extract_minutiae_csv_from_image(

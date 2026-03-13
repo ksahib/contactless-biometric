@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Optional, List
+from typing import Any, List, Optional
 
 
 @dataclass(slots=True)
@@ -25,6 +25,11 @@ class MCCCell:
     spatial_contribution: Optional[float] = None
     directional_contribution: Optional[float] = None
 
+
+@dataclass(slots=True)
+class MCCOverlapContext:
+    mask: Any
+
 @dataclass(slots=True)
 class MCCCylinder:
     center_index: int
@@ -42,3 +47,4 @@ class MCCCylinder:
     sigma_d: float
 
     cells: List[MCCCell]
+    overlap_context: Optional[MCCOverlapContext] = None
