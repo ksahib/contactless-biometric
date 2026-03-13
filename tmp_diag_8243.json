@@ -1,0 +1,1314 @@
+{
+  "mode": "diagnose",
+  "run_dir": "D:\\contactless biome\\contactless-biometric\\match_outputs\\match_1773388243",
+  "left": {
+    "path": "D:\\contactless biome\\contactless-biometric\\match_outputs\\match_1773388243\\a\\tonmoy2",
+    "stages": {
+      "cropped": {
+        "exists": true,
+        "readable": true,
+        "shape": [
+          1151,
+          923,
+          3
+        ],
+        "dtype": "uint8",
+        "nonzero_ratio": 1.0,
+        "mean_intensity": 132.10396599562176,
+        "std_intensity": 53.80648598329482,
+        "nonzero_bbox": {
+          "x_min": 0,
+          "y_min": 0,
+          "x_max": 922,
+          "y_max": 1150
+        }
+      },
+      "cropped_mask": {
+        "exists": true,
+        "readable": true,
+        "shape": [
+          1151,
+          923
+        ],
+        "dtype": "uint8",
+        "nonzero_ratio": 0.4470652021465154,
+        "mean_intensity": 114.00162654736143,
+        "std_intensity": 126.78345284039673,
+        "nonzero_bbox": {
+          "x_min": 192,
+          "y_min": 283,
+          "x_max": 864,
+          "y_max": 1150
+        }
+      },
+      "nobg": {
+        "exists": true,
+        "readable": true,
+        "shape": [
+          1151,
+          923,
+          4
+        ],
+        "dtype": "uint8",
+        "alpha_foreground_ratio": 0.4470652021465154,
+        "nonzero_ratio": 0.4470652021465154,
+        "mean_intensity": 127.57838113355668,
+        "std_intensity": 79.06520842929214,
+        "nonzero_bbox": {
+          "x_min": 192,
+          "y_min": 283,
+          "x_max": 864,
+          "y_max": 1150
+        }
+      },
+      "normalised": {
+        "exists": true,
+        "readable": true,
+        "shape": [
+          1151,
+          923,
+          4
+        ],
+        "dtype": "uint8",
+        "alpha_foreground_ratio": 0.4470652021465154,
+        "nonzero_ratio": 0.4470652021465154,
+        "mean_intensity": 79.35386770936385,
+        "std_intensity": 96.71795938506153,
+        "nonzero_bbox": {
+          "x_min": 192,
+          "y_min": 283,
+          "x_max": 864,
+          "y_max": 1150
+        }
+      },
+      "enhanced": {
+        "exists": true,
+        "readable": true,
+        "shape": [
+          1151,
+          923,
+          4
+        ],
+        "dtype": "uint8",
+        "alpha_foreground_ratio": 0.4470652021465154,
+        "nonzero_ratio": 0.4470652021465154,
+        "mean_intensity": 79.21491157060656,
+        "std_intensity": 96.9946746057506,
+        "nonzero_bbox": {
+          "x_min": 192,
+          "y_min": 283,
+          "x_max": 864,
+          "y_max": 1150
+        }
+      },
+      "minutiae_csv": "D:\\contactless biome\\contactless-biometric\\match_outputs\\match_1773388243\\a\\tonmoy2\\minutiae.csv",
+      "minutiae_json": "D:\\contactless biome\\contactless-biometric\\match_outputs\\match_1773388243\\a\\tonmoy2\\minutiae.json",
+      "core_csv": null
+    },
+    "minutiae": {
+      "exists": true,
+      "count": 58,
+      "columns": [
+        "x",
+        "y",
+        "angle",
+        "score",
+        "class"
+      ],
+      "x_stats": {
+        "min": 277.0,
+        "median": 474.5,
+        "max": 790.0,
+        "mean": 514.6896551724138,
+        "std": 156.95960460956647
+      },
+      "y_stats": {
+        "min": 342.0,
+        "median": 848.5,
+        "max": 1075.0,
+        "mean": 784.051724137931,
+        "std": 216.40275528982377
+      },
+      "angle_stats": {
+        "min": 0.1875232376195619,
+        "median": 1.620439954531688,
+        "max": 6.117425209423844,
+        "mean": 2.2461693135186427,
+        "std": 1.7397451332773344
+      },
+      "score_stats": {
+        "min": 0.4516078496090935,
+        "median": 0.7195190692059563,
+        "max": 0.9368619680404664,
+        "mean": 0.690640205143469,
+        "std": 0.11508497585696263
+      },
+      "spatial_spread": {
+        "x_range": 513.0,
+        "y_range": 733.0,
+        "x_median": 474.5,
+        "y_median": 848.5
+      },
+      "class_counts": {
+        "0.0": 4,
+        "1.0": 3,
+        "2.0": 2,
+        "3.0": 40,
+        "4.0": 2,
+        "5.0": 7
+      }
+    },
+    "descriptors": {
+      "raw_minutiae_count": 58,
+      "surviving_descriptor_count": 51,
+      "descriptor_survival_ratio": 0.8793103448275862,
+      "validity_mode": "mask",
+      "adaptive_neighbor_support": true,
+      "mask_coverage": {
+        "path": "D:\\contactless biome\\contactless-biometric\\match_outputs\\match_1773388243\\a\\tonmoy2\\cropped_mask.png",
+        "shape": [
+          1151,
+          923
+        ],
+        "foreground_ratio": 0.4470652021465154
+      },
+      "invalidation": {
+        "validity_mode": "mask",
+        "base_neighbor_threshold": 2,
+        "resolved_neighbor_threshold": 2,
+        "adaptive_neighbor_support": true,
+        "min_valid_cells_threshold": 936,
+        "too_few_valid_cells": 0,
+        "too_few_neighbors": 7,
+        "dropped_descriptors": 7,
+        "support_region_invalidated_cells": 576,
+        "in_radius_cells": 72384
+      }
+    }
+  },
+  "right": {
+    "path": "D:\\contactless biome\\contactless-biometric\\match_outputs\\match_1773388243\\b\\tonmoy1",
+    "stages": {
+      "cropped": {
+        "exists": true,
+        "readable": true,
+        "shape": [
+          1121,
+          930,
+          3
+        ],
+        "dtype": "uint8",
+        "nonzero_ratio": 1.0,
+        "mean_intensity": 146.59869899827024,
+        "std_intensity": 46.60725315826146,
+        "nonzero_bbox": {
+          "x_min": 0,
+          "y_min": 0,
+          "x_max": 929,
+          "y_max": 1120
+        }
+      },
+      "cropped_mask": {
+        "exists": true,
+        "readable": true,
+        "shape": [
+          1121,
+          930
+        ],
+        "dtype": "uint8",
+        "nonzero_ratio": 0.5669668978350743,
+        "mean_intensity": 144.57655894794394,
+        "std_intensity": 126.35126091376137,
+        "nonzero_bbox": {
+          "x_min": 100,
+          "y_min": 178,
+          "x_max": 832,
+          "y_max": 1120
+        }
+      },
+      "nobg": {
+        "exists": true,
+        "readable": true,
+        "shape": [
+          1121,
+          930,
+          4
+        ],
+        "dtype": "uint8",
+        "alpha_foreground_ratio": 0.5669668978350743,
+        "nonzero_ratio": 0.5669668978350743,
+        "mean_intensity": 146.09316398568865,
+        "std_intensity": 74.97402227298393,
+        "nonzero_bbox": {
+          "x_min": 100,
+          "y_min": 178,
+          "x_max": 832,
+          "y_max": 1120
+        }
+      },
+      "normalised": {
+        "exists": true,
+        "readable": true,
+        "shape": [
+          1121,
+          930,
+          4
+        ],
+        "dtype": "uint8",
+        "alpha_foreground_ratio": 0.5669668978350743,
+        "nonzero_ratio": 0.5669668978350743,
+        "mean_intensity": 100.66583983194728,
+        "std_intensity": 98.07758601597968,
+        "nonzero_bbox": {
+          "x_min": 100,
+          "y_min": 178,
+          "x_max": 832,
+          "y_max": 1120
+        }
+      },
+      "enhanced": {
+        "exists": true,
+        "readable": true,
+        "shape": [
+          1121,
+          930,
+          4
+        ],
+        "dtype": "uint8",
+        "alpha_foreground_ratio": 0.5669668978350743,
+        "nonzero_ratio": 0.5669668978350743,
+        "mean_intensity": 100.52377701361112,
+        "std_intensity": 98.43394864035713,
+        "nonzero_bbox": {
+          "x_min": 100,
+          "y_min": 178,
+          "x_max": 832,
+          "y_max": 1120
+        }
+      },
+      "minutiae_csv": "D:\\contactless biome\\contactless-biometric\\match_outputs\\match_1773388243\\b\\tonmoy1\\minutiae.csv",
+      "minutiae_json": "D:\\contactless biome\\contactless-biometric\\match_outputs\\match_1773388243\\b\\tonmoy1\\minutiae.json",
+      "core_csv": null
+    },
+    "minutiae": {
+      "exists": true,
+      "count": 39,
+      "columns": [
+        "x",
+        "y",
+        "angle",
+        "score",
+        "class"
+      ],
+      "x_stats": {
+        "min": 270.0,
+        "median": 533.0,
+        "max": 788.0,
+        "mean": 543.4358974358975,
+        "std": 134.88072506264703
+      },
+      "y_stats": {
+        "min": 260.0,
+        "median": 779.0,
+        "max": 966.0,
+        "mean": 771.8974358974359,
+        "std": 143.39827894253747
+      },
+      "angle_stats": {
+        "min": 0.6747258364987624,
+        "median": 2.0743907377744586,
+        "max": 4.847643720893592,
+        "mean": 2.1465309195336264,
+        "std": 1.3488174240928612
+      },
+      "score_stats": {
+        "min": 0.4978765988461541,
+        "median": 0.6160546326748895,
+        "max": 0.7847472786903381,
+        "mean": 0.6331910481070544,
+        "std": 0.09643805542442987
+      },
+      "spatial_spread": {
+        "x_range": 518.0,
+        "y_range": 706.0,
+        "x_median": 533.0,
+        "y_median": 779.0
+      },
+      "class_counts": {
+        "0.0": 2,
+        "1.0": 6,
+        "2.0": 1,
+        "3.0": 28,
+        "5.0": 2
+      }
+    },
+    "descriptors": {
+      "raw_minutiae_count": 39,
+      "surviving_descriptor_count": 34,
+      "descriptor_survival_ratio": 0.8717948717948718,
+      "validity_mode": "mask",
+      "adaptive_neighbor_support": true,
+      "mask_coverage": {
+        "path": "D:\\contactless biome\\contactless-biometric\\match_outputs\\match_1773388243\\b\\tonmoy1\\cropped_mask.png",
+        "shape": [
+          1121,
+          930
+        ],
+        "foreground_ratio": 0.5669668978350743
+      },
+      "invalidation": {
+        "validity_mode": "mask",
+        "base_neighbor_threshold": 2,
+        "resolved_neighbor_threshold": 2,
+        "adaptive_neighbor_support": true,
+        "min_valid_cells_threshold": 936,
+        "too_few_valid_cells": 0,
+        "too_few_neighbors": 5,
+        "dropped_descriptors": 5,
+        "support_region_invalidated_cells": 366,
+        "in_radius_cells": 48672
+      }
+    }
+  },
+  "methods": {
+    "LSA": {
+      "final_score": 0.3298221280177434,
+      "similarity_matrix_shape": [
+        51,
+        34
+      ],
+      "top_local_pairs": [
+        {
+          "row": 16,
+          "col": 5,
+          "score": 0.4087182283401489
+        },
+        {
+          "row": 46,
+          "col": 18,
+          "score": 0.37719160318374634
+        },
+        {
+          "row": 9,
+          "col": 9,
+          "score": 0.3726773262023926
+        },
+        {
+          "row": 18,
+          "col": 1,
+          "score": 0.35769253969192505
+        },
+        {
+          "row": 25,
+          "col": 18,
+          "score": 0.3535460829734802
+        },
+        {
+          "row": 0,
+          "col": 32,
+          "score": 0.34523457288742065
+        },
+        {
+          "row": 6,
+          "col": 9,
+          "score": 0.33955466747283936
+        },
+        {
+          "row": 10,
+          "col": 17,
+          "score": 0.322563111782074
+        },
+        {
+          "row": 46,
+          "col": 32,
+          "score": 0.3144347667694092
+        },
+        {
+          "row": 21,
+          "col": 15,
+          "score": 0.3137540817260742
+        }
+      ],
+      "selected_pair_count": 12,
+      "selected_pairs": [
+        {
+          "row": 16,
+          "col": 5,
+          "score": 0.4087182283401489
+        },
+        {
+          "row": 46,
+          "col": 18,
+          "score": 0.37719160318374634
+        },
+        {
+          "row": 9,
+          "col": 9,
+          "score": 0.3726773262023926
+        },
+        {
+          "row": 18,
+          "col": 1,
+          "score": 0.35769253969192505
+        },
+        {
+          "row": 0,
+          "col": 32,
+          "score": 0.34523457288742065
+        },
+        {
+          "row": 10,
+          "col": 17,
+          "score": 0.322563111782074
+        },
+        {
+          "row": 30,
+          "col": 25,
+          "score": 0.3062439560890198
+        },
+        {
+          "row": 20,
+          "col": 28,
+          "score": 0.3061674237251282
+        },
+        {
+          "row": 25,
+          "col": 15,
+          "score": 0.3009182810783386
+        },
+        {
+          "row": 21,
+          "col": 26,
+          "score": 0.29579269886016846
+        }
+      ],
+      "selected_pair_scores": [
+        0.4087182283401489,
+        0.37719160318374634,
+        0.3726773262023926,
+        0.35769253969192505,
+        0.34523457288742065,
+        0.322563111782074,
+        0.3062439560890198,
+        0.3061674237251282,
+        0.3009182810783386,
+        0.29579269886016846
+      ],
+      "relaxed_top_scores": [],
+      "total_pairs": 1734,
+      "angle_rejected_pairs": null,
+      "matchable_rejected_pairs": null,
+      "comparable_pairs": null,
+      "nonzero_similarity_pairs": 915,
+      "min_matchable_cells": null,
+      "pose_details": {
+        "estimated_transform": {
+          "scale": 0.9148344908450707,
+          "rotation": -0.0701969483106617,
+          "rotation_degrees": -4.021988872898909,
+          "translation_x": 11.167972293943421,
+          "translation_y": 150.4174415042869
+        },
+        "overlap_area": 461149,
+        "overlap_ratio": 0.970942204442573,
+        "fallback_to_legacy": false,
+        "fallback_reason": null,
+        "raw_minutiae_count": {
+          "left": 58,
+          "right": 39
+        },
+        "normalized_overlap_minutiae_count": {
+          "left": 58,
+          "right": 39
+        },
+        "descriptor_count_before": {
+          "left": 51,
+          "right": 34
+        },
+        "descriptor_count_after": {
+          "left": 51,
+          "right": 34
+        },
+        "final_selected_pair_count": 12,
+        "legacy_method": "LSA-LEGACY",
+        "legacy_score": 0.3180510501066844
+      }
+    },
+    "LSA-LEGACY": {
+      "final_score": 0.3180510501066844,
+      "similarity_matrix_shape": [
+        51,
+        34
+      ],
+      "top_local_pairs": [
+        {
+          "row": 46,
+          "col": 18,
+          "score": 0.4061785340309143
+        },
+        {
+          "row": 9,
+          "col": 9,
+          "score": 0.36449116468429565
+        },
+        {
+          "row": 25,
+          "col": 18,
+          "score": 0.36036747694015503
+        },
+        {
+          "row": 21,
+          "col": 15,
+          "score": 0.33130794763565063
+        },
+        {
+          "row": 16,
+          "col": 5,
+          "score": 0.3257486820220947
+        },
+        {
+          "row": 0,
+          "col": 32,
+          "score": 0.31993263959884644
+        },
+        {
+          "row": 6,
+          "col": 9,
+          "score": 0.31367218494415283
+        },
+        {
+          "row": 43,
+          "col": 21,
+          "score": 0.3133588433265686
+        },
+        {
+          "row": 22,
+          "col": 21,
+          "score": 0.31218236684799194
+        },
+        {
+          "row": 4,
+          "col": 18,
+          "score": 0.3096073269844055
+        }
+      ],
+      "selected_pair_count": 12,
+      "selected_pairs": [
+        {
+          "row": 46,
+          "col": 18,
+          "score": 0.4061785340309143
+        },
+        {
+          "row": 9,
+          "col": 9,
+          "score": 0.36449116468429565
+        },
+        {
+          "row": 21,
+          "col": 15,
+          "score": 0.33130794763565063
+        },
+        {
+          "row": 16,
+          "col": 5,
+          "score": 0.3257486820220947
+        },
+        {
+          "row": 0,
+          "col": 32,
+          "score": 0.31993263959884644
+        },
+        {
+          "row": 43,
+          "col": 21,
+          "score": 0.3133588433265686
+        },
+        {
+          "row": 36,
+          "col": 3,
+          "score": 0.30557137727737427
+        },
+        {
+          "row": 13,
+          "col": 20,
+          "score": 0.3011418581008911
+        },
+        {
+          "row": 12,
+          "col": 7,
+          "score": 0.2943947911262512
+        },
+        {
+          "row": 18,
+          "col": 1,
+          "score": 0.29101836681365967
+        }
+      ],
+      "selected_pair_scores": [
+        0.4061785340309143,
+        0.36449116468429565,
+        0.33130794763565063,
+        0.3257486820220947,
+        0.31993263959884644,
+        0.3133588433265686,
+        0.30557137727737427,
+        0.3011418581008911,
+        0.2943947911262512,
+        0.29101836681365967
+      ],
+      "relaxed_top_scores": [],
+      "total_pairs": 1734,
+      "angle_rejected_pairs": 805,
+      "matchable_rejected_pairs": 0,
+      "comparable_pairs": 929,
+      "nonzero_similarity_pairs": 928,
+      "min_matchable_cells": 749
+    },
+    "LSA-R": {
+      "final_score": 0.2359677404165268,
+      "similarity_matrix_shape": [
+        51,
+        34
+      ],
+      "top_local_pairs": [
+        {
+          "row": 16,
+          "col": 5,
+          "score": 0.4087182283401489
+        },
+        {
+          "row": 46,
+          "col": 18,
+          "score": 0.37719160318374634
+        },
+        {
+          "row": 9,
+          "col": 9,
+          "score": 0.3726773262023926
+        },
+        {
+          "row": 18,
+          "col": 1,
+          "score": 0.35769253969192505
+        },
+        {
+          "row": 25,
+          "col": 18,
+          "score": 0.3535460829734802
+        },
+        {
+          "row": 0,
+          "col": 32,
+          "score": 0.34523457288742065
+        },
+        {
+          "row": 6,
+          "col": 9,
+          "score": 0.33955466747283936
+        },
+        {
+          "row": 10,
+          "col": 17,
+          "score": 0.322563111782074
+        },
+        {
+          "row": 46,
+          "col": 32,
+          "score": 0.3144347667694092
+        },
+        {
+          "row": 21,
+          "col": 15,
+          "score": 0.3137540817260742
+        }
+      ],
+      "selected_pair_count": 12,
+      "selected_pairs": [
+        {
+          "row": 34,
+          "col": 4,
+          "score": 0.2557605504989624
+        },
+        {
+          "row": 3,
+          "col": 19,
+          "score": 0.1978987455368042
+        },
+        {
+          "row": 47,
+          "col": 7,
+          "score": 0.21573984622955322
+        },
+        {
+          "row": 10,
+          "col": 13,
+          "score": 0.22048497200012207
+        },
+        {
+          "row": 2,
+          "col": 6,
+          "score": 0.24004590511322021
+        },
+        {
+          "row": 18,
+          "col": 1,
+          "score": 0.35769253969192505
+        },
+        {
+          "row": 39,
+          "col": 11,
+          "score": 0.1697346568107605
+        },
+        {
+          "row": 35,
+          "col": 16,
+          "score": 0.15971773862838745
+        },
+        {
+          "row": 5,
+          "col": 12,
+          "score": 0.20099681615829468
+        },
+        {
+          "row": 33,
+          "col": 31,
+          "score": 0.19301331043243408
+        }
+      ],
+      "selected_pair_scores": [
+        0.2557605504989624,
+        0.1978987455368042,
+        0.21573984622955322,
+        0.22048497200012207,
+        0.24004590511322021,
+        0.35769253969192505,
+        0.1697346568107605,
+        0.15971773862838745,
+        0.20099681615829468,
+        0.19301331043243408
+      ],
+      "relaxed_top_scores": [
+        0.30422621965408325,
+        0.23114395141601562,
+        0.24481475353240967,
+        0.2465781569480896,
+        0.2617450952529907,
+        0.3824780583381653,
+        0.1697346568107605,
+        0.15971773862838745,
+        0.20099681615829468,
+        0.19301331043243408
+      ],
+      "total_pairs": 1734,
+      "angle_rejected_pairs": null,
+      "matchable_rejected_pairs": null,
+      "comparable_pairs": null,
+      "nonzero_similarity_pairs": 915,
+      "min_matchable_cells": null,
+      "pose_details": {
+        "estimated_transform": {
+          "scale": 0.9148344908450707,
+          "rotation": -0.0701969483106617,
+          "rotation_degrees": -4.021988872898909,
+          "translation_x": 11.167972293943421,
+          "translation_y": 150.4174415042869
+        },
+        "overlap_area": 461149,
+        "overlap_ratio": 0.970942204442573,
+        "fallback_to_legacy": false,
+        "fallback_reason": null,
+        "raw_minutiae_count": {
+          "left": 58,
+          "right": 39
+        },
+        "normalized_overlap_minutiae_count": {
+          "left": 58,
+          "right": 39
+        },
+        "descriptor_count_before": {
+          "left": 51,
+          "right": 34
+        },
+        "descriptor_count_after": {
+          "left": 51,
+          "right": 34
+        },
+        "final_selected_pair_count": 12,
+        "legacy_method": "LSA-R-LEGACY",
+        "legacy_score": 0.23047660291194916
+      },
+      "relaxation_collapse_ratio": 0.5773359837040265,
+      "non_relaxed_reference_score": 0.2211085081100464,
+      "relaxation_details": {
+        "compatibility_summary": {
+          "min": 1.401298464324817e-45,
+          "median": 1.6522753782650378e-24,
+          "max": 0.10336307436227798,
+          "mean": 0.002772522857412696,
+          "nonzero_ratio": 0.11497326203208556
+        },
+        "iteration_summaries": [
+          {
+            "iteration": 1,
+            "min": 0.15971773862838745,
+            "median": 0.251577764749527,
+            "max": 0.3832052946090698,
+            "mean": 0.26225733757019043
+          },
+          {
+            "iteration": 2,
+            "min": 0.15971773862838745,
+            "median": 0.251577764749527,
+            "max": 0.3830677270889282,
+            "mean": 0.26227378845214844
+          },
+          {
+            "iteration": 3,
+            "min": 0.15971773862838745,
+            "median": 0.251577764749527,
+            "max": 0.3828705847263336,
+            "mean": 0.26228299736976624
+          },
+          {
+            "iteration": 4,
+            "min": 0.15971773862838745,
+            "median": 0.251577764749527,
+            "max": 0.382673978805542,
+            "mean": 0.2622910737991333
+          },
+          {
+            "iteration": 5,
+            "min": 0.15971773862838745,
+            "median": 0.251577764749527,
+            "max": 0.3824780583381653,
+            "mean": 0.26229915022850037
+          }
+        ],
+        "support_summaries": [
+          {
+            "iteration": 1,
+            "support_mean": 0.010519277064709488,
+            "support_median": 3.708093976708175e-17,
+            "support_min": 0.0,
+            "support_max": 0.10376041382551193
+          },
+          {
+            "iteration": 2,
+            "support_mean": 0.010519277064709488,
+            "support_median": 3.708093976708175e-17,
+            "support_min": 0.0,
+            "support_max": 0.10376041382551193
+          },
+          {
+            "iteration": 3,
+            "support_mean": 0.010519277064709488,
+            "support_median": 3.708093976708175e-17,
+            "support_min": 0.0,
+            "support_max": 0.10376041382551193
+          },
+          {
+            "iteration": 4,
+            "support_mean": 0.010519277064709488,
+            "support_median": 3.708093976708175e-17,
+            "support_min": 0.0,
+            "support_max": 0.10376041382551193
+          },
+          {
+            "iteration": 5,
+            "support_mean": 0.010519277064709488,
+            "support_median": 3.708093976708175e-17,
+            "support_min": 0.0,
+            "support_max": 0.10376041382551193
+          }
+        ],
+        "final_relaxed_ranking": [
+          {
+            "row": 34,
+            "col": 4,
+            "initial_score": 0.2557605504989624,
+            "relaxed_score": 0.30422621965408325
+          },
+          {
+            "row": 3,
+            "col": 19,
+            "initial_score": 0.1978987455368042,
+            "relaxed_score": 0.23114395141601562
+          },
+          {
+            "row": 47,
+            "col": 7,
+            "initial_score": 0.21573984622955322,
+            "relaxed_score": 0.24481475353240967
+          },
+          {
+            "row": 10,
+            "col": 13,
+            "initial_score": 0.22048497200012207,
+            "relaxed_score": 0.2465781569480896
+          },
+          {
+            "row": 2,
+            "col": 6,
+            "initial_score": 0.24004590511322021,
+            "relaxed_score": 0.2617450952529907
+          },
+          {
+            "row": 18,
+            "col": 1,
+            "initial_score": 0.35769253969192505,
+            "relaxed_score": 0.3824780583381653
+          },
+          {
+            "row": 39,
+            "col": 11,
+            "initial_score": 0.1697346568107605,
+            "relaxed_score": 0.1697346568107605
+          },
+          {
+            "row": 35,
+            "col": 16,
+            "initial_score": 0.15971773862838745,
+            "relaxed_score": 0.15971773862838745
+          },
+          {
+            "row": 5,
+            "col": 12,
+            "initial_score": 0.20099681615829468,
+            "relaxed_score": 0.20099681615829468
+          },
+          {
+            "row": 33,
+            "col": 31,
+            "initial_score": 0.19301331043243408,
+            "relaxed_score": 0.19301331043243408
+          }
+        ]
+      }
+    },
+    "LSA-R-LEGACY": {
+      "final_score": 0.23047660291194916,
+      "similarity_matrix_shape": [
+        51,
+        34
+      ],
+      "top_local_pairs": [
+        {
+          "row": 46,
+          "col": 18,
+          "score": 0.4061785340309143
+        },
+        {
+          "row": 9,
+          "col": 9,
+          "score": 0.36449116468429565
+        },
+        {
+          "row": 25,
+          "col": 18,
+          "score": 0.36036747694015503
+        },
+        {
+          "row": 21,
+          "col": 15,
+          "score": 0.33130794763565063
+        },
+        {
+          "row": 16,
+          "col": 5,
+          "score": 0.3257486820220947
+        },
+        {
+          "row": 0,
+          "col": 32,
+          "score": 0.31993263959884644
+        },
+        {
+          "row": 6,
+          "col": 9,
+          "score": 0.31367218494415283
+        },
+        {
+          "row": 43,
+          "col": 21,
+          "score": 0.3133588433265686
+        },
+        {
+          "row": 22,
+          "col": 21,
+          "score": 0.31218236684799194
+        },
+        {
+          "row": 4,
+          "col": 18,
+          "score": 0.3096073269844055
+        }
+      ],
+      "selected_pair_count": 34,
+      "selected_pairs": [
+        {
+          "row": 9,
+          "col": 9,
+          "score": 0.36449116468429565
+        },
+        {
+          "row": 25,
+          "col": 18,
+          "score": 0.36036747694015503
+        },
+        {
+          "row": 21,
+          "col": 15,
+          "score": 0.33130794763565063
+        },
+        {
+          "row": 16,
+          "col": 5,
+          "score": 0.3257486820220947
+        },
+        {
+          "row": 0,
+          "col": 32,
+          "score": 0.31993263959884644
+        },
+        {
+          "row": 43,
+          "col": 21,
+          "score": 0.3133588433265686
+        },
+        {
+          "row": 36,
+          "col": 3,
+          "score": 0.30557137727737427
+        },
+        {
+          "row": 13,
+          "col": 20,
+          "score": 0.3011418581008911
+        },
+        {
+          "row": 12,
+          "col": 7,
+          "score": 0.2943947911262512
+        },
+        {
+          "row": 18,
+          "col": 1,
+          "score": 0.29101836681365967
+        }
+      ],
+      "selected_pair_scores": [
+        0.36449116468429565,
+        0.36036747694015503,
+        0.33130794763565063,
+        0.3257486820220947,
+        0.31993263959884644,
+        0.3133588433265686,
+        0.30557137727737427,
+        0.3011418581008911,
+        0.2943947911262512,
+        0.29101836681365967
+      ],
+      "relaxed_top_scores": [
+        0.2776528596878052,
+        0.2242041826248169,
+        0.2739015817642212,
+        0.2692362666130066,
+        0.2992100417613983,
+        0.20034639537334442,
+        0.1704695224761963,
+        0.12837034463882446,
+        0.21434789896011353,
+        0.2254493236541748
+      ],
+      "total_pairs": 1734,
+      "angle_rejected_pairs": 805,
+      "matchable_rejected_pairs": 0,
+      "comparable_pairs": 929,
+      "nonzero_similarity_pairs": 928,
+      "min_matchable_cells": 749,
+      "relaxation_collapse_ratio": 0.5674268421442664,
+      "non_relaxed_reference_score": 0.3207333147525787,
+      "relaxation_details": {
+        "compatibility_summary": {
+          "min": 1.401298464324817e-45,
+          "median": 3.8568032116813293e-26,
+          "max": 0.9386736750602722,
+          "mean": 0.016135437414050102,
+          "nonzero_ratio": 0.10606060606060606
+        },
+        "iteration_summaries": [
+          {
+            "iteration": 1,
+            "min": 0.12837034463882446,
+            "median": 0.2678322494029999,
+            "max": 0.36449116468429565,
+            "mean": 0.25941792130470276
+          },
+          {
+            "iteration": 2,
+            "min": 0.12837034463882446,
+            "median": 0.2678322494029999,
+            "max": 0.36449116468429565,
+            "mean": 0.25989651679992676
+          },
+          {
+            "iteration": 3,
+            "min": 0.12837034463882446,
+            "median": 0.2690383195877075,
+            "max": 0.36449116468429565,
+            "mean": 0.2601686716079712
+          },
+          {
+            "iteration": 4,
+            "min": 0.12837034463882446,
+            "median": 0.2692362666130066,
+            "max": 0.36449116468429565,
+            "mean": 0.2603166103363037
+          },
+          {
+            "iteration": 5,
+            "min": 0.12837034463882446,
+            "median": 0.2692362666130066,
+            "max": 0.36449116468429565,
+            "mean": 0.26040223240852356
+          }
+        ],
+        "support_summaries": [
+          {
+            "iteration": 1,
+            "support_mean": 0.05647403196725506,
+            "support_median": 1.768577579624826e-17,
+            "support_min": 0.0,
+            "support_max": 0.9386973977088928
+          },
+          {
+            "iteration": 2,
+            "support_mean": 0.05647403196725506,
+            "support_median": 1.768577579624826e-17,
+            "support_min": 0.0,
+            "support_max": 0.9386973977088928
+          },
+          {
+            "iteration": 3,
+            "support_mean": 0.05647403196725506,
+            "support_median": 1.768577579624826e-17,
+            "support_min": 0.0,
+            "support_max": 0.9386973977088928
+          },
+          {
+            "iteration": 4,
+            "support_mean": 0.05647403196725506,
+            "support_median": 1.768577579624826e-17,
+            "support_min": 0.0,
+            "support_max": 0.9386973977088928
+          },
+          {
+            "iteration": 5,
+            "support_mean": 0.05647403196725506,
+            "support_median": 1.768577579624826e-17,
+            "support_min": 0.0,
+            "support_max": 0.9386973977088928
+          }
+        ],
+        "final_relaxed_ranking": [
+          {
+            "row": 38,
+            "col": 22,
+            "initial_score": 0.19325149059295654,
+            "relaxed_score": 0.2776528596878052,
+            "efficiency": 1.4367437362670898
+          },
+          {
+            "row": 44,
+            "col": 33,
+            "initial_score": 0.20391499996185303,
+            "relaxed_score": 0.2242041826248169,
+            "efficiency": 1.0994982719421387
+          },
+          {
+            "row": 34,
+            "col": 4,
+            "initial_score": 0.2531505227088928,
+            "relaxed_score": 0.2739015817642212,
+            "efficiency": 1.0819711685180664
+          },
+          {
+            "row": 7,
+            "col": 19,
+            "initial_score": 0.2572057843208313,
+            "relaxed_score": 0.2692362666130066,
+            "efficiency": 1.0467737913131714
+          },
+          {
+            "row": 18,
+            "col": 1,
+            "initial_score": 0.29101836681365967,
+            "relaxed_score": 0.2992100417613983,
+            "efficiency": 1.0281482934951782
+          },
+          {
+            "row": 48,
+            "col": 31,
+            "initial_score": 0.19792908430099487,
+            "relaxed_score": 0.20034639537334442,
+            "efficiency": 1.0122129917144775
+          },
+          {
+            "row": 39,
+            "col": 11,
+            "initial_score": 0.1704695224761963,
+            "relaxed_score": 0.1704695224761963,
+            "efficiency": 1.0
+          },
+          {
+            "row": 37,
+            "col": 13,
+            "initial_score": 0.12837034463882446,
+            "relaxed_score": 0.12837034463882446,
+            "efficiency": 1.0
+          },
+          {
+            "row": 1,
+            "col": 12,
+            "initial_score": 0.21434789896011353,
+            "relaxed_score": 0.21434789896011353,
+            "efficiency": 1.0
+          },
+          {
+            "row": 49,
+            "col": 29,
+            "initial_score": 0.2254493236541748,
+            "relaxed_score": 0.2254493236541748,
+            "efficiency": 1.0
+          }
+        ]
+      }
+    }
+  },
+  "descriptor_mode_comparison": {
+    "mask": {
+      "left_surviving_descriptor_count": 51,
+      "right_surviving_descriptor_count": 34
+    },
+    "hull": {
+      "left_surviving_descriptor_count": 51,
+      "right_surviving_descriptor_count": 34
+    }
+  },
+  "adaptive_neighbor_comparison": {
+    "adaptive_on": {
+      "left_surviving_descriptor_count": 51,
+      "right_surviving_descriptor_count": 34,
+      "left_resolved_neighbor_threshold": 2,
+      "right_resolved_neighbor_threshold": 2
+    },
+    "adaptive_off": {
+      "left_surviving_descriptor_count": 51,
+      "right_surviving_descriptor_count": 34,
+      "left_resolved_neighbor_threshold": 2,
+      "right_resolved_neighbor_threshold": 2
+    }
+  },
+  "dominant_bottleneck": "no dominant bottleneck identified"
+}

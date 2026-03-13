@@ -565,7 +565,7 @@ def parse_args() -> argparse.Namespace:
         parser.add_argument(
             "--method",
             default="LSA-R",
-            choices=("LSS", "LSA", "LSS-R", "LSA-R"),
+            choices=("LSS", "LSA", "LSS-R", "LSA-R", "LSA-OVERLAP", "LSA-R-OVERLAP"),
             help="MCC consolidation method.",
         )
         parser.add_argument(
@@ -1340,6 +1340,16 @@ MCC_RHO_PARAMS = (
     (math.pi / 12.0, -30.0),
     (math.pi / 12.0, -30.0),
 )
+MCC_OVERLAP_MIN_RATIO = 0.18
+MCC_OVERLAP_MIN_MINUTIAE = 4
+MCC_OVERLAP_MIN_SCALE = 0.80
+MCC_OVERLAP_MAX_SCALE = 1.25
+MCC_CANONICAL_FRAME_WIDTH = 1024
+MCC_CANONICAL_FRAME_HEIGHT = 1280
+MCC_CANONICAL_TIP_X = MCC_CANONICAL_FRAME_WIDTH / 2.0
+MCC_CANONICAL_TIP_Y = 120.0
+MCC_CANONICAL_TARGET_LENGTH = 850.0
+MCC_CANONICAL_TARGET_WIDTH = 550.0
 
 
 def wrap_angle(angle: float) -> float:
@@ -1404,9 +1414,12 @@ def _point_in_enlarged_hull(
 def _load_validity_mask(mask_path: Path | None) -> np.ndarray | None:
     if mask_path is None:
         return None
-    mask = cv2.imread(str(mask_path), cv2.IMREAD_UNCHANGED)
-    if mask is None:
-        raise FileNotFoundError(f"validity mask not found: {mask_path}")
+    if isinstance(mask_path, np.ndarray):
+        mask = mask_path.copy()
+    else:
+        mask = cv2.imread(str(mask_path), cv2.IMREAD_UNCHANGED)
+        if mask is None:
+            raise FileNotFoundError(f"validity mask not found: {mask_path}")
     if mask.ndim == 3:
         if mask.shape[2] == 4:
             mask = mask[:, :, 3]
@@ -1499,6 +1512,674 @@ def _overlap_valid_cell_mask(
     return overlap_valid
 
 
+def _rotation_angle(vector: np.ndarray) -> float:
+    return float(math.atan2(float(vector[1]), float(vector[0])))
+
+
+def _similarity_affine_matrix(
+    scale: float,
+    rotation: float,
+    translation_x: float,
+    translation_y: float,
+) -> np.ndarray:
+    cos_r = math.cos(rotation) * float(scale)
+    sin_r = math.sin(rotation) * float(scale)
+    return np.array(
+        [
+            [cos_r, -sin_r, float(translation_x)],
+            [sin_r, cos_r, float(translation_y)],
+        ],
+        dtype=np.float32,
+    )
+
+
+def _inverse_similarity_transform(
+    scale: float,
+    rotation: float,
+    translation_x: float,
+    translation_y: float,
+) -> tuple[float, float, float, float]:
+    inv_scale = 1.0 / float(scale)
+    inv_rotation = -float(rotation)
+    cos_r = math.cos(inv_rotation) * inv_scale
+    sin_r = math.sin(inv_rotation) * inv_scale
+    inv_translation_x = -((cos_r * float(translation_x)) - (sin_r * float(translation_y)))
+    inv_translation_y = -((sin_r * float(translation_x)) + (cos_r * float(translation_y)))
+    return inv_scale, inv_rotation, inv_translation_x, inv_translation_y
+
+
+def _warp_mask(
+    mask: np.ndarray,
+    shape: tuple[int, int],
+    scale: float,
+    rotation: float,
+    translation_x: float,
+    translation_y: float,
+) -> np.ndarray:
+    warped = cv2.warpAffine(
+        np.where(mask > 0, 255, 0).astype(np.uint8),
+        _similarity_affine_matrix(scale, rotation, translation_x, translation_y),
+        (int(shape[1]), int(shape[0])),
+        flags=cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+    return np.where(warped > 0, 255, 0).astype(np.uint8)
+
+
+def _axis_stats_from_mask(mask: np.ndarray) -> dict:
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not contours:
+        raise RuntimeError("no contour available for overlap estimation")
+    contour = max(contours, key=cv2.contourArea)
+    axis_u, axis_v, length_l, width_w = estimate_finger_axis(contour)
+    tip_center, tip_to_base = select_fingertip_end(
+        contour,
+        axis_u,
+        axis_v,
+        length_l,
+        mask.shape[:2],
+    )
+    center = np.array(
+        [float(np.mean(contour[:, 0, 0])), float(np.mean(contour[:, 0, 1]))],
+        dtype=np.float32,
+    )
+    return {
+        "contour": contour,
+        "axis_u": axis_u,
+        "axis_v": axis_v,
+        "length": float(length_l),
+        "width": float(width_w),
+        "tip_center": tip_center.astype(np.float32),
+        "tip_to_base": tip_to_base.astype(np.float32),
+        "center": center,
+    }
+
+
+def _estimate_overlap_region(
+    mask_a: np.ndarray,
+    mask_b: np.ndarray,
+) -> dict:
+    stats_a = _axis_stats_from_mask(mask_a)
+    stats_b = _axis_stats_from_mask(mask_b)
+    length_scale = stats_a["length"] / max(stats_b["length"], 1e-6)
+    width_scale = stats_a["width"] / max(stats_b["width"], 1e-6)
+    scale = float((length_scale + width_scale) / 2.0)
+
+    details = {
+        "estimated_transform": None,
+        "overlap_area": 0,
+        "overlap_ratio": 0.0,
+        "fallback_reason": None,
+        "common_mask_a": None,
+        "common_mask_b": None,
+        "warped_mask_b_area": 0,
+    }
+
+    if not (MCC_OVERLAP_MIN_SCALE <= scale <= MCC_OVERLAP_MAX_SCALE):
+        details["fallback_reason"] = "scale_out_of_range"
+        return details
+
+    rotation = wrap_angle(
+        _rotation_angle(stats_a["tip_to_base"]) - _rotation_angle(stats_b["tip_to_base"])
+    )
+    scaled_tip_b_x = float(stats_b["tip_center"][0]) * scale
+    scaled_tip_b_y = float(stats_b["tip_center"][1]) * scale
+    rotated_tip_b_x, rotated_tip_b_y = _transform_point(
+        scaled_tip_b_x,
+        scaled_tip_b_y,
+        rotation,
+        0.0,
+        0.0,
+    )
+    translation_x = float(stats_a["tip_center"][0]) - rotated_tip_b_x
+    translation_y = float(stats_a["tip_center"][1]) - rotated_tip_b_y
+
+    warped_mask_b = _warp_mask(
+        mask_b,
+        mask_a.shape[:2],
+        scale,
+        rotation,
+        translation_x,
+        translation_y,
+    )
+    common_mask_a = np.where((mask_a > 0) & (warped_mask_b > 0), 255, 0).astype(np.uint8)
+    smaller_area = max(1, min(int(np.count_nonzero(mask_a)), int(np.count_nonzero(mask_b))))
+    overlap_area = int(np.count_nonzero(common_mask_a))
+    overlap_ratio = float(overlap_area / smaller_area)
+
+    if overlap_ratio < MCC_OVERLAP_MIN_RATIO:
+        details["fallback_reason"] = "overlap_ratio_too_small"
+        details["overlap_area"] = overlap_area
+        details["overlap_ratio"] = overlap_ratio
+        details["warped_mask_b_area"] = int(np.count_nonzero(warped_mask_b))
+        details["estimated_transform"] = {
+            "scale": scale,
+            "rotation": rotation,
+            "rotation_degrees": float(math.degrees(rotation)),
+            "translation_x": translation_x,
+            "translation_y": translation_y,
+        }
+        return details
+
+    inv_scale, inv_rotation, inv_tx, inv_ty = _inverse_similarity_transform(
+        scale,
+        rotation,
+        translation_x,
+        translation_y,
+    )
+    warped_mask_a = _warp_mask(
+        mask_a,
+        mask_b.shape[:2],
+        inv_scale,
+        inv_rotation,
+        inv_tx,
+        inv_ty,
+    )
+    common_mask_b = np.where((mask_b > 0) & (warped_mask_a > 0), 255, 0).astype(np.uint8)
+
+    details["estimated_transform"] = {
+        "scale": scale,
+        "rotation": rotation,
+        "rotation_degrees": float(math.degrees(rotation)),
+        "translation_x": translation_x,
+        "translation_y": translation_y,
+    }
+    details["overlap_area"] = overlap_area
+    details["overlap_ratio"] = overlap_ratio
+    details["common_mask_a"] = common_mask_a
+    details["common_mask_b"] = common_mask_b
+    details["warped_mask_b_area"] = int(np.count_nonzero(warped_mask_b))
+    return details
+
+
+def _estimate_canonical_transform(mask: np.ndarray) -> dict:
+    stats = _axis_stats_from_mask(mask)
+    target_rotation = math.pi / 2.0
+    rotation = wrap_angle(target_rotation - _rotation_angle(stats["tip_to_base"]))
+    length_scale = MCC_CANONICAL_TARGET_LENGTH / max(stats["length"], 1e-6)
+    width_scale = MCC_CANONICAL_TARGET_WIDTH / max(stats["width"], 1e-6)
+    scale = float((length_scale + width_scale) / 2.0)
+
+    details = {
+        "estimated_transform": None,
+        "warped_mask": None,
+        "mask_area": 0,
+        "fallback_reason": None,
+    }
+    if not (MCC_OVERLAP_MIN_SCALE <= scale <= MCC_OVERLAP_MAX_SCALE):
+        details["fallback_reason"] = "scale_out_of_range"
+        details["estimated_transform"] = {
+            "scale": scale,
+            "rotation": rotation,
+            "rotation_degrees": float(math.degrees(rotation)),
+            "translation_x": None,
+            "translation_y": None,
+            "source_length": float(stats["length"]),
+            "source_width": float(stats["width"]),
+        }
+        return details
+
+    scaled_tip_x = float(stats["tip_center"][0]) * scale
+    scaled_tip_y = float(stats["tip_center"][1]) * scale
+    rotated_tip_x, rotated_tip_y = _transform_point(
+        scaled_tip_x,
+        scaled_tip_y,
+        rotation,
+        0.0,
+        0.0,
+    )
+    translation_x = float(MCC_CANONICAL_TIP_X) - rotated_tip_x
+    translation_y = float(MCC_CANONICAL_TIP_Y) - rotated_tip_y
+    warped_mask = _warp_mask(
+        mask,
+        (MCC_CANONICAL_FRAME_HEIGHT, MCC_CANONICAL_FRAME_WIDTH),
+        scale,
+        rotation,
+        translation_x,
+        translation_y,
+    )
+    details["estimated_transform"] = {
+        "scale": scale,
+        "rotation": rotation,
+        "rotation_degrees": float(math.degrees(rotation)),
+        "translation_x": translation_x,
+        "translation_y": translation_y,
+        "source_length": float(stats["length"]),
+        "source_width": float(stats["width"]),
+        "canonical_tip_x": float(MCC_CANONICAL_TIP_X),
+        "canonical_tip_y": float(MCC_CANONICAL_TIP_Y),
+        "canonical_frame_width": int(MCC_CANONICAL_FRAME_WIDTH),
+        "canonical_frame_height": int(MCC_CANONICAL_FRAME_HEIGHT),
+    }
+    details["warped_mask"] = warped_mask
+    details["mask_area"] = int(np.count_nonzero(warped_mask))
+    return details
+
+
+def _estimate_canonical_overlap_region(
+    mask_a: np.ndarray,
+    mask_b: np.ndarray,
+) -> dict:
+    canonical_a = _estimate_canonical_transform(mask_a)
+    canonical_b = _estimate_canonical_transform(mask_b)
+    details = {
+        "estimated_transform": {
+            "strategy": "canonical",
+            "left": canonical_a["estimated_transform"],
+            "right": canonical_b["estimated_transform"],
+        },
+        "overlap_area": 0,
+        "overlap_ratio": 0.0,
+        "fallback_reason": None,
+        "common_mask_a": None,
+        "common_mask_b": None,
+        "warped_mask_a_area": int(canonical_a["mask_area"]),
+        "warped_mask_b_area": int(canonical_b["mask_area"]),
+    }
+
+    if canonical_a["fallback_reason"] is not None:
+        details["fallback_reason"] = f"left_{canonical_a['fallback_reason']}"
+        return details
+    if canonical_b["fallback_reason"] is not None:
+        details["fallback_reason"] = f"right_{canonical_b['fallback_reason']}"
+        return details
+
+    warped_mask_a = canonical_a["warped_mask"]
+    warped_mask_b = canonical_b["warped_mask"]
+    common_mask = np.where((warped_mask_a > 0) & (warped_mask_b > 0), 255, 0).astype(np.uint8)
+    smaller_area = max(1, min(int(np.count_nonzero(warped_mask_a)), int(np.count_nonzero(warped_mask_b))))
+    overlap_area = int(np.count_nonzero(common_mask))
+    overlap_ratio = float(overlap_area / smaller_area)
+    details["overlap_area"] = overlap_area
+    details["overlap_ratio"] = overlap_ratio
+    if overlap_ratio < MCC_OVERLAP_MIN_RATIO:
+        details["fallback_reason"] = "overlap_ratio_too_small"
+        return details
+
+    details["common_mask_a"] = common_mask
+    details["common_mask_b"] = common_mask.copy()
+    return details
+
+
+def _filter_minutiae_by_mask(
+    minutiae_source: Path | pd.DataFrame,
+    mask: np.ndarray,
+) -> pd.DataFrame:
+    if isinstance(minutiae_source, pd.DataFrame):
+        frame = minutiae_source.copy()
+    else:
+        frame = pd.read_csv(minutiae_source)
+    frame = frame.dropna(subset=["x", "y", "angle"])
+    if frame.empty:
+        return frame
+
+    keep = frame.apply(
+        lambda row: _point_in_validity_mask(mask, float(row["x"]), float(row["y"])),
+        axis=1,
+    )
+    return frame.loc[keep].reset_index(drop=True)
+
+
+def _transform_minutiae_frame(
+    minutiae_source: Path | pd.DataFrame,
+    scale: float,
+    rotation: float,
+    translation_x: float,
+    translation_y: float,
+) -> pd.DataFrame:
+    if isinstance(minutiae_source, pd.DataFrame):
+        frame = minutiae_source.copy()
+    else:
+        frame = pd.read_csv(minutiae_source)
+    frame = frame.dropna(subset=["x", "y", "angle"]).reset_index(drop=True)
+    if frame.empty:
+        return frame
+
+    transformed = frame.copy()
+    coords = frame[["x", "y"]].to_numpy(dtype=np.float32)
+    cos_r = math.cos(rotation) * float(scale)
+    sin_r = math.sin(rotation) * float(scale)
+    matrix = np.array(
+        [
+            [cos_r, -sin_r],
+            [sin_r, cos_r],
+        ],
+        dtype=np.float32,
+    )
+    transformed_coords = coords @ matrix.T
+    transformed_coords[:, 0] += float(translation_x)
+    transformed_coords[:, 1] += float(translation_y)
+    transformed.loc[:, "x"] = transformed_coords[:, 0]
+    transformed.loc[:, "y"] = transformed_coords[:, 1]
+    transformed.loc[:, "angle"] = transformed["angle"].apply(
+        lambda value: wrap_angle(float(value) + float(rotation))
+    )
+    return transformed.reset_index(drop=True)
+
+
+def _base_method_for_overlap(method: str) -> str:
+    normalized = method.upper()
+    if normalized == "LSA-OVERLAP":
+        return "LSA"
+    if normalized == "LSA-R-OVERLAP":
+        return "LSA-R"
+    raise ValueError(f"unsupported overlap-aware method: {method}")
+
+
+def _base_method_for_legacy(method: str) -> str:
+    normalized = method.upper()
+    if normalized in {"LSA", "LSA-R", "LSS", "LSS-R"}:
+        return normalized
+    if normalized == "LSA-LEGACY":
+        return "LSA"
+    if normalized == "LSA-R-LEGACY":
+        return "LSA-R"
+    raise ValueError(f"unsupported legacy MCC method: {method}")
+
+
+def match_minutiae_csv_legacy(
+    path_a: Path | pd.DataFrame,
+    path_b: Path | pd.DataFrame,
+    method: str = "LSA-R",
+    mask_path_a: Path | np.ndarray | None = None,
+    mask_path_b: Path | np.ndarray | None = None,
+    overlap_mode: str = "auto",
+) -> tuple[float, np.ndarray]:
+    base_method = _base_method_for_legacy(method)
+    descriptors_a = build_descriptors(path_a, validity_mask_path=mask_path_a)
+    descriptors_b = build_descriptors(path_b, validity_mask_path=mask_path_b)
+    return match_descriptors(
+        descriptors_a,
+        descriptors_b,
+        method=base_method,
+        overlap_mode=overlap_mode,
+    )
+
+
+def match_minutiae_csv_pose_normalized_details(
+    path_a: Path | pd.DataFrame,
+    path_b: Path | pd.DataFrame,
+    mask_path_a: Path | np.ndarray | None,
+    mask_path_b: Path | np.ndarray | None,
+    method: str,
+    strategy: str = "relative",
+    overlap_mode: str = "auto",
+) -> tuple[float, np.ndarray, dict]:
+    base_method = _base_method_for_legacy(method)
+    normalized_strategy = strategy.lower()
+    if normalized_strategy not in {"relative", "canonical"}:
+        raise ValueError(f"unsupported pose normalization strategy: {strategy}")
+    legacy_score, legacy_sim_matrix = match_minutiae_csv_legacy(
+        path_a if isinstance(path_a, Path) else path_a.copy(),
+        path_b if isinstance(path_b, Path) else path_b.copy(),
+        method=base_method,
+        mask_path_a=mask_path_a if mask_path_a is None or isinstance(mask_path_a, Path) else mask_path_a.copy(),
+        mask_path_b=mask_path_b if mask_path_b is None or isinstance(mask_path_b, Path) else mask_path_b.copy(),
+        overlap_mode=overlap_mode,
+    )
+
+    details = {
+        "fallback_to_legacy": False,
+        "fallback_reason": None,
+        "estimated_transform": None,
+        "overlap_area": 0,
+        "overlap_ratio": 0.0,
+        "left_raw_minutiae_count": 0,
+        "right_raw_minutiae_count": 0,
+        "left_overlap_minutiae_count": 0,
+        "right_overlap_minutiae_count": 0,
+        "left_descriptor_count_before": 0,
+        "right_descriptor_count_before": 0,
+        "left_descriptor_count_after": 0,
+        "right_descriptor_count_after": 0,
+        "selected_pair_count": 0,
+        "selected_pairs": [],
+        "selected_pair_scores": [],
+        "relaxed_top_scores": [],
+        "relaxation_details": None,
+        "legacy_score": float(legacy_score),
+        "legacy_method": f"{base_method}-LEGACY",
+        "strategy": normalized_strategy,
+    }
+
+    if mask_path_a is None or mask_path_b is None:
+        details["fallback_to_legacy"] = True
+        details["fallback_reason"] = "missing_masks"
+        return legacy_score, legacy_sim_matrix, details
+
+    mask_a = _load_validity_mask(mask_path_a)
+    mask_b = _load_validity_mask(mask_path_b)
+    if mask_a is None or mask_b is None:
+        details["fallback_to_legacy"] = True
+        details["fallback_reason"] = "missing_masks"
+        return legacy_score, legacy_sim_matrix, details
+
+    raw_frame_a = path_a.copy() if isinstance(path_a, pd.DataFrame) else pd.read_csv(path_a)
+    raw_frame_b = path_b.copy() if isinstance(path_b, pd.DataFrame) else pd.read_csv(path_b)
+    raw_frame_a = raw_frame_a.dropna(subset=["x", "y", "angle"]).reset_index(drop=True)
+    raw_frame_b = raw_frame_b.dropna(subset=["x", "y", "angle"]).reset_index(drop=True)
+    details["left_raw_minutiae_count"] = int(len(raw_frame_a))
+    details["right_raw_minutiae_count"] = int(len(raw_frame_b))
+
+    if normalized_strategy == "relative":
+        overlap_details = _estimate_overlap_region(mask_a, mask_b)
+    else:
+        overlap_details = _estimate_canonical_overlap_region(mask_a, mask_b)
+    details["estimated_transform"] = overlap_details["estimated_transform"]
+    details["overlap_area"] = int(overlap_details["overlap_area"])
+    details["overlap_ratio"] = float(overlap_details["overlap_ratio"])
+    if overlap_details["fallback_reason"] is not None:
+        details["fallback_to_legacy"] = True
+        details["fallback_reason"] = overlap_details["fallback_reason"]
+        return legacy_score, legacy_sim_matrix, details
+
+    if normalized_strategy == "relative":
+        transform = overlap_details["estimated_transform"]
+        normalized_a = raw_frame_a.copy()
+        normalized_b = _transform_minutiae_frame(
+            raw_frame_b,
+            scale=float(transform["scale"]),
+            rotation=float(transform["rotation"]),
+            translation_x=float(transform["translation_x"]),
+            translation_y=float(transform["translation_y"]),
+        )
+        common_mask_a = overlap_details["common_mask_a"]
+        common_mask_b = overlap_details["common_mask_b"]
+    else:
+        transform_left = overlap_details["estimated_transform"]["left"]
+        transform_right = overlap_details["estimated_transform"]["right"]
+        normalized_a = _transform_minutiae_frame(
+            raw_frame_a,
+            scale=float(transform_left["scale"]),
+            rotation=float(transform_left["rotation"]),
+            translation_x=float(transform_left["translation_x"]),
+            translation_y=float(transform_left["translation_y"]),
+        )
+        normalized_b = _transform_minutiae_frame(
+            raw_frame_b,
+            scale=float(transform_right["scale"]),
+            rotation=float(transform_right["rotation"]),
+            translation_x=float(transform_right["translation_x"]),
+            translation_y=float(transform_right["translation_y"]),
+        )
+        common_mask_a = overlap_details["common_mask_a"]
+        common_mask_b = overlap_details["common_mask_b"]
+
+    filtered_a = _filter_minutiae_by_mask(normalized_a, common_mask_a)
+    filtered_b = _filter_minutiae_by_mask(normalized_b, common_mask_b)
+    details["left_overlap_minutiae_count"] = int(len(filtered_a))
+    details["right_overlap_minutiae_count"] = int(len(filtered_b))
+    if len(filtered_a) < MCC_OVERLAP_MIN_MINUTIAE or len(filtered_b) < MCC_OVERLAP_MIN_MINUTIAE:
+        details["fallback_to_legacy"] = True
+        details["fallback_reason"] = "too_few_overlap_minutiae"
+        return legacy_score, legacy_sim_matrix, details
+
+    descriptors_before_a = build_descriptors(raw_frame_a, validity_mask_path=mask_a, validity_mode="mask")
+    descriptors_before_b = build_descriptors(raw_frame_b, validity_mask_path=mask_b, validity_mode="mask")
+    descriptors_after_a = build_descriptors(
+        filtered_a,
+        validity_mask_path=common_mask_a,
+        validity_mode="mask",
+    )
+    descriptors_after_b = build_descriptors(
+        filtered_b,
+        validity_mask_path=common_mask_b,
+        validity_mode="mask",
+    )
+    details["left_descriptor_count_before"] = int(len(descriptors_before_a))
+    details["right_descriptor_count_before"] = int(len(descriptors_before_b))
+    details["left_descriptor_count_after"] = int(len(descriptors_after_a))
+    details["right_descriptor_count_after"] = int(len(descriptors_after_b))
+    if len(descriptors_after_a) == 0 or len(descriptors_after_b) == 0:
+        details["fallback_to_legacy"] = True
+        details["fallback_reason"] = "no_descriptors_after_normalization"
+        return legacy_score, legacy_sim_matrix, details
+
+    score, sim_matrix = match_descriptors(
+        descriptors_after_a,
+        descriptors_after_b,
+        method=base_method,
+        overlap_mode=overlap_mode,
+    )
+    n_pairs = _compute_n_pairs(len(descriptors_after_a), len(descriptors_after_b))
+    if base_method == "LSA":
+        selected_pairs = _select_lsa_pairs(sim_matrix, n_pairs)
+    else:
+        rel_pairs = _select_lsa_pairs(
+            sim_matrix,
+            min(len(descriptors_after_a), len(descriptors_after_b)),
+        )
+        relaxed, efficiency, relaxation_details = _relax_pairs_with_details(
+            descriptors_after_a,
+            descriptors_after_b,
+            rel_pairs,
+        )
+        top_indices = np.argsort(efficiency)[::-1][: min(n_pairs, len(rel_pairs))]
+        selected_pairs = [rel_pairs[index] for index in top_indices]
+        details["relaxed_top_scores"] = [float(relaxed[index]) for index in top_indices]
+        details["relaxation_details"] = relaxation_details
+
+    details["selected_pair_count"] = int(len(selected_pairs))
+    details["selected_pairs"] = [
+        {"row": int(row), "col": int(col), "score": float(pair_score)}
+        for row, col, pair_score in selected_pairs
+    ]
+    details["selected_pair_scores"] = [float(pair_score) for _, _, pair_score in selected_pairs]
+    return score, sim_matrix, details
+
+
+def match_minutiae_csv_overlap_details(
+    path_a: Path | pd.DataFrame,
+    path_b: Path | pd.DataFrame,
+    mask_path_a: Path | np.ndarray | None,
+    mask_path_b: Path | np.ndarray | None,
+    method: str,
+    overlap_mode: str = "auto",
+) -> tuple[float, np.ndarray, dict]:
+    base_method = _base_method_for_overlap(method)
+    base_score, base_sim_matrix = match_minutiae_csv(
+        path_a if isinstance(path_a, Path) else path_a.copy(),
+        path_b if isinstance(path_b, Path) else path_b.copy(),
+        method=base_method,
+        mask_path_a=mask_path_a if mask_path_a is None or isinstance(mask_path_a, Path) else mask_path_a.copy(),
+        mask_path_b=mask_path_b if mask_path_b is None or isinstance(mask_path_b, Path) else mask_path_b.copy(),
+        overlap_mode=overlap_mode,
+    )
+
+    details = {
+        "fallback_to_base": False,
+        "fallback_reason": None,
+        "estimated_transform": None,
+        "overlap_area": 0,
+        "overlap_ratio": 0.0,
+        "left_raw_minutiae_count": 0,
+        "right_raw_minutiae_count": 0,
+        "left_overlap_minutiae_count": 0,
+        "right_overlap_minutiae_count": 0,
+        "left_descriptor_count_before": 0,
+        "right_descriptor_count_before": 0,
+        "left_descriptor_count_after": 0,
+        "right_descriptor_count_after": 0,
+        "selected_pair_count": 0,
+    }
+
+    if mask_path_a is None or mask_path_b is None:
+        details["fallback_to_base"] = True
+        details["fallback_reason"] = "missing_masks"
+        return base_score, base_sim_matrix, details
+
+    mask_a = _load_validity_mask(mask_path_a)
+    mask_b = _load_validity_mask(mask_path_b)
+    if mask_a is None or mask_b is None:
+        details["fallback_to_base"] = True
+        details["fallback_reason"] = "missing_masks"
+        return base_score, base_sim_matrix, details
+
+    raw_frame_a = path_a.copy() if isinstance(path_a, pd.DataFrame) else pd.read_csv(path_a)
+    raw_frame_b = path_b.copy() if isinstance(path_b, pd.DataFrame) else pd.read_csv(path_b)
+    raw_frame_a = raw_frame_a.dropna(subset=["x", "y", "angle"])
+    raw_frame_b = raw_frame_b.dropna(subset=["x", "y", "angle"])
+    details["left_raw_minutiae_count"] = int(len(raw_frame_a))
+    details["right_raw_minutiae_count"] = int(len(raw_frame_b))
+
+    overlap_details = _estimate_overlap_region(mask_a, mask_b)
+    details["estimated_transform"] = overlap_details["estimated_transform"]
+    details["overlap_area"] = int(overlap_details["overlap_area"])
+    details["overlap_ratio"] = float(overlap_details["overlap_ratio"])
+    if overlap_details["fallback_reason"] is not None:
+        details["fallback_to_base"] = True
+        details["fallback_reason"] = overlap_details["fallback_reason"]
+        return base_score, base_sim_matrix, details
+
+    filtered_a = _filter_minutiae_by_mask(raw_frame_a, overlap_details["common_mask_a"])
+    filtered_b = _filter_minutiae_by_mask(raw_frame_b, overlap_details["common_mask_b"])
+    details["left_overlap_minutiae_count"] = int(len(filtered_a))
+    details["right_overlap_minutiae_count"] = int(len(filtered_b))
+    if len(filtered_a) < MCC_OVERLAP_MIN_MINUTIAE or len(filtered_b) < MCC_OVERLAP_MIN_MINUTIAE:
+        details["fallback_to_base"] = True
+        details["fallback_reason"] = "too_few_overlap_minutiae"
+        return base_score, base_sim_matrix, details
+
+    descriptors_before_a = build_descriptors(raw_frame_a, validity_mask_path=mask_a, validity_mode="mask")
+    descriptors_before_b = build_descriptors(raw_frame_b, validity_mask_path=mask_b, validity_mode="mask")
+    descriptors_after_a = build_descriptors(
+        filtered_a,
+        validity_mask_path=overlap_details["common_mask_a"],
+        validity_mode="mask",
+    )
+    descriptors_after_b = build_descriptors(
+        filtered_b,
+        validity_mask_path=overlap_details["common_mask_b"],
+        validity_mode="mask",
+    )
+    details["left_descriptor_count_before"] = int(len(descriptors_before_a))
+    details["right_descriptor_count_before"] = int(len(descriptors_before_b))
+    details["left_descriptor_count_after"] = int(len(descriptors_after_a))
+    details["right_descriptor_count_after"] = int(len(descriptors_after_b))
+    if len(descriptors_after_a) == 0 or len(descriptors_after_b) == 0:
+        details["fallback_to_base"] = True
+        details["fallback_reason"] = "no_descriptors_after_overlap_filter"
+        return base_score, base_sim_matrix, details
+
+    score, sim_matrix = match_descriptors(
+        descriptors_after_a,
+        descriptors_after_b,
+        method=base_method,
+        overlap_mode=overlap_mode,
+    )
+    n_pairs = _compute_n_pairs(len(descriptors_after_a), len(descriptors_after_b))
+    if base_method == "LSA":
+        selected_pairs = [pair for pair in _select_lsa_pairs(sim_matrix, n_pairs) if pair[2] > 0.0]
+    else:
+        rel_pairs = _select_lsa_pairs(sim_matrix, min(len(descriptors_after_a), len(descriptors_after_b)))
+        relaxed, efficiency = _relax_pairs(descriptors_after_a, descriptors_after_b, rel_pairs)
+        top_indices = np.argsort(efficiency)[::-1][: min(n_pairs, len(rel_pairs))]
+        selected_pairs = [rel_pairs[index] for index in top_indices if rel_pairs[index][2] > 0.0]
+    details["selected_pair_count"] = int(len(selected_pairs))
+    return score, sim_matrix, details
+
+
 def _resolve_validity_mode(
     validity_mode: str,
     validity_mask: np.ndarray | None,
@@ -1586,12 +2267,15 @@ def _flatten_descriptors(
 
 
 def build_descriptors(
-    path: Path,
-    validity_mask_path: Path | None = None,
+    path: Path | pd.DataFrame,
+    validity_mask_path: Path | np.ndarray | None = None,
     validity_mode: str = "auto",
     adaptive_neighbor_support: bool = True,
 ) -> list[MCCCylinder]:
-    minutiae_df = pd.read_csv(path)
+    if isinstance(path, pd.DataFrame):
+        minutiae_df = path.copy()
+    else:
+        minutiae_df = pd.read_csv(path)
     minutiae_df = minutiae_df.dropna(subset=["x", "y", "angle"])
     minutiae = minutiae_df.to_dict(orient="records")
     if not minutiae:
@@ -2089,6 +2773,10 @@ def match_descriptors(
         return 0.0, sim_matrix
 
     normalized_method = method.upper()
+    if normalized_method in {"LSA-OVERLAP", "LSA-R-OVERLAP"}:
+        raise ValueError(
+            f"{normalized_method} requires minutiae CSV inputs and masks, not prebuilt descriptors"
+        )
     if normalized_method == "LSS":
         pairs = _select_lss_pairs(sim_matrix, n_pairs)
         return (
@@ -2128,12 +2816,33 @@ def match_minutiae_csv(
     mask_path_b: Path | None = None,
     overlap_mode: str = "auto",
 ) -> tuple[float, np.ndarray]:
-    descriptors_a = build_descriptors(path_a, validity_mask_path=mask_path_a)
-    descriptors_b = build_descriptors(path_b, validity_mask_path=mask_path_b)
-    return match_descriptors(
-        descriptors_a,
-        descriptors_b,
+    normalized_method = method.upper()
+    if normalized_method in {"LSA-OVERLAP", "LSA-R-OVERLAP"}:
+        score, sim_matrix, _ = match_minutiae_csv_overlap_details(
+            path_a,
+            path_b,
+            mask_path_a,
+            mask_path_b,
+            method=method,
+            overlap_mode=overlap_mode,
+        )
+        return score, sim_matrix
+    if normalized_method in {"LSA", "LSA-R"} and mask_path_a is not None and mask_path_b is not None:
+        score, sim_matrix, _ = match_minutiae_csv_pose_normalized_details(
+            path_a,
+            path_b,
+            mask_path_a,
+            mask_path_b,
+            method=method,
+            overlap_mode=overlap_mode,
+        )
+        return score, sim_matrix
+    return match_minutiae_csv_legacy(
+        path_a,
+        path_b,
         method=method,
+        mask_path_a=mask_path_a,
+        mask_path_b=mask_path_b,
         overlap_mode=overlap_mode,
     )
 
@@ -2226,6 +2935,16 @@ def _match_fingerprint_images_with_workspace(
     run_dir.mkdir(parents=True, exist_ok=True)
     csv_a, mask_a = _extract_minutiae_csv_from_image(image_a, run_dir / "a", model_paths)
     csv_b, mask_b = _extract_minutiae_csv_from_image(image_b, run_dir / "b", model_paths)
+    if method.upper() in {"LSA", "LSA-R", "LSA-OVERLAP", "LSA-R-OVERLAP"}:
+        score, sim_matrix = match_minutiae_csv(
+            csv_a,
+            csv_b,
+            method=method,
+            mask_path_a=mask_a,
+            mask_path_b=mask_b,
+            overlap_mode="auto",
+        )
+        return score, sim_matrix, run_dir
     descriptors_a = build_descriptors(
         csv_a,
         validity_mask_path=mask_a,

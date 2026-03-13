@@ -1,0 +1,1156 @@
+{
+  "mode": "diagnose",
+  "run_dir": "D:\\contactless biome\\contactless-biometric\\match_outputs\\match_1773386602",
+  "left": {
+    "path": "D:\\contactless biome\\contactless-biometric\\match_outputs\\match_1773386602\\a\\amit",
+    "stages": {
+      "cropped": {
+        "exists": true,
+        "readable": true,
+        "shape": [
+          665,
+          515,
+          3
+        ],
+        "dtype": "uint8",
+        "nonzero_ratio": 1.0,
+        "mean_intensity": 94.78818210574981,
+        "std_intensity": 76.96520055967922,
+        "nonzero_bbox": {
+          "x_min": 0,
+          "y_min": 0,
+          "x_max": 514,
+          "y_max": 664
+        }
+      },
+      "cropped_mask": {
+        "exists": true,
+        "readable": true,
+        "shape": [
+          665,
+          515
+        ],
+        "dtype": "uint8",
+        "nonzero_ratio": 0.49289145193079786,
+        "mean_intensity": 125.68732024235345,
+        "std_intensity": 127.48711382761873,
+        "nonzero_bbox": {
+          "x_min": 30,
+          "y_min": 126,
+          "x_max": 406,
+          "y_max": 664
+        }
+      },
+      "nobg": {
+        "exists": true,
+        "readable": true,
+        "shape": [
+          665,
+          515,
+          4
+        ],
+        "dtype": "uint8",
+        "alpha_foreground_ratio": 0.49289145193079786,
+        "nonzero_ratio": 0.49289145193079786,
+        "mean_intensity": 102.51296663990072,
+        "std_intensity": 93.19329111698417,
+        "nonzero_bbox": {
+          "x_min": 30,
+          "y_min": 126,
+          "x_max": 406,
+          "y_max": 664
+        }
+      },
+      "normalised": {
+        "exists": true,
+        "readable": true,
+        "shape": [
+          665,
+          515,
+          4
+        ],
+        "dtype": "uint8",
+        "alpha_foreground_ratio": 0.49289145193079786,
+        "nonzero_ratio": 0.49289145193079786,
+        "mean_intensity": 88.52307321702314,
+        "std_intensity": 97.92113549722195,
+        "nonzero_bbox": {
+          "x_min": 30,
+          "y_min": 126,
+          "x_max": 406,
+          "y_max": 664
+        }
+      },
+      "enhanced": {
+        "exists": true,
+        "readable": true,
+        "shape": [
+          665,
+          515,
+          4
+        ],
+        "dtype": "uint8",
+        "alpha_foreground_ratio": 0.49289145193079786,
+        "nonzero_ratio": 0.49289145193079786,
+        "mean_intensity": 88.435412073874,
+        "std_intensity": 98.00967638803422,
+        "nonzero_bbox": {
+          "x_min": 30,
+          "y_min": 126,
+          "x_max": 406,
+          "y_max": 664
+        }
+      },
+      "minutiae_csv": "D:\\contactless biome\\contactless-biometric\\match_outputs\\match_1773386602\\a\\amit\\minutiae.csv",
+      "minutiae_json": "D:\\contactless biome\\contactless-biometric\\match_outputs\\match_1773386602\\a\\amit\\minutiae.json",
+      "core_csv": null
+    },
+    "minutiae": {
+      "exists": true,
+      "count": 13,
+      "columns": [
+        "x",
+        "y",
+        "angle",
+        "score",
+        "class"
+      ],
+      "x_stats": {
+        "min": 189.0,
+        "median": 307.0,
+        "max": 349.0,
+        "mean": 293.2307692307692,
+        "std": 48.96176506080865
+      },
+      "y_stats": {
+        "min": 162.0,
+        "median": 310.0,
+        "max": 434.0,
+        "mean": 305.84615384615387,
+        "std": 76.56957233969655
+      },
+      "angle_stats": {
+        "min": 0.568262930458377,
+        "median": 1.4127136828707565,
+        "max": 4.27362185571066,
+        "mean": 1.6661850339009603,
+        "std": 0.9257519975695953
+      },
+      "score_stats": {
+        "min": 0.5729963552221307,
+        "median": 0.7123881690204144,
+        "max": 0.9961331129074096,
+        "mean": 0.7480953881989016,
+        "std": 0.12145232865422145
+      },
+      "spatial_spread": {
+        "x_range": 160.0,
+        "y_range": 272.0,
+        "x_median": 307.0,
+        "y_median": 310.0
+      },
+      "class_counts": {
+        "0.0": 3,
+        "1.0": 2,
+        "3.0": 4,
+        "5.0": 4
+      }
+    },
+    "descriptors": {
+      "raw_minutiae_count": 13,
+      "surviving_descriptor_count": 11,
+      "descriptor_survival_ratio": 0.8461538461538461,
+      "validity_mode": "mask",
+      "adaptive_neighbor_support": true,
+      "mask_coverage": {
+        "path": "D:\\contactless biome\\contactless-biometric\\match_outputs\\match_1773386602\\a\\amit\\cropped_mask.png",
+        "shape": [
+          665,
+          515
+        ],
+        "foreground_ratio": 0.49289145193079786
+      },
+      "invalidation": {
+        "validity_mode": "mask",
+        "base_neighbor_threshold": 2,
+        "resolved_neighbor_threshold": 2,
+        "adaptive_neighbor_support": true,
+        "min_valid_cells_threshold": 936,
+        "too_few_valid_cells": 0,
+        "too_few_neighbors": 2,
+        "dropped_descriptors": 2,
+        "support_region_invalidated_cells": 516,
+        "in_radius_cells": 16224
+      }
+    }
+  },
+  "right": {
+    "path": "D:\\contactless biome\\contactless-biometric\\match_outputs\\match_1773386602\\b\\amitind2",
+    "stages": {
+      "cropped": {
+        "exists": true,
+        "readable": true,
+        "shape": [
+          800,
+          585,
+          3
+        ],
+        "dtype": "uint8",
+        "nonzero_ratio": 1.0,
+        "mean_intensity": 77.16223504273505,
+        "std_intensity": 69.48278035068108,
+        "nonzero_bbox": {
+          "x_min": 0,
+          "y_min": 0,
+          "x_max": 584,
+          "y_max": 799
+        }
+      },
+      "cropped_mask": {
+        "exists": true,
+        "readable": true,
+        "shape": [
+          800,
+          585
+        ],
+        "dtype": "uint8",
+        "nonzero_ratio": 0.4311111111111111,
+        "mean_intensity": 109.93333333333334,
+        "std_intensity": 126.28405371313602,
+        "nonzero_bbox": {
+          "x_min": 27,
+          "y_min": 159,
+          "x_max": 442,
+          "y_max": 799
+        }
+      },
+      "nobg": {
+        "exists": true,
+        "readable": true,
+        "shape": [
+          800,
+          585,
+          4
+        ],
+        "dtype": "uint8",
+        "alpha_foreground_ratio": 0.4311111111111111,
+        "nonzero_ratio": 0.4311111111111111,
+        "mean_intensity": 85.35500961538462,
+        "std_intensity": 88.36952413075484,
+        "nonzero_bbox": {
+          "x_min": 27,
+          "y_min": 159,
+          "x_max": 442,
+          "y_max": 799
+        }
+      },
+      "normalised": {
+        "exists": true,
+        "readable": true,
+        "shape": [
+          800,
+          585,
+          4
+        ],
+        "dtype": "uint8",
+        "alpha_foreground_ratio": 0.4311111111111111,
+        "nonzero_ratio": 0.4311111111111111,
+        "mean_intensity": 72.44221153846154,
+        "std_intensity": 93.11794533722833,
+        "nonzero_bbox": {
+          "x_min": 27,
+          "y_min": 159,
+          "x_max": 442,
+          "y_max": 799
+        }
+      },
+      "enhanced": {
+        "exists": true,
+        "readable": true,
+        "shape": [
+          800,
+          585,
+          4
+        ],
+        "dtype": "uint8",
+        "alpha_foreground_ratio": 0.4311111111111111,
+        "nonzero_ratio": 0.4311111111111111,
+        "mean_intensity": 72.30442628205128,
+        "std_intensity": 93.50524252214939,
+        "nonzero_bbox": {
+          "x_min": 27,
+          "y_min": 159,
+          "x_max": 442,
+          "y_max": 799
+        }
+      },
+      "minutiae_csv": "D:\\contactless biome\\contactless-biometric\\match_outputs\\match_1773386602\\b\\amitind2\\minutiae.csv",
+      "minutiae_json": "D:\\contactless biome\\contactless-biometric\\match_outputs\\match_1773386602\\b\\amitind2\\minutiae.json",
+      "core_csv": null
+    },
+    "minutiae": {
+      "exists": true,
+      "count": 33,
+      "columns": [
+        "x",
+        "y",
+        "angle",
+        "score",
+        "class"
+      ],
+      "x_stats": {
+        "min": 170.0,
+        "median": 330.0,
+        "max": 405.0,
+        "mean": 305.2121212121212,
+        "std": 72.83220964770413
+      },
+      "y_stats": {
+        "min": 206.0,
+        "median": 353.0,
+        "max": 589.0,
+        "mean": 357.1515151515151,
+        "std": 90.87157811893402
+      },
+      "angle_stats": {
+        "min": 0.6956245720231364,
+        "median": 1.5580377456953465,
+        "max": 4.166280591322202,
+        "mean": 1.771106239260728,
+        "std": 0.8851658928647399
+      },
+      "score_stats": {
+        "min": 0.468963196286685,
+        "median": 0.7678394600749016,
+        "max": 0.9890583872795105,
+        "mean": 0.7376413023409425,
+        "std": 0.13172357474721721
+      },
+      "spatial_spread": {
+        "x_range": 235.0,
+        "y_range": 383.0,
+        "x_median": 330.0,
+        "y_median": 353.0
+      },
+      "class_counts": {
+        "0.0": 6,
+        "1.0": 5,
+        "2.0": 2,
+        "3.0": 17,
+        "5.0": 3
+      }
+    },
+    "descriptors": {
+      "raw_minutiae_count": 33,
+      "surviving_descriptor_count": 32,
+      "descriptor_survival_ratio": 0.9696969696969697,
+      "validity_mode": "mask",
+      "adaptive_neighbor_support": true,
+      "mask_coverage": {
+        "path": "D:\\contactless biome\\contactless-biometric\\match_outputs\\match_1773386602\\b\\amitind2\\cropped_mask.png",
+        "shape": [
+          800,
+          585
+        ],
+        "foreground_ratio": 0.4311111111111111
+      },
+      "invalidation": {
+        "validity_mode": "mask",
+        "base_neighbor_threshold": 2,
+        "resolved_neighbor_threshold": 2,
+        "adaptive_neighbor_support": true,
+        "min_valid_cells_threshold": 936,
+        "too_few_valid_cells": 0,
+        "too_few_neighbors": 1,
+        "dropped_descriptors": 1,
+        "support_region_invalidated_cells": 1734,
+        "in_radius_cells": 41184
+      }
+    }
+  },
+  "methods": {
+    "LSA": {
+      "final_score": 0.4496452808380127,
+      "similarity_matrix_shape": [
+        10,
+        31
+      ],
+      "top_local_pairs": [
+        {
+          "row": 8,
+          "col": 26,
+          "score": 0.4781125783920288
+        },
+        {
+          "row": 3,
+          "col": 5,
+          "score": 0.44641923904418945
+        },
+        {
+          "row": 1,
+          "col": 11,
+          "score": 0.4426920413970947
+        },
+        {
+          "row": 7,
+          "col": 28,
+          "score": 0.4313572645187378
+        },
+        {
+          "row": 1,
+          "col": 0,
+          "score": 0.4239917993545532
+        },
+        {
+          "row": 0,
+          "col": 13,
+          "score": 0.42375075817108154
+        },
+        {
+          "row": 4,
+          "col": 1,
+          "score": 0.4145103693008423
+        },
+        {
+          "row": 3,
+          "col": 12,
+          "score": 0.40328139066696167
+        },
+        {
+          "row": 7,
+          "col": 11,
+          "score": 0.3985384702682495
+        },
+        {
+          "row": 8,
+          "col": 0,
+          "score": 0.380557119846344
+        }
+      ],
+      "selected_pair_count": 4,
+      "selected_pairs": [
+        {
+          "row": 8,
+          "col": 26,
+          "score": 0.4781125783920288
+        },
+        {
+          "row": 3,
+          "col": 5,
+          "score": 0.44641923904418945
+        },
+        {
+          "row": 1,
+          "col": 11,
+          "score": 0.4426920413970947
+        },
+        {
+          "row": 7,
+          "col": 28,
+          "score": 0.4313572645187378
+        }
+      ],
+      "selected_pair_scores": [
+        0.4781125783920288,
+        0.44641923904418945,
+        0.4426920413970947,
+        0.4313572645187378
+      ],
+      "relaxed_top_scores": [],
+      "total_pairs": 310,
+      "angle_rejected_pairs": null,
+      "matchable_rejected_pairs": null,
+      "comparable_pairs": null,
+      "nonzero_similarity_pairs": 212,
+      "min_matchable_cells": null,
+      "pose_details": {
+        "estimated_transform": {
+          "scale": 0.8995187632132593,
+          "rotation": -0.034526757570673805,
+          "rotation_degrees": -1.9782374890709722,
+          "translation_x": -18.445186771519843,
+          "translation_y": -7.706729436497056
+        },
+        "overlap_area": 150234,
+        "overlap_ratio": 0.8899960308762285,
+        "fallback_to_legacy": false,
+        "fallback_reason": null,
+        "raw_minutiae_count": {
+          "left": 13,
+          "right": 33
+        },
+        "normalized_overlap_minutiae_count": {
+          "left": 13,
+          "right": 33
+        },
+        "descriptor_count_before": {
+          "left": 11,
+          "right": 32
+        },
+        "descriptor_count_after": {
+          "left": 10,
+          "right": 31
+        },
+        "final_selected_pair_count": 4,
+        "legacy_method": "LSA-LEGACY",
+        "legacy_score": 0.4770849794149399
+      }
+    },
+    "LSA-LEGACY": {
+      "final_score": 0.4770849794149399,
+      "similarity_matrix_shape": [
+        11,
+        32
+      ],
+      "top_local_pairs": [
+        {
+          "row": 9,
+          "col": 27,
+          "score": 0.5209352970123291
+        },
+        {
+          "row": 0,
+          "col": 13,
+          "score": 0.474437952041626
+        },
+        {
+          "row": 3,
+          "col": 5,
+          "score": 0.4585556983947754
+        },
+        {
+          "row": 1,
+          "col": 11,
+          "score": 0.45441097021102905
+        },
+        {
+          "row": 1,
+          "col": 0,
+          "score": 0.44099920988082886
+        },
+        {
+          "row": 8,
+          "col": 29,
+          "score": 0.42914503812789917
+        },
+        {
+          "row": 9,
+          "col": 0,
+          "score": 0.41060739755630493
+        },
+        {
+          "row": 0,
+          "col": 4,
+          "score": 0.39878547191619873
+        },
+        {
+          "row": 3,
+          "col": 12,
+          "score": 0.39660435914993286
+        },
+        {
+          "row": 1,
+          "col": 5,
+          "score": 0.39583349227905273
+        }
+      ],
+      "selected_pair_count": 4,
+      "selected_pairs": [
+        {
+          "row": 9,
+          "col": 27,
+          "score": 0.5209352970123291
+        },
+        {
+          "row": 0,
+          "col": 13,
+          "score": 0.474437952041626
+        },
+        {
+          "row": 3,
+          "col": 5,
+          "score": 0.4585556983947754
+        },
+        {
+          "row": 1,
+          "col": 11,
+          "score": 0.45441097021102905
+        }
+      ],
+      "selected_pair_scores": [
+        0.5209352970123291,
+        0.474437952041626,
+        0.4585556983947754,
+        0.45441097021102905
+      ],
+      "relaxed_top_scores": [],
+      "total_pairs": 352,
+      "angle_rejected_pairs": 73,
+      "matchable_rejected_pairs": 0,
+      "comparable_pairs": 279,
+      "nonzero_similarity_pairs": 243,
+      "min_matchable_cells": 749
+    },
+    "LSA-R": {
+      "final_score": 0.4436914920806885,
+      "similarity_matrix_shape": [
+        10,
+        31
+      ],
+      "top_local_pairs": [
+        {
+          "row": 8,
+          "col": 26,
+          "score": 0.4781125783920288
+        },
+        {
+          "row": 3,
+          "col": 5,
+          "score": 0.44641923904418945
+        },
+        {
+          "row": 1,
+          "col": 11,
+          "score": 0.4426920413970947
+        },
+        {
+          "row": 7,
+          "col": 28,
+          "score": 0.4313572645187378
+        },
+        {
+          "row": 1,
+          "col": 0,
+          "score": 0.4239917993545532
+        },
+        {
+          "row": 0,
+          "col": 13,
+          "score": 0.42375075817108154
+        },
+        {
+          "row": 4,
+          "col": 1,
+          "score": 0.4145103693008423
+        },
+        {
+          "row": 3,
+          "col": 12,
+          "score": 0.40328139066696167
+        },
+        {
+          "row": 7,
+          "col": 11,
+          "score": 0.3985384702682495
+        },
+        {
+          "row": 8,
+          "col": 0,
+          "score": 0.380557119846344
+        }
+      ],
+      "selected_pair_count": 4,
+      "selected_pairs": [
+        {
+          "row": 5,
+          "col": 30,
+          "score": 0.13363420963287354
+        },
+        {
+          "row": 6,
+          "col": 28,
+          "score": 0.31953656673431396
+        },
+        {
+          "row": 0,
+          "col": 13,
+          "score": 0.42375075817108154
+        },
+        {
+          "row": 3,
+          "col": 5,
+          "score": 0.44641923904418945
+        }
+      ],
+      "selected_pair_scores": [
+        0.13363420963287354,
+        0.31953656673431396,
+        0.42375075817108154,
+        0.44641923904418945
+      ],
+      "relaxed_top_scores": [
+        0.43318694829940796,
+        0.4462383985519409,
+        0.44762492179870605,
+        0.44771572947502136
+      ],
+      "total_pairs": 310,
+      "angle_rejected_pairs": null,
+      "matchable_rejected_pairs": null,
+      "comparable_pairs": null,
+      "nonzero_similarity_pairs": 212,
+      "min_matchable_cells": null,
+      "pose_details": {
+        "estimated_transform": {
+          "scale": 0.8995187632132593,
+          "rotation": -0.034526757570673805,
+          "rotation_degrees": -1.9782374890709722,
+          "translation_x": -18.445186771519843,
+          "translation_y": -7.706729436497056
+        },
+        "overlap_area": 150234,
+        "overlap_ratio": 0.8899960308762285,
+        "fallback_to_legacy": false,
+        "fallback_reason": null,
+        "raw_minutiae_count": {
+          "left": 13,
+          "right": 33
+        },
+        "normalized_overlap_minutiae_count": {
+          "left": 13,
+          "right": 33
+        },
+        "descriptor_count_before": {
+          "left": 11,
+          "right": 32
+        },
+        "descriptor_count_after": {
+          "left": 10,
+          "right": 31
+        },
+        "final_selected_pair_count": 4,
+        "legacy_method": "LSA-R-LEGACY",
+        "legacy_score": 0.4507150650024414
+      },
+      "relaxation_collapse_ratio": 0.928006315108663,
+      "non_relaxed_reference_score": 0.3308351933956146,
+      "relaxation_details": {
+        "compatibility_summary": {
+          "min": 1.401298464324817e-45,
+          "median": 1.2181966636046019e-17,
+          "max": 0.9416849613189697,
+          "mean": 0.07522305101156235,
+          "nonzero_ratio": 0.5888888888888889
+        },
+        "iteration_summaries": [
+          {
+            "iteration": 1,
+            "min": 0.0883219838142395,
+            "median": 0.3985585570335388,
+            "max": 0.45842087268829346,
+            "mean": 0.3632966876029968
+          },
+          {
+            "iteration": 2,
+            "min": 0.0883219838142395,
+            "median": 0.41126513481140137,
+            "max": 0.4514451026916504,
+            "mean": 0.3744053244590759
+          },
+          {
+            "iteration": 3,
+            "min": 0.0883219838142395,
+            "median": 0.4131453335285187,
+            "max": 0.44901445508003235,
+            "mean": 0.38251665234565735
+          },
+          {
+            "iteration": 4,
+            "min": 0.0883219838142395,
+            "median": 0.4231463372707367,
+            "max": 0.44817373156547546,
+            "mean": 0.3880043625831604
+          },
+          {
+            "iteration": 5,
+            "min": 0.0883219838142395,
+            "median": 0.4285893738269806,
+            "max": 0.4478839635848999,
+            "mean": 0.39156219363212585
+          }
+        ],
+        "support_summaries": [
+          {
+            "iteration": 1,
+            "support_mean": 0.39868218500504676,
+            "support_median": 5.63902696759655e-09,
+            "support_min": 1.401298464324817e-45,
+            "support_max": 1.662602424621582
+          },
+          {
+            "iteration": 2,
+            "support_mean": 0.39868218500504676,
+            "support_median": 5.63902696759655e-09,
+            "support_min": 1.401298464324817e-45,
+            "support_max": 1.662602424621582
+          },
+          {
+            "iteration": 3,
+            "support_mean": 0.39868218500504676,
+            "support_median": 5.63902696759655e-09,
+            "support_min": 1.401298464324817e-45,
+            "support_max": 1.662602424621582
+          },
+          {
+            "iteration": 4,
+            "support_mean": 0.39868218500504676,
+            "support_median": 5.63902696759655e-09,
+            "support_min": 1.401298464324817e-45,
+            "support_max": 1.662602424621582
+          },
+          {
+            "iteration": 5,
+            "support_mean": 0.39868218500504676,
+            "support_median": 5.63902696759655e-09,
+            "support_min": 1.401298464324817e-45,
+            "support_max": 1.662602424621582
+          }
+        ],
+        "final_relaxed_ranking": [
+          {
+            "row": 5,
+            "col": 30,
+            "initial_score": 0.13363420963287354,
+            "relaxed_score": 0.43318694829940796
+          },
+          {
+            "row": 6,
+            "col": 28,
+            "initial_score": 0.31953656673431396,
+            "relaxed_score": 0.4462383985519409
+          },
+          {
+            "row": 0,
+            "col": 13,
+            "initial_score": 0.42375075817108154,
+            "relaxed_score": 0.44762492179870605
+          },
+          {
+            "row": 3,
+            "col": 5,
+            "initial_score": 0.44641923904418945,
+            "relaxed_score": 0.44771572947502136
+          }
+        ]
+      }
+    },
+    "LSA-R-LEGACY": {
+      "final_score": 0.4507150650024414,
+      "similarity_matrix_shape": [
+        11,
+        32
+      ],
+      "top_local_pairs": [
+        {
+          "row": 9,
+          "col": 27,
+          "score": 0.5209352970123291
+        },
+        {
+          "row": 0,
+          "col": 13,
+          "score": 0.474437952041626
+        },
+        {
+          "row": 3,
+          "col": 5,
+          "score": 0.4585556983947754
+        },
+        {
+          "row": 1,
+          "col": 11,
+          "score": 0.45441097021102905
+        },
+        {
+          "row": 1,
+          "col": 0,
+          "score": 0.44099920988082886
+        },
+        {
+          "row": 8,
+          "col": 29,
+          "score": 0.42914503812789917
+        },
+        {
+          "row": 9,
+          "col": 0,
+          "score": 0.41060739755630493
+        },
+        {
+          "row": 0,
+          "col": 4,
+          "score": 0.39878547191619873
+        },
+        {
+          "row": 3,
+          "col": 12,
+          "score": 0.39660435914993286
+        },
+        {
+          "row": 1,
+          "col": 5,
+          "score": 0.39583349227905273
+        }
+      ],
+      "selected_pair_count": 11,
+      "selected_pairs": [
+        {
+          "row": 9,
+          "col": 27,
+          "score": 0.5209352970123291
+        },
+        {
+          "row": 0,
+          "col": 13,
+          "score": 0.474437952041626
+        },
+        {
+          "row": 3,
+          "col": 5,
+          "score": 0.4585556983947754
+        },
+        {
+          "row": 1,
+          "col": 11,
+          "score": 0.45441097021102905
+        },
+        {
+          "row": 10,
+          "col": 30,
+          "score": 0.3884667754173279
+        },
+        {
+          "row": 7,
+          "col": 29,
+          "score": 0.38251256942749023
+        },
+        {
+          "row": 5,
+          "col": 1,
+          "score": 0.37850773334503174
+        },
+        {
+          "row": 8,
+          "col": 22,
+          "score": 0.3733510375022888
+        },
+        {
+          "row": 6,
+          "col": 0,
+          "score": 0.1360732913017273
+        },
+        {
+          "row": 2,
+          "col": 20,
+          "score": 0.09066641330718994
+        }
+      ],
+      "selected_pair_scores": [
+        0.5209352970123291,
+        0.474437952041626,
+        0.4585556983947754,
+        0.45441097021102905,
+        0.3884667754173279,
+        0.38251256942749023,
+        0.37850773334503174,
+        0.3733510375022888,
+        0.1360732913017273,
+        0.09066641330718994
+      ],
+      "relaxed_top_scores": [
+        0.46976619958877563,
+        0.47611743211746216,
+        0.47646939754486084,
+        0.380507230758667
+      ],
+      "total_pairs": 352,
+      "angle_rejected_pairs": 73,
+      "matchable_rejected_pairs": 0,
+      "comparable_pairs": 279,
+      "nonzero_similarity_pairs": 243,
+      "min_matchable_cells": 749,
+      "relaxation_collapse_ratio": 0.8652035436788117,
+      "non_relaxed_reference_score": 0.4770849794149399,
+      "relaxation_details": {
+        "compatibility_summary": {
+          "min": 2.802596928649634e-45,
+          "median": 2.520852769090053e-18,
+          "max": 0.996764600276947,
+          "mean": 0.1864107996225357,
+          "nonzero_ratio": 0.4818181818181818
+        },
+        "iteration_summaries": [
+          {
+            "iteration": 1,
+            "min": 0.09066641330718994,
+            "median": 0.380510151386261,
+            "max": 0.4919586181640625,
+            "mean": 0.34989163279533386
+          },
+          {
+            "iteration": 2,
+            "min": 0.09066641330718994,
+            "median": 0.3884667754173279,
+            "max": 0.4820244014263153,
+            "mean": 0.35726749897003174
+          },
+          {
+            "iteration": 3,
+            "min": 0.09066641330718994,
+            "median": 0.3884667754173279,
+            "max": 0.4785001873970032,
+            "mean": 0.3605099618434906
+          },
+          {
+            "iteration": 4,
+            "min": 0.09066641330718994,
+            "median": 0.3884667754173279,
+            "max": 0.4772185683250427,
+            "mean": 0.361973375082016
+          },
+          {
+            "iteration": 5,
+            "min": 0.09066641330718994,
+            "median": 0.3884667754173279,
+            "max": 0.4767444133758545,
+            "mean": 0.3626478314399719
+          }
+        ],
+        "support_summaries": [
+          {
+            "iteration": 1,
+            "support_mean": 0.8981610578181972,
+            "support_median": 8.02840016689288e-10,
+            "support_min": 4.5694695110701087e-29,
+            "support_max": 2.7551369667053223
+          },
+          {
+            "iteration": 2,
+            "support_mean": 0.8981610578181972,
+            "support_median": 8.02840016689288e-10,
+            "support_min": 4.5694695110701087e-29,
+            "support_max": 2.7551369667053223
+          },
+          {
+            "iteration": 3,
+            "support_mean": 0.8981610578181972,
+            "support_median": 8.02840016689288e-10,
+            "support_min": 4.5694695110701087e-29,
+            "support_max": 2.7551369667053223
+          },
+          {
+            "iteration": 4,
+            "support_mean": 0.8981610578181972,
+            "support_median": 8.02840016689288e-10,
+            "support_min": 4.5694695110701087e-29,
+            "support_max": 2.7551369667053223
+          },
+          {
+            "iteration": 5,
+            "support_mean": 0.8981610578181972,
+            "support_median": 8.02840016689288e-10,
+            "support_min": 4.5694695110701087e-29,
+            "support_max": 2.7551369667053223
+          }
+        ],
+        "final_relaxed_ranking": [
+          {
+            "row": 6,
+            "col": 0,
+            "initial_score": 0.1360732913017273,
+            "relaxed_score": 0.46976619958877563,
+            "efficiency": 3.4523026943206787
+          },
+          {
+            "row": 1,
+            "col": 11,
+            "initial_score": 0.45441097021102905,
+            "relaxed_score": 0.47611743211746216,
+            "efficiency": 1.0477683544158936
+          },
+          {
+            "row": 3,
+            "col": 5,
+            "initial_score": 0.4585556983947754,
+            "relaxed_score": 0.47646939754486084,
+            "efficiency": 1.0390654802322388
+          },
+          {
+            "row": 5,
+            "col": 1,
+            "initial_score": 0.37850773334503174,
+            "relaxed_score": 0.380507230758667,
+            "efficiency": 1.0052825212478638
+          },
+          {
+            "row": 0,
+            "col": 13,
+            "initial_score": 0.474437952041626,
+            "relaxed_score": 0.47652745246887207,
+            "efficiency": 1.0044041872024536
+          },
+          {
+            "row": 10,
+            "col": 30,
+            "initial_score": 0.3884667754173279,
+            "relaxed_score": 0.3884667754173279,
+            "efficiency": 1.0
+          },
+          {
+            "row": 2,
+            "col": 20,
+            "initial_score": 0.09066641330718994,
+            "relaxed_score": 0.09066641330718994,
+            "efficiency": 1.0
+          },
+          {
+            "row": 7,
+            "col": 29,
+            "initial_score": 0.38251256942749023,
+            "relaxed_score": 0.3805096447467804,
+            "efficiency": 0.9947637915611267
+          },
+          {
+            "row": 9,
+            "col": 27,
+            "initial_score": 0.5209352970123291,
+            "relaxed_score": 0.4767444133758545,
+            "efficiency": 0.9151701331138611
+          },
+          {
+            "row": 8,
+            "col": 22,
+            "initial_score": 0.3733510375022888,
+            "relaxed_score": 0.1866755187511444,
+            "efficiency": 0.5
+          }
+        ]
+      }
+    }
+  },
+  "descriptor_mode_comparison": {
+    "mask": {
+      "left_surviving_descriptor_count": 11,
+      "right_surviving_descriptor_count": 32
+    },
+    "hull": {
+      "left_surviving_descriptor_count": 11,
+      "right_surviving_descriptor_count": 32
+    }
+  },
+  "adaptive_neighbor_comparison": {
+    "adaptive_on": {
+      "left_surviving_descriptor_count": 11,
+      "right_surviving_descriptor_count": 32,
+      "left_resolved_neighbor_threshold": 2,
+      "right_resolved_neighbor_threshold": 2
+    },
+    "adaptive_off": {
+      "left_surviving_descriptor_count": 11,
+      "right_surviving_descriptor_count": 32,
+      "left_resolved_neighbor_threshold": 2,
+      "right_resolved_neighbor_threshold": 2
+    }
+  },
+  "dominant_bottleneck": "minutiae extraction"
+}

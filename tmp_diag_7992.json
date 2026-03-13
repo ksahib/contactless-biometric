@@ -1,0 +1,1313 @@
+{
+  "mode": "diagnose",
+  "run_dir": "D:\\contactless biome\\contactless-biometric\\match_outputs\\match_1773387992",
+  "left": {
+    "path": "D:\\contactless biome\\contactless-biometric\\match_outputs\\match_1773387992\\a\\tony",
+    "stages": {
+      "cropped": {
+        "exists": true,
+        "readable": true,
+        "shape": [
+          1156,
+          1220,
+          3
+        ],
+        "dtype": "uint8",
+        "nonzero_ratio": 1.0,
+        "mean_intensity": 128.80923761983095,
+        "std_intensity": 43.47646023134097,
+        "nonzero_bbox": {
+          "x_min": 0,
+          "y_min": 0,
+          "x_max": 1219,
+          "y_max": 1155
+        }
+      },
+      "cropped_mask": {
+        "exists": true,
+        "readable": true,
+        "shape": [
+          1156,
+          1220
+        ],
+        "dtype": "uint8",
+        "nonzero_ratio": 0.3655886607294798,
+        "mean_intensity": 93.22510848601736,
+        "std_intensity": 122.80668471913376,
+        "nonzero_bbox": {
+          "x_min": 204,
+          "y_min": 170,
+          "x_max": 890,
+          "y_max": 1155
+        }
+      },
+      "nobg": {
+        "exists": true,
+        "readable": true,
+        "shape": [
+          1156,
+          1220,
+          4
+        ],
+        "dtype": "uint8",
+        "alpha_foreground_ratio": 0.3655886607294798,
+        "nonzero_ratio": 0.3655886607294798,
+        "mean_intensity": 119.91320533637756,
+        "std_intensity": 73.65759003508359,
+        "nonzero_bbox": {
+          "x_min": 204,
+          "y_min": 170,
+          "x_max": 890,
+          "y_max": 1155
+        }
+      },
+      "normalised": {
+        "exists": true,
+        "readable": true,
+        "shape": [
+          1156,
+          1220,
+          4
+        ],
+        "dtype": "uint8",
+        "alpha_foreground_ratio": 0.3655886607294798,
+        "nonzero_ratio": 0.3655886607294798,
+        "mean_intensity": 63.76133572522548,
+        "std_intensity": 91.3451031379096,
+        "nonzero_bbox": {
+          "x_min": 204,
+          "y_min": 170,
+          "x_max": 890,
+          "y_max": 1155
+        }
+      },
+      "enhanced": {
+        "exists": true,
+        "readable": true,
+        "shape": [
+          1156,
+          1220,
+          4
+        ],
+        "dtype": "uint8",
+        "alpha_foreground_ratio": 0.3655886607294798,
+        "nonzero_ratio": 0.3655886607294798,
+        "mean_intensity": 63.65453336831357,
+        "std_intensity": 91.4676103803938,
+        "nonzero_bbox": {
+          "x_min": 204,
+          "y_min": 170,
+          "x_max": 890,
+          "y_max": 1155
+        }
+      },
+      "minutiae_csv": "D:\\contactless biome\\contactless-biometric\\match_outputs\\match_1773387992\\a\\tony\\minutiae.csv",
+      "minutiae_json": "D:\\contactless biome\\contactless-biometric\\match_outputs\\match_1773387992\\a\\tony\\minutiae.json",
+      "core_csv": null
+    },
+    "minutiae": {
+      "exists": true,
+      "count": 43,
+      "columns": [
+        "x",
+        "y",
+        "angle",
+        "score",
+        "class"
+      ],
+      "x_stats": {
+        "min": 412.0,
+        "median": 730.0,
+        "max": 858.0,
+        "mean": 677.5581395348837,
+        "std": 132.41518607590072
+      },
+      "y_stats": {
+        "min": 218.0,
+        "median": 533.0,
+        "max": 818.0,
+        "mean": 513.0232558139535,
+        "std": 142.78353894637448
+      },
+      "angle_stats": {
+        "min": 0.1635958263490341,
+        "median": 2.227475383910845,
+        "max": 5.970648954714239,
+        "mean": 2.4010010721678405,
+        "std": 1.497658994883372
+      },
+      "score_stats": {
+        "min": 0.4626748258247971,
+        "median": 0.7024977743625641,
+        "max": 0.9745775103569032,
+        "mean": 0.6797794091624724,
+        "std": 0.1219963140097197
+      },
+      "spatial_spread": {
+        "x_range": 446.0,
+        "y_range": 600.0,
+        "x_median": 730.0,
+        "y_median": 533.0
+      },
+      "class_counts": {
+        "0.0": 2,
+        "1.0": 9,
+        "2.0": 3,
+        "3.0": 19,
+        "5.0": 10
+      }
+    },
+    "descriptors": {
+      "raw_minutiae_count": 43,
+      "surviving_descriptor_count": 40,
+      "descriptor_survival_ratio": 0.9302325581395349,
+      "validity_mode": "mask",
+      "adaptive_neighbor_support": true,
+      "mask_coverage": {
+        "path": "D:\\contactless biome\\contactless-biometric\\match_outputs\\match_1773387992\\a\\tony\\cropped_mask.png",
+        "shape": [
+          1156,
+          1220
+        ],
+        "foreground_ratio": 0.3655886607294798
+      },
+      "invalidation": {
+        "validity_mode": "mask",
+        "base_neighbor_threshold": 2,
+        "resolved_neighbor_threshold": 2,
+        "adaptive_neighbor_support": true,
+        "min_valid_cells_threshold": 936,
+        "too_few_valid_cells": 2,
+        "too_few_neighbors": 1,
+        "dropped_descriptors": 3,
+        "support_region_invalidated_cells": 1602,
+        "in_radius_cells": 53664
+      }
+    }
+  },
+  "right": {
+    "path": "D:\\contactless biome\\contactless-biometric\\match_outputs\\match_1773387992\\b\\tonmoy1",
+    "stages": {
+      "cropped": {
+        "exists": true,
+        "readable": true,
+        "shape": [
+          1121,
+          930,
+          3
+        ],
+        "dtype": "uint8",
+        "nonzero_ratio": 1.0,
+        "mean_intensity": 146.59869899827024,
+        "std_intensity": 46.60725315826146,
+        "nonzero_bbox": {
+          "x_min": 0,
+          "y_min": 0,
+          "x_max": 929,
+          "y_max": 1120
+        }
+      },
+      "cropped_mask": {
+        "exists": true,
+        "readable": true,
+        "shape": [
+          1121,
+          930
+        ],
+        "dtype": "uint8",
+        "nonzero_ratio": 0.5669668978350743,
+        "mean_intensity": 144.57655894794394,
+        "std_intensity": 126.35126091376137,
+        "nonzero_bbox": {
+          "x_min": 100,
+          "y_min": 178,
+          "x_max": 832,
+          "y_max": 1120
+        }
+      },
+      "nobg": {
+        "exists": true,
+        "readable": true,
+        "shape": [
+          1121,
+          930,
+          4
+        ],
+        "dtype": "uint8",
+        "alpha_foreground_ratio": 0.5669668978350743,
+        "nonzero_ratio": 0.5669668978350743,
+        "mean_intensity": 146.09316398568865,
+        "std_intensity": 74.97402227298393,
+        "nonzero_bbox": {
+          "x_min": 100,
+          "y_min": 178,
+          "x_max": 832,
+          "y_max": 1120
+        }
+      },
+      "normalised": {
+        "exists": true,
+        "readable": true,
+        "shape": [
+          1121,
+          930,
+          4
+        ],
+        "dtype": "uint8",
+        "alpha_foreground_ratio": 0.5669668978350743,
+        "nonzero_ratio": 0.5669668978350743,
+        "mean_intensity": 100.66583983194728,
+        "std_intensity": 98.07758601597968,
+        "nonzero_bbox": {
+          "x_min": 100,
+          "y_min": 178,
+          "x_max": 832,
+          "y_max": 1120
+        }
+      },
+      "enhanced": {
+        "exists": true,
+        "readable": true,
+        "shape": [
+          1121,
+          930,
+          4
+        ],
+        "dtype": "uint8",
+        "alpha_foreground_ratio": 0.5669668978350743,
+        "nonzero_ratio": 0.5669668978350743,
+        "mean_intensity": 100.52377701361112,
+        "std_intensity": 98.43394864035713,
+        "nonzero_bbox": {
+          "x_min": 100,
+          "y_min": 178,
+          "x_max": 832,
+          "y_max": 1120
+        }
+      },
+      "minutiae_csv": "D:\\contactless biome\\contactless-biometric\\match_outputs\\match_1773387992\\b\\tonmoy1\\minutiae.csv",
+      "minutiae_json": "D:\\contactless biome\\contactless-biometric\\match_outputs\\match_1773387992\\b\\tonmoy1\\minutiae.json",
+      "core_csv": null
+    },
+    "minutiae": {
+      "exists": true,
+      "count": 40,
+      "columns": [
+        "x",
+        "y",
+        "angle",
+        "score",
+        "class"
+      ],
+      "x_stats": {
+        "min": 270.0,
+        "median": 532.5,
+        "max": 788.0,
+        "mean": 540.175,
+        "std": 134.73193524550888
+      },
+      "y_stats": {
+        "min": 260.0,
+        "median": 776.5,
+        "max": 966.0,
+        "mean": 771.275,
+        "std": 141.64780045944943
+      },
+      "angle_stats": {
+        "min": 0.6747258364987624,
+        "median": 2.120474723638589,
+        "max": 4.847643720893592,
+        "mean": 2.151935417551896,
+        "std": 1.3322780745033818
+      },
+      "score_stats": {
+        "min": 0.4507109429967386,
+        "median": 0.6160014414311569,
+        "max": 0.7847651183605194,
+        "mean": 0.6288599456910567,
+        "std": 0.09930605339255927
+      },
+      "spatial_spread": {
+        "x_range": 518.0,
+        "y_range": 706.0,
+        "x_median": 532.5,
+        "y_median": 776.5
+      },
+      "class_counts": {
+        "0.0": 2,
+        "1.0": 6,
+        "2.0": 1,
+        "3.0": 29,
+        "5.0": 2
+      }
+    },
+    "descriptors": {
+      "raw_minutiae_count": 40,
+      "surviving_descriptor_count": 35,
+      "descriptor_survival_ratio": 0.875,
+      "validity_mode": "mask",
+      "adaptive_neighbor_support": true,
+      "mask_coverage": {
+        "path": "D:\\contactless biome\\contactless-biometric\\match_outputs\\match_1773387992\\b\\tonmoy1\\cropped_mask.png",
+        "shape": [
+          1121,
+          930
+        ],
+        "foreground_ratio": 0.5669668978350743
+      },
+      "invalidation": {
+        "validity_mode": "mask",
+        "base_neighbor_threshold": 2,
+        "resolved_neighbor_threshold": 2,
+        "adaptive_neighbor_support": true,
+        "min_valid_cells_threshold": 936,
+        "too_few_valid_cells": 0,
+        "too_few_neighbors": 5,
+        "dropped_descriptors": 5,
+        "support_region_invalidated_cells": 366,
+        "in_radius_cells": 49920
+      }
+    }
+  },
+  "methods": {
+    "LSA": {
+      "final_score": 0.3240630179643631,
+      "similarity_matrix_shape": [
+        40,
+        29
+      ],
+      "top_local_pairs": [
+        {
+          "row": 24,
+          "col": 23,
+          "score": 0.38229650259017944
+        },
+        {
+          "row": 21,
+          "col": 14,
+          "score": 0.36656641960144043
+        },
+        {
+          "row": 32,
+          "col": 19,
+          "score": 0.35831987857818604
+        },
+        {
+          "row": 11,
+          "col": 24,
+          "score": 0.35317736864089966
+        },
+        {
+          "row": 18,
+          "col": 3,
+          "score": 0.34360557794570923
+        },
+        {
+          "row": 5,
+          "col": 13,
+          "score": 0.3264029026031494
+        },
+        {
+          "row": 21,
+          "col": 27,
+          "score": 0.32269901037216187
+        },
+        {
+          "row": 0,
+          "col": 14,
+          "score": 0.3180280923843384
+        },
+        {
+          "row": 8,
+          "col": 15,
+          "score": 0.3121129870414734
+        },
+        {
+          "row": 1,
+          "col": 13,
+          "score": 0.3086543679237366
+        }
+      ],
+      "selected_pair_count": 12,
+      "selected_pairs": [
+        {
+          "row": 24,
+          "col": 23,
+          "score": 0.38229650259017944
+        },
+        {
+          "row": 21,
+          "col": 14,
+          "score": 0.36656641960144043
+        },
+        {
+          "row": 32,
+          "col": 19,
+          "score": 0.35831987857818604
+        },
+        {
+          "row": 11,
+          "col": 24,
+          "score": 0.35317736864089966
+        },
+        {
+          "row": 18,
+          "col": 3,
+          "score": 0.34360557794570923
+        },
+        {
+          "row": 5,
+          "col": 13,
+          "score": 0.3264029026031494
+        },
+        {
+          "row": 8,
+          "col": 15,
+          "score": 0.3121129870414734
+        },
+        {
+          "row": 30,
+          "col": 16,
+          "score": 0.2975577712059021
+        },
+        {
+          "row": 19,
+          "col": 12,
+          "score": 0.294114351272583
+        },
+        {
+          "row": 25,
+          "col": 0,
+          "score": 0.2877378463745117
+        }
+      ],
+      "selected_pair_scores": [
+        0.38229650259017944,
+        0.36656641960144043,
+        0.35831987857818604,
+        0.35317736864089966,
+        0.34360557794570923,
+        0.3264029026031494,
+        0.3121129870414734,
+        0.2975577712059021,
+        0.294114351272583,
+        0.2877378463745117
+      ],
+      "relaxed_top_scores": [],
+      "total_pairs": 1160,
+      "angle_rejected_pairs": null,
+      "matchable_rejected_pairs": null,
+      "comparable_pairs": null,
+      "nonzero_similarity_pairs": 674,
+      "min_matchable_cells": null,
+      "pose_details": {
+        "estimated_transform": {
+          "scale": 0.9651762310526107,
+          "rotation": 0.1714598606931763,
+          "rotation_degrees": 9.82392637362004,
+          "translation_x": 288.7808055992241,
+          "translation_y": -71.39163242030588
+        },
+        "overlap_area": 462898,
+        "overlap_ratio": 0.8977903284929897,
+        "fallback_to_legacy": false,
+        "fallback_reason": null,
+        "raw_minutiae_count": {
+          "left": 43,
+          "right": 40
+        },
+        "normalized_overlap_minutiae_count": {
+          "left": 43,
+          "right": 36
+        },
+        "descriptor_count_before": {
+          "left": 40,
+          "right": 35
+        },
+        "descriptor_count_after": {
+          "left": 40,
+          "right": 29
+        },
+        "final_selected_pair_count": 12,
+        "legacy_method": "LSA-LEGACY",
+        "legacy_score": 0.3425878236691157
+      }
+    },
+    "LSA-LEGACY": {
+      "final_score": 0.3425878236691157,
+      "similarity_matrix_shape": [
+        40,
+        35
+      ],
+      "top_local_pairs": [
+        {
+          "row": 18,
+          "col": 4,
+          "score": 0.3682180643081665
+        },
+        {
+          "row": 32,
+          "col": 24,
+          "score": 0.36817818880081177
+        },
+        {
+          "row": 5,
+          "col": 18,
+          "score": 0.35332971811294556
+        },
+        {
+          "row": 14,
+          "col": 9,
+          "score": 0.35308873653411865
+        },
+        {
+          "row": 4,
+          "col": 27,
+          "score": 0.34958386421203613
+        },
+        {
+          "row": 11,
+          "col": 30,
+          "score": 0.34782254695892334
+        },
+        {
+          "row": 27,
+          "col": 5,
+          "score": 0.3448702096939087
+        },
+        {
+          "row": 21,
+          "col": 19,
+          "score": 0.34430986642837524
+        },
+        {
+          "row": 7,
+          "col": 26,
+          "score": 0.33281081914901733
+        },
+        {
+          "row": 0,
+          "col": 19,
+          "score": 0.32460546493530273
+        }
+      ],
+      "selected_pair_count": 12,
+      "selected_pairs": [
+        {
+          "row": 18,
+          "col": 4,
+          "score": 0.3682180643081665
+        },
+        {
+          "row": 32,
+          "col": 24,
+          "score": 0.36817818880081177
+        },
+        {
+          "row": 5,
+          "col": 18,
+          "score": 0.35332971811294556
+        },
+        {
+          "row": 14,
+          "col": 9,
+          "score": 0.35308873653411865
+        },
+        {
+          "row": 4,
+          "col": 27,
+          "score": 0.34958386421203613
+        },
+        {
+          "row": 11,
+          "col": 30,
+          "score": 0.34782254695892334
+        },
+        {
+          "row": 27,
+          "col": 5,
+          "score": 0.3448702096939087
+        },
+        {
+          "row": 21,
+          "col": 19,
+          "score": 0.34430986642837524
+        },
+        {
+          "row": 7,
+          "col": 26,
+          "score": 0.33281081914901733
+        },
+        {
+          "row": 29,
+          "col": 10,
+          "score": 0.32277530431747437
+        }
+      ],
+      "selected_pair_scores": [
+        0.3682180643081665,
+        0.36817818880081177,
+        0.35332971811294556,
+        0.35308873653411865,
+        0.34958386421203613,
+        0.34782254695892334,
+        0.3448702096939087,
+        0.34430986642837524,
+        0.33281081914901733,
+        0.32277530431747437
+      ],
+      "relaxed_top_scores": [],
+      "total_pairs": 1400,
+      "angle_rejected_pairs": 582,
+      "matchable_rejected_pairs": 0,
+      "comparable_pairs": 818,
+      "nonzero_similarity_pairs": 816,
+      "min_matchable_cells": 749
+    },
+    "LSA-R": {
+      "final_score": 0.2325998693704605,
+      "similarity_matrix_shape": [
+        40,
+        29
+      ],
+      "top_local_pairs": [
+        {
+          "row": 24,
+          "col": 23,
+          "score": 0.38229650259017944
+        },
+        {
+          "row": 21,
+          "col": 14,
+          "score": 0.36656641960144043
+        },
+        {
+          "row": 32,
+          "col": 19,
+          "score": 0.35831987857818604
+        },
+        {
+          "row": 11,
+          "col": 24,
+          "score": 0.35317736864089966
+        },
+        {
+          "row": 18,
+          "col": 3,
+          "score": 0.34360557794570923
+        },
+        {
+          "row": 5,
+          "col": 13,
+          "score": 0.3264029026031494
+        },
+        {
+          "row": 21,
+          "col": 27,
+          "score": 0.32269901037216187
+        },
+        {
+          "row": 0,
+          "col": 14,
+          "score": 0.3180280923843384
+        },
+        {
+          "row": 8,
+          "col": 15,
+          "score": 0.3121129870414734
+        },
+        {
+          "row": 1,
+          "col": 13,
+          "score": 0.3086543679237366
+        }
+      ],
+      "selected_pair_count": 12,
+      "selected_pairs": [
+        {
+          "row": 20,
+          "col": 27,
+          "score": 0.2747066020965576
+        },
+        {
+          "row": 28,
+          "col": 1,
+          "score": 0.23958134651184082
+        },
+        {
+          "row": 7,
+          "col": 21,
+          "score": 0.2820589542388916
+        },
+        {
+          "row": 27,
+          "col": 18,
+          "score": 0.1650470495223999
+        },
+        {
+          "row": 3,
+          "col": 2,
+          "score": 0.1757955551147461
+        },
+        {
+          "row": 37,
+          "col": 6,
+          "score": 0.205297589302063
+        },
+        {
+          "row": 17,
+          "col": 5,
+          "score": 0.20829129219055176
+        },
+        {
+          "row": 34,
+          "col": 17,
+          "score": 0.21869266033172607
+        },
+        {
+          "row": 15,
+          "col": 4,
+          "score": 0.22086608409881592
+        },
+        {
+          "row": 12,
+          "col": 11,
+          "score": 0.24098354578018188
+        }
+      ],
+      "selected_pair_scores": [
+        0.2747066020965576,
+        0.23958134651184082,
+        0.2820589542388916,
+        0.1650470495223999,
+        0.1757955551147461,
+        0.205297589302063,
+        0.20829129219055176,
+        0.21869266033172607,
+        0.22086608409881592,
+        0.24098354578018188
+      ],
+      "relaxed_top_scores": [
+        0.3507251739501953,
+        0.2668478488922119,
+        0.29291921854019165,
+        0.1650470495223999,
+        0.1757955551147461,
+        0.205297589302063,
+        0.20829129219055176,
+        0.21869266033172607,
+        0.22086608409881592,
+        0.24098354578018188
+      ],
+      "total_pairs": 1160,
+      "angle_rejected_pairs": null,
+      "matchable_rejected_pairs": null,
+      "comparable_pairs": null,
+      "nonzero_similarity_pairs": 674,
+      "min_matchable_cells": null,
+      "pose_details": {
+        "estimated_transform": {
+          "scale": 0.9651762310526107,
+          "rotation": 0.1714598606931763,
+          "rotation_degrees": 9.82392637362004,
+          "translation_x": 288.7808055992241,
+          "translation_y": -71.39163242030588
+        },
+        "overlap_area": 462898,
+        "overlap_ratio": 0.8977903284929897,
+        "fallback_to_legacy": false,
+        "fallback_reason": null,
+        "raw_minutiae_count": {
+          "left": 43,
+          "right": 40
+        },
+        "normalized_overlap_minutiae_count": {
+          "left": 43,
+          "right": 36
+        },
+        "descriptor_count_before": {
+          "left": 40,
+          "right": 35
+        },
+        "descriptor_count_after": {
+          "left": 40,
+          "right": 29
+        },
+        "final_selected_pair_count": 12,
+        "legacy_method": "LSA-R-LEGACY",
+        "legacy_score": 0.22700780630111694
+      },
+      "relaxation_collapse_ratio": 0.6084279290930548,
+      "non_relaxed_reference_score": 0.22313206791877746,
+      "relaxation_details": {
+        "compatibility_summary": {
+          "min": 1.401298464324817e-45,
+          "median": 7.203229077601598e-31,
+          "max": 1.6517885796929477e-06,
+          "mean": 3.246274360435564e-08,
+          "nonzero_ratio": 0.09729064039408868
+        },
+        "iteration_summaries": [
+          {
+            "iteration": 1,
+            "min": 0.14151322841644287,
+            "median": 0.2721465229988098,
+            "max": 0.38229650259017944,
+            "mean": 0.2685583233833313
+          },
+          {
+            "iteration": 2,
+            "min": 0.14151322841644287,
+            "median": 0.2721465229988098,
+            "max": 0.38229650259017944,
+            "mean": 0.2692347764968872
+          },
+          {
+            "iteration": 3,
+            "min": 0.14151322841644287,
+            "median": 0.2721465229988098,
+            "max": 0.38229650259017944,
+            "mean": 0.26957303285598755
+          },
+          {
+            "iteration": 4,
+            "min": 0.14151322841644287,
+            "median": 0.2721465229988098,
+            "max": 0.38229650259017944,
+            "mean": 0.26974213123321533
+          },
+          {
+            "iteration": 5,
+            "min": 0.14151322841644287,
+            "median": 0.2721465229988098,
+            "max": 0.38229650259017944,
+            "mean": 0.2698267102241516
+          }
+        ],
+        "support_summaries": [
+          {
+            "iteration": 1,
+            "support_mean": 8.843298787492323e-08,
+            "support_median": 4.56754566199673e-24,
+            "support_min": 0.0,
+            "support_max": 1.6517885796929477e-06
+          },
+          {
+            "iteration": 2,
+            "support_mean": 8.843298787492323e-08,
+            "support_median": 4.56754566199673e-24,
+            "support_min": 0.0,
+            "support_max": 1.6517885796929477e-06
+          },
+          {
+            "iteration": 3,
+            "support_mean": 8.843298787492323e-08,
+            "support_median": 4.56754566199673e-24,
+            "support_min": 0.0,
+            "support_max": 1.6517885796929477e-06
+          },
+          {
+            "iteration": 4,
+            "support_mean": 8.843298787492323e-08,
+            "support_median": 4.56754566199673e-24,
+            "support_min": 0.0,
+            "support_max": 1.6517885796929477e-06
+          },
+          {
+            "iteration": 5,
+            "support_mean": 8.843298787492323e-08,
+            "support_median": 4.56754566199673e-24,
+            "support_min": 0.0,
+            "support_max": 1.6517885796929477e-06
+          }
+        ],
+        "final_relaxed_ranking": [
+          {
+            "row": 20,
+            "col": 27,
+            "initial_score": 0.2747066020965576,
+            "relaxed_score": 0.3507251739501953
+          },
+          {
+            "row": 28,
+            "col": 1,
+            "initial_score": 0.23958134651184082,
+            "relaxed_score": 0.2668478488922119
+          },
+          {
+            "row": 7,
+            "col": 21,
+            "initial_score": 0.2820589542388916,
+            "relaxed_score": 0.29291921854019165
+          },
+          {
+            "row": 27,
+            "col": 18,
+            "initial_score": 0.1650470495223999,
+            "relaxed_score": 0.1650470495223999
+          },
+          {
+            "row": 3,
+            "col": 2,
+            "initial_score": 0.1757955551147461,
+            "relaxed_score": 0.1757955551147461
+          },
+          {
+            "row": 37,
+            "col": 6,
+            "initial_score": 0.205297589302063,
+            "relaxed_score": 0.205297589302063
+          },
+          {
+            "row": 17,
+            "col": 5,
+            "initial_score": 0.20829129219055176,
+            "relaxed_score": 0.20829129219055176
+          },
+          {
+            "row": 34,
+            "col": 17,
+            "initial_score": 0.21869266033172607,
+            "relaxed_score": 0.21869266033172607
+          },
+          {
+            "row": 15,
+            "col": 4,
+            "initial_score": 0.22086608409881592,
+            "relaxed_score": 0.22086608409881592
+          },
+          {
+            "row": 12,
+            "col": 11,
+            "initial_score": 0.24098354578018188,
+            "relaxed_score": 0.24098354578018188
+          }
+        ]
+      }
+    },
+    "LSA-R-LEGACY": {
+      "final_score": 0.22700780630111694,
+      "similarity_matrix_shape": [
+        40,
+        35
+      ],
+      "top_local_pairs": [
+        {
+          "row": 18,
+          "col": 4,
+          "score": 0.3682180643081665
+        },
+        {
+          "row": 32,
+          "col": 24,
+          "score": 0.36817818880081177
+        },
+        {
+          "row": 5,
+          "col": 18,
+          "score": 0.35332971811294556
+        },
+        {
+          "row": 14,
+          "col": 9,
+          "score": 0.35308873653411865
+        },
+        {
+          "row": 4,
+          "col": 27,
+          "score": 0.34958386421203613
+        },
+        {
+          "row": 11,
+          "col": 30,
+          "score": 0.34782254695892334
+        },
+        {
+          "row": 27,
+          "col": 5,
+          "score": 0.3448702096939087
+        },
+        {
+          "row": 21,
+          "col": 19,
+          "score": 0.34430986642837524
+        },
+        {
+          "row": 7,
+          "col": 26,
+          "score": 0.33281081914901733
+        },
+        {
+          "row": 0,
+          "col": 19,
+          "score": 0.32460546493530273
+        }
+      ],
+      "selected_pair_count": 35,
+      "selected_pairs": [
+        {
+          "row": 32,
+          "col": 24,
+          "score": 0.36817818880081177
+        },
+        {
+          "row": 5,
+          "col": 18,
+          "score": 0.35332971811294556
+        },
+        {
+          "row": 14,
+          "col": 9,
+          "score": 0.35308873653411865
+        },
+        {
+          "row": 4,
+          "col": 27,
+          "score": 0.34958386421203613
+        },
+        {
+          "row": 11,
+          "col": 30,
+          "score": 0.34782254695892334
+        },
+        {
+          "row": 27,
+          "col": 5,
+          "score": 0.3448702096939087
+        },
+        {
+          "row": 21,
+          "col": 19,
+          "score": 0.34430986642837524
+        },
+        {
+          "row": 7,
+          "col": 26,
+          "score": 0.33281081914901733
+        },
+        {
+          "row": 29,
+          "col": 10,
+          "score": 0.32277530431747437
+        },
+        {
+          "row": 30,
+          "col": 21,
+          "score": 0.3151662349700928
+        }
+      ],
+      "selected_pair_scores": [
+        0.36817818880081177,
+        0.35332971811294556,
+        0.35308873653411865,
+        0.34958386421203613,
+        0.34782254695892334,
+        0.3448702096939087,
+        0.34430986642837524,
+        0.33281081914901733,
+        0.32277530431747437,
+        0.3151662349700928
+      ],
+      "relaxed_top_scores": [
+        0.1862596571445465,
+        0.345485121011734,
+        0.29256364703178406,
+        0.25369274616241455,
+        0.34923744201660156,
+        0.13408464193344116,
+        0.12801134586334229,
+        0.2059561014175415,
+        0.2060897946357727,
+        0.20560652017593384
+      ],
+      "total_pairs": 1400,
+      "angle_rejected_pairs": 582,
+      "matchable_rejected_pairs": 0,
+      "comparable_pairs": 818,
+      "nonzero_similarity_pairs": 816,
+      "min_matchable_cells": 749,
+      "relaxation_collapse_ratio": 0.6165037196847876,
+      "non_relaxed_reference_score": 0.3431935489177704,
+      "relaxation_details": {
+        "compatibility_summary": {
+          "min": 5.605193857299268e-45,
+          "median": 6.428524697867313e-30,
+          "max": 0.9820452332496643,
+          "mean": 0.05122432857751846,
+          "nonzero_ratio": 0.09243697478991597
+        },
+        "iteration_summaries": [
+          {
+            "iteration": 1,
+            "min": 0.12801134586334229,
+            "median": 0.27313774824142456,
+            "max": 0.36817818880081177,
+            "mean": 0.2664682865142822
+          },
+          {
+            "iteration": 2,
+            "min": 0.12801134586334229,
+            "median": 0.27313774824142456,
+            "max": 0.36817818880081177,
+            "mean": 0.2670039236545563
+          },
+          {
+            "iteration": 3,
+            "min": 0.12801134586334229,
+            "median": 0.27313774824142456,
+            "max": 0.36817818880081177,
+            "mean": 0.2672715187072754
+          },
+          {
+            "iteration": 4,
+            "min": 0.12801134586334229,
+            "median": 0.27313774824142456,
+            "max": 0.36817818880081177,
+            "mean": 0.267405241727829
+          },
+          {
+            "iteration": 5,
+            "min": 0.12801134586334229,
+            "median": 0.27313774824142456,
+            "max": 0.36817818880081177,
+            "mean": 0.2674720585346222
+          }
+        ],
+        "support_summaries": [
+          {
+            "iteration": 1,
+            "support_mean": 0.16099074985625358,
+            "support_median": 7.769258748228279e-19,
+            "support_min": 0.0,
+            "support_max": 1.9035429954528809
+          },
+          {
+            "iteration": 2,
+            "support_mean": 0.16099074985625358,
+            "support_median": 7.769258748228279e-19,
+            "support_min": 0.0,
+            "support_max": 1.9035429954528809
+          },
+          {
+            "iteration": 3,
+            "support_mean": 0.16099074985625358,
+            "support_median": 7.769258748228279e-19,
+            "support_min": 0.0,
+            "support_max": 1.9035429954528809
+          },
+          {
+            "iteration": 4,
+            "support_mean": 0.16099074985625358,
+            "support_median": 7.769258748228279e-19,
+            "support_min": 0.0,
+            "support_max": 1.9035429954528809
+          },
+          {
+            "iteration": 5,
+            "support_mean": 0.16099074985625358,
+            "support_median": 7.769258748228279e-19,
+            "support_min": 0.0,
+            "support_max": 1.9035429954528809
+          }
+        ],
+        "final_relaxed_ranking": [
+          {
+            "row": 16,
+            "col": 13,
+            "initial_score": 0.10408574342727661,
+            "relaxed_score": 0.1862596571445465,
+            "efficiency": 1.7894829511642456
+          },
+          {
+            "row": 20,
+            "col": 33,
+            "initial_score": 0.2730252146720886,
+            "relaxed_score": 0.345485121011734,
+            "efficiency": 1.2653963565826416
+          },
+          {
+            "row": 17,
+            "col": 7,
+            "initial_score": 0.23179757595062256,
+            "relaxed_score": 0.29256364703178406,
+            "efficiency": 1.2621514797210693
+          },
+          {
+            "row": 28,
+            "col": 2,
+            "initial_score": 0.21389096975326538,
+            "relaxed_score": 0.25369274616241455,
+            "efficiency": 1.1860843896865845
+          },
+          {
+            "row": 27,
+            "col": 5,
+            "initial_score": 0.3448702096939087,
+            "relaxed_score": 0.34923744201660156,
+            "efficiency": 1.0126633644104004
+          },
+          {
+            "row": 22,
+            "col": 31,
+            "initial_score": 0.13408464193344116,
+            "relaxed_score": 0.13408464193344116,
+            "efficiency": 1.0
+          },
+          {
+            "row": 9,
+            "col": 23,
+            "initial_score": 0.12801134586334229,
+            "relaxed_score": 0.12801134586334229,
+            "efficiency": 1.0
+          },
+          {
+            "row": 1,
+            "col": 29,
+            "initial_score": 0.2059561014175415,
+            "relaxed_score": 0.2059561014175415,
+            "efficiency": 1.0
+          },
+          {
+            "row": 15,
+            "col": 6,
+            "initial_score": 0.2060897946357727,
+            "relaxed_score": 0.2060897946357727,
+            "efficiency": 1.0
+          },
+          {
+            "row": 31,
+            "col": 32,
+            "initial_score": 0.20560652017593384,
+            "relaxed_score": 0.20560652017593384,
+            "efficiency": 1.0
+          }
+        ]
+      }
+    }
+  },
+  "descriptor_mode_comparison": {
+    "mask": {
+      "left_surviving_descriptor_count": 40,
+      "right_surviving_descriptor_count": 35
+    },
+    "hull": {
+      "left_surviving_descriptor_count": 42,
+      "right_surviving_descriptor_count": 35
+    }
+  },
+  "adaptive_neighbor_comparison": {
+    "adaptive_on": {
+      "left_surviving_descriptor_count": 40,
+      "right_surviving_descriptor_count": 35,
+      "left_resolved_neighbor_threshold": 2,
+      "right_resolved_neighbor_threshold": 2
+    },
+    "adaptive_off": {
+      "left_surviving_descriptor_count": 40,
+      "right_surviving_descriptor_count": 35,
+      "left_resolved_neighbor_threshold": 2,
+      "right_resolved_neighbor_threshold": 2
+    }
+  },
+  "dominant_bottleneck": "no dominant bottleneck identified"
+}

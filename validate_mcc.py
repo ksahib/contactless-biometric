@@ -15,6 +15,17 @@ import main as mcc
 
 
 DEFAULT_METHODS = ("LSS", "LSA", "LSS-R", "LSA-R")
+SUPPORTED_METHODS = DEFAULT_METHODS + (
+    "LSA-LEGACY",
+    "LSA-R-LEGACY",
+    "LSA-OVERLAP",
+    "LSA-R-OVERLAP",
+)
+DEFAULT_COMPARE_RUN_DIRS = (
+    Path("match_outputs/match_1773388243"),
+    Path("match_outputs/match_1773387992"),
+    Path("match_outputs/match_1773386602"),
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -117,6 +128,30 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional JSON output path.",
     )
+
+    compare_cached = subparsers.add_parser(
+        "compare-cached",
+        help="Compare legacy, relative, and canonical pose normalization on cached runs.",
+    )
+    compare_cached.add_argument(
+        "--run-dirs",
+        nargs="*",
+        type=Path,
+        default=list(DEFAULT_COMPARE_RUN_DIRS),
+        help="Saved match run directories to compare.",
+    )
+    compare_cached.add_argument(
+        "--top-k",
+        type=int,
+        default=10,
+        help="Number of top local or selected pairs to report in the embedded diagnose output.",
+    )
+    compare_cached.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Optional JSON output path.",
+    )
     return parser.parse_args()
 
 
@@ -124,7 +159,7 @@ def _normalize_methods(methods: list[str]) -> list[str]:
     normalized = []
     for method in methods:
         name = method.upper()
-        if name not in DEFAULT_METHODS:
+        if name not in SUPPORTED_METHODS:
             raise ValueError(f"unsupported MCC method: {method}")
         normalized.append(name)
     return normalized
@@ -177,18 +212,25 @@ def run_smoke(csv_path: Path, methods: list[str], seed: int) -> dict:
 
         results: dict[str, dict] = {}
         for method in methods:
-            self_score, self_matrix = mcc.match_descriptors(
-                base_descriptors, base_descriptors, method=method
-            )
-            perturb_score, _ = mcc.match_descriptors(
-                base_descriptors, perturbed_descriptors, method=method
-            )
-            perturb_reverse_score, _ = mcc.match_descriptors(
-                perturbed_descriptors, base_descriptors, method=method
-            )
-            randomized_score, _ = mcc.match_descriptors(
-                base_descriptors, randomized_descriptors, method=method
-            )
+            if method in {"LSA-OVERLAP", "LSA-R-OVERLAP"}:
+                self_score, self_matrix = mcc.match_minutiae_csv(csv_path, csv_path, method=method)
+                perturb_score, _ = mcc.match_minutiae_csv(csv_path, perturbed_path, method=method)
+                perturb_reverse_score, _ = mcc.match_minutiae_csv(perturbed_path, csv_path, method=method)
+                randomized_score, _ = mcc.match_minutiae_csv(csv_path, randomized_path, method=method)
+            else:
+                descriptor_method = method.replace("-LEGACY", "")
+                self_score, self_matrix = mcc.match_descriptors(
+                    base_descriptors, base_descriptors, method=descriptor_method
+                )
+                perturb_score, _ = mcc.match_descriptors(
+                    base_descriptors, perturbed_descriptors, method=descriptor_method
+                )
+                perturb_reverse_score, _ = mcc.match_descriptors(
+                    perturbed_descriptors, base_descriptors, method=descriptor_method
+                )
+                randomized_score, _ = mcc.match_descriptors(
+                    base_descriptors, randomized_descriptors, method=descriptor_method
+                )
 
             results[method] = {
                 "descriptor_count": len(base_descriptors),
@@ -252,6 +294,7 @@ def _extract_minutiae_csv_for_image(
     cache_root.mkdir(parents=True, exist_ok=True)
     nobg_path = cache_root / "nobg.png"
     cropped_path = cache_root / "cropped.png"
+    cropped_mask_path = cache_root / "cropped_mask.png"
     normalised_path = cache_root / "normalised.png"
     enhanced_path = cache_root / "enhanced.png"
     minutiae_json = cache_root / "minutiae.json"
@@ -267,6 +310,7 @@ def _extract_minutiae_csv_for_image(
     cropped_rgba = mcc.compose_rgba(cropped_bgr, cropped_mask)
     mcc.save_png(cropped_path, cropped_bgr)
     mcc.save_png(nobg_path, cropped_rgba)
+    mcc.save_png(cropped_mask_path, cropped_mask)
     mcc.normalise_brightness(nobg_path, normalised_path)
     mcc.filter(normalised_path, enhanced_path)
     model_paths = mcc.ensure_fingerflow_models(model_dir)
@@ -407,21 +451,54 @@ def run_verification(
         genuine_scores = []
         impostor_scores = []
 
-        for left, right in genuine_pairs:
+        def _pair_score(left_csv: Path, right_csv: Path) -> float:
+            left_mask = left_csv.with_name("cropped_mask.png")
+            right_mask = right_csv.with_name("cropped_mask.png")
+            has_masks = left_mask.exists() and right_mask.exists()
+
+            if method in {"LSA-OVERLAP", "LSA-R-OVERLAP"}:
+                score, _ = mcc.match_minutiae_csv(
+                    left_csv,
+                    right_csv,
+                    method=method,
+                    mask_path_a=left_mask if has_masks else None,
+                    mask_path_b=right_mask if has_masks else None,
+                )
+                return float(score)
+
+            if method in {"LSA", "LSA-R"} and has_masks:
+                score, _ = mcc.match_minutiae_csv(
+                    left_csv,
+                    right_csv,
+                    method=method,
+                    mask_path_a=left_mask,
+                    mask_path_b=right_mask,
+                )
+                return float(score)
+
+            if method in {"LSA-LEGACY", "LSA-R-LEGACY"} and has_masks:
+                score, _ = mcc.match_minutiae_csv_legacy(
+                    left_csv,
+                    right_csv,
+                    method=method,
+                    mask_path_a=left_mask,
+                    mask_path_b=right_mask,
+                )
+                return float(score)
+
+            descriptor_method = method.replace("-LEGACY", "")
             score, _ = mcc.match_descriptors(
-                get_descriptors(resolved_csvs[left]),
-                get_descriptors(resolved_csvs[right]),
-                method=method,
+                get_descriptors(left_csv),
+                get_descriptors(right_csv),
+                method=descriptor_method,
             )
-            genuine_scores.append(float(score))
+            return float(score)
+
+        for left, right in genuine_pairs:
+            genuine_scores.append(_pair_score(resolved_csvs[left], resolved_csvs[right]))
 
         for left, right in impostor_pairs:
-            score, _ = mcc.match_descriptors(
-                get_descriptors(resolved_csvs[left]),
-                get_descriptors(resolved_csvs[right]),
-                method=method,
-            )
-            impostor_scores.append(float(score))
+            impostor_scores.append(_pair_score(resolved_csvs[left], resolved_csvs[right]))
 
         genuine_array = np.array(genuine_scores, dtype=np.float64)
         impostor_array = np.array(impostor_scores, dtype=np.float64)
@@ -782,16 +859,72 @@ def _method_diagnostics(
     descriptors_b: list[mcc.MCCCylinder],
     method: str,
     top_k: int,
+    csv_a: Path | None = None,
+    csv_b: Path | None = None,
+    mask_a: Path | None = None,
+    mask_b: Path | None = None,
 ) -> dict:
-    score, sim_matrix = mcc.match_descriptors(descriptors_a, descriptors_b, method=method)
-    n_pairs = mcc._compute_n_pairs(len(descriptors_a), len(descriptors_b))
+    overlap_details = None
+    pose_details = None
+    canonical_pose_details = None
+    descriptor_method = method.replace("-LEGACY", "")
+    diagnostic_descriptors_a = descriptors_a
+    diagnostic_descriptors_b = descriptors_b
+
+    if method in {"LSA-OVERLAP", "LSA-R-OVERLAP"}:
+        if csv_a is None or csv_b is None:
+            raise ValueError(f"{method} diagnostics require minutiae CSV paths")
+        score, sim_matrix, overlap_details = mcc.match_minutiae_csv_overlap_details(
+            csv_a,
+            csv_b,
+            mask_a,
+            mask_b,
+            method=method,
+        )
+    elif method in {"LSA", "LSA-R"} and csv_a is not None and csv_b is not None and mask_a is not None and mask_b is not None:
+        score, sim_matrix, pose_details = mcc.match_minutiae_csv_pose_normalized_details(
+            csv_a,
+            csv_b,
+            mask_a,
+            mask_b,
+            method=method,
+            strategy="relative",
+        )
+        canonical_score, canonical_sim_matrix, canonical_pose_details = mcc.match_minutiae_csv_pose_normalized_details(
+            csv_a,
+            csv_b,
+            mask_a,
+            mask_b,
+            method=method,
+            strategy="canonical",
+        )
+    else:
+        if method in {"LSA-LEGACY", "LSA-R-LEGACY"} and csv_a is not None and csv_b is not None:
+            score, sim_matrix = mcc.match_minutiae_csv_legacy(
+                csv_a,
+                csv_b,
+                method=method,
+                mask_path_a=mask_a,
+                mask_path_b=mask_b,
+            )
+        else:
+            score, sim_matrix = mcc.match_descriptors(descriptors_a, descriptors_b, method=descriptor_method)
+    n_pairs = mcc._compute_n_pairs(sim_matrix.shape[0], sim_matrix.shape[1])
     selected_pairs: list[tuple[int, int, float]]
     relaxed_scores: list[float] = []
     selected_scores: list[float] = []
 
-    if method == "LSS":
+    if pose_details is not None:
+        selected_pairs = [
+            (int(pair["row"]), int(pair["col"]), float(pair["score"]))
+            for pair in pose_details["selected_pairs"]
+        ]
+        selected_scores = [float(score_value) for score_value in pose_details["selected_pair_scores"]]
+        relaxed_scores = [float(score_value) for score_value in pose_details["relaxed_top_scores"]]
+        relaxation_details = pose_details["relaxation_details"]
+    elif method == "LSS":
         selected_pairs = mcc._select_lss_pairs(sim_matrix, n_pairs)
-    elif method == "LSA":
+    elif method in {"LSA", "LSA-LEGACY", "LSA-OVERLAP"}:
         selected_pairs = mcc._select_lsa_pairs(sim_matrix, n_pairs)
     elif method == "LSS-R":
         selected_pairs = mcc._select_lss_pairs(
@@ -818,7 +951,7 @@ def _method_diagnostics(
         top_indices = np.argsort(efficiency)[::-1][: min(n_pairs, len(selected_pairs))]
         relaxed_scores = [float(relaxed[index]) for index in top_indices]
 
-    if method not in {"LSS-R", "LSA-R"}:
+    if method not in {"LSS-R", "LSA-R", "LSA-R-LEGACY", "LSA-R-OVERLAP"}:
         relaxation_details = None
 
     selected_scores = [float(pair[2]) for pair in selected_pairs[:top_k]]
@@ -826,6 +959,18 @@ def _method_diagnostics(
         {"row": int(row), "col": int(col), "score": float(score)}
         for row, col, score in selected_pairs[:top_k]
     ]
+    if overlap_details is None and pose_details is None:
+        gating_stats = _pair_gating_stats(diagnostic_descriptors_a, diagnostic_descriptors_b, sim_matrix)
+    else:
+        gating_stats = {
+            "total_pairs": int(sim_matrix.shape[0] * sim_matrix.shape[1]),
+            "angle_rejected_pairs": None,
+            "matchable_rejected_pairs": None,
+            "comparable_pairs": None,
+            "nonzero_similarity_pairs": int(np.count_nonzero(sim_matrix > 0)),
+            "min_matchable_cells": None,
+        }
+
     report = {
         "final_score": float(score),
         "similarity_matrix_shape": list(sim_matrix.shape),
@@ -834,9 +979,101 @@ def _method_diagnostics(
         "selected_pairs": selected_pairs_report,
         "selected_pair_scores": selected_scores,
         "relaxed_top_scores": relaxed_scores[:top_k],
-        **_pair_gating_stats(descriptors_a, descriptors_b, sim_matrix),
+        **gating_stats,
     }
-    if method in {"LSS-R", "LSA-R"}:
+    if overlap_details is not None:
+        report["overlap_details"] = {
+            "estimated_transform": overlap_details["estimated_transform"],
+            "overlap_area": int(overlap_details["overlap_area"]),
+            "overlap_ratio": float(overlap_details["overlap_ratio"]),
+            "fallback_to_base": bool(overlap_details["fallback_to_base"]),
+            "fallback_reason": overlap_details["fallback_reason"],
+            "raw_minutiae_count": {
+                "left": int(overlap_details["left_raw_minutiae_count"]),
+                "right": int(overlap_details["right_raw_minutiae_count"]),
+            },
+            "overlap_minutiae_count": {
+                "left": int(overlap_details["left_overlap_minutiae_count"]),
+                "right": int(overlap_details["right_overlap_minutiae_count"]),
+            },
+            "descriptor_count_before": {
+                "left": int(overlap_details["left_descriptor_count_before"]),
+                "right": int(overlap_details["right_descriptor_count_before"]),
+            },
+            "descriptor_count_after": {
+                "left": int(overlap_details["left_descriptor_count_after"]),
+                "right": int(overlap_details["right_descriptor_count_after"]),
+            },
+            "final_selected_pair_count": int(overlap_details["selected_pair_count"]),
+        }
+    if pose_details is not None:
+        report["pose_details"] = {
+            "strategy": pose_details["strategy"],
+            "estimated_transform": pose_details["estimated_transform"],
+            "overlap_area": int(pose_details["overlap_area"]),
+            "overlap_ratio": float(pose_details["overlap_ratio"]),
+            "fallback_to_legacy": bool(pose_details["fallback_to_legacy"]),
+            "fallback_reason": pose_details["fallback_reason"],
+            "raw_minutiae_count": {
+                "left": int(pose_details["left_raw_minutiae_count"]),
+                "right": int(pose_details["right_raw_minutiae_count"]),
+            },
+            "normalized_overlap_minutiae_count": {
+                "left": int(pose_details["left_overlap_minutiae_count"]),
+                "right": int(pose_details["right_overlap_minutiae_count"]),
+            },
+            "descriptor_count_before": {
+                "left": int(pose_details["left_descriptor_count_before"]),
+                "right": int(pose_details["right_descriptor_count_before"]),
+            },
+            "descriptor_count_after": {
+                "left": int(pose_details["left_descriptor_count_after"]),
+                "right": int(pose_details["right_descriptor_count_after"]),
+            },
+            "final_selected_pair_count": int(pose_details["selected_pair_count"]),
+            "legacy_method": pose_details["legacy_method"],
+            "legacy_score": float(pose_details["legacy_score"]),
+        }
+        if canonical_pose_details is not None:
+            report["pose_comparison"] = {
+                "active_strategy": "relative",
+                "relative": {
+                    "final_score": float(score),
+                    "estimated_transform": pose_details["estimated_transform"],
+                    "overlap_area": int(pose_details["overlap_area"]),
+                    "overlap_ratio": float(pose_details["overlap_ratio"]),
+                    "fallback_to_legacy": bool(pose_details["fallback_to_legacy"]),
+                    "fallback_reason": pose_details["fallback_reason"],
+                    "descriptor_count_after": {
+                        "left": int(pose_details["left_descriptor_count_after"]),
+                        "right": int(pose_details["right_descriptor_count_after"]),
+                    },
+                    "final_selected_pair_count": int(pose_details["selected_pair_count"]),
+                },
+                "canonical": {
+                    "final_score": float(canonical_score),
+                    "estimated_transform": canonical_pose_details["estimated_transform"],
+                    "overlap_area": int(canonical_pose_details["overlap_area"]),
+                    "overlap_ratio": float(canonical_pose_details["overlap_ratio"]),
+                    "fallback_to_legacy": bool(canonical_pose_details["fallback_to_legacy"]),
+                    "fallback_reason": canonical_pose_details["fallback_reason"],
+                    "descriptor_count_after": {
+                        "left": int(canonical_pose_details["left_descriptor_count_after"]),
+                        "right": int(canonical_pose_details["right_descriptor_count_after"]),
+                    },
+                    "final_selected_pair_count": int(canonical_pose_details["selected_pair_count"]),
+                },
+                "legacy": {
+                    "method": pose_details["legacy_method"],
+                    "final_score": float(pose_details["legacy_score"]),
+                },
+                "deltas": {
+                    "relative_minus_legacy": float(score - pose_details["legacy_score"]),
+                    "canonical_minus_legacy": float(canonical_score - canonical_pose_details["legacy_score"]),
+                    "canonical_minus_relative": float(canonical_score - score),
+                },
+            }
+    if method in {"LSS-R", "LSA-R", "LSA-R-LEGACY", "LSA-R-OVERLAP"}:
         strongest_local = report["top_local_pairs"][0]["score"] if report["top_local_pairs"] else 0.0
         report["relaxation_collapse_ratio"] = (
             float(score / strongest_local) if strongest_local > 0 else 0.0
@@ -844,21 +1081,37 @@ def _method_diagnostics(
         report["non_relaxed_reference_score"] = float(
             np.mean(selected_scores[: min(n_pairs, len(selected_scores))])
         ) if selected_scores else 0.0
-        report["relaxation_details"] = {
-            "compatibility_summary": relaxation_details["compatibility_summary"],
-            "iteration_summaries": relaxation_details["iteration_summaries"],
-            "support_summaries": relaxation_details["support_summaries"],
-            "final_relaxed_ranking": [
-                {
-                    "row": int(selected_pairs[index][0]),
-                    "col": int(selected_pairs[index][1]),
-                    "initial_score": float(selected_pairs[index][2]),
-                    "relaxed_score": float(relaxed[index]),
-                    "efficiency": float(efficiency[index]),
-                }
-                for index in np.argsort(efficiency)[::-1][:top_k]
-            ],
-        }
+        if pose_details is not None:
+            report["relaxation_details"] = {
+                "compatibility_summary": relaxation_details["compatibility_summary"] if relaxation_details else None,
+                "iteration_summaries": relaxation_details["iteration_summaries"] if relaxation_details else [],
+                "support_summaries": relaxation_details["support_summaries"] if relaxation_details else [],
+                "final_relaxed_ranking": [
+                    {
+                        "row": int(pair["row"]),
+                        "col": int(pair["col"]),
+                        "initial_score": float(pair["score"]),
+                        "relaxed_score": float(relaxed_score),
+                    }
+                    for pair, relaxed_score in zip(selected_pairs_report, report["relaxed_top_scores"])
+                ],
+            }
+        else:
+            report["relaxation_details"] = {
+                "compatibility_summary": relaxation_details["compatibility_summary"],
+                "iteration_summaries": relaxation_details["iteration_summaries"],
+                "support_summaries": relaxation_details["support_summaries"],
+                "final_relaxed_ranking": [
+                    {
+                        "row": int(selected_pairs[index][0]),
+                        "col": int(selected_pairs[index][1]),
+                        "initial_score": float(selected_pairs[index][2]),
+                        "relaxed_score": float(relaxed[index]),
+                        "efficiency": float(efficiency[index]),
+                    }
+                    for index in np.argsort(efficiency)[::-1][:top_k]
+                ],
+            }
     return report
 
 
@@ -937,10 +1190,23 @@ def _dominant_bottleneck(report: dict) -> str:
     if best_non_relaxed >= 0.25 and best_relaxed <= (0.15 * best_non_relaxed) and strongest_local >= 0.35:
         return "MCC pair gating"
 
-    comparable_pairs = lsa_r.get("comparable_pairs", 0)
+    comparable_pairs = lsa_r.get("comparable_pairs")
     total_pairs = lsa_r.get("total_pairs", 0)
-    if total_pairs > 0 and comparable_pairs / total_pairs < 0.05:
+    if comparable_pairs is not None and total_pairs > 0 and comparable_pairs / total_pairs < 0.05:
         return "MCC pair gating"
+
+    pose_comparison = lsa_r.get("pose_comparison")
+    if pose_comparison:
+        relative = pose_comparison.get("relative", {})
+        canonical = pose_comparison.get("canonical", {})
+        deltas = pose_comparison.get("deltas", {})
+        if (
+            relative.get("overlap_ratio", 0.0) >= 0.8
+            and canonical.get("overlap_ratio", 0.0) >= 0.8
+            and deltas.get("relative_minus_legacy", 0.0) < 0.03
+            and deltas.get("canonical_minus_legacy", 0.0) < 0.03
+        ):
+            return "extractor repeatability / local deformation"
 
     if lsa_r.get("top_local_pairs"):
         top_score = lsa_r["top_local_pairs"][0]["score"]
@@ -1029,10 +1295,65 @@ def run_diagnose(run_dir: Path | None, methods: list[str], top_k: int) -> dict:
             right_descriptors,
             method,
             top_k,
+            csv_a=left_csv,
+            csv_b=right_csv,
+            mask_a=left_mask if left_mask.exists() else None,
+            mask_b=right_mask if right_mask.exists() else None,
         )
 
     report["dominant_bottleneck"] = _dominant_bottleneck(report)
     return report
+
+
+def run_compare_cached(run_dirs: list[Path], top_k: int) -> dict:
+    methods = ["LSA", "LSA-LEGACY", "LSA-R", "LSA-R-LEGACY"]
+    comparisons = []
+    for run_dir in run_dirs:
+        diagnose_report = run_diagnose(run_dir, methods, top_k=top_k)
+        method_comparisons = {}
+        for method in ("LSA", "LSA-R"):
+            method_report = diagnose_report["methods"][method]
+            pose_comparison = method_report.get("pose_comparison", {})
+            method_comparisons[method] = {
+                "active_score": float(method_report["final_score"]),
+                "legacy_score": float(diagnose_report["methods"][f"{method}-LEGACY"]["final_score"]),
+                "relative_score": float(pose_comparison.get("relative", {}).get("final_score", method_report["final_score"])),
+                "canonical_score": float(pose_comparison.get("canonical", {}).get("final_score", method_report["final_score"])),
+                "relative_fallback": bool(pose_comparison.get("relative", {}).get("fallback_to_legacy", False)),
+                "canonical_fallback": bool(pose_comparison.get("canonical", {}).get("fallback_to_legacy", False)),
+                "relative_fallback_reason": pose_comparison.get("relative", {}).get("fallback_reason"),
+                "canonical_fallback_reason": pose_comparison.get("canonical", {}).get("fallback_reason"),
+                "deltas": pose_comparison.get(
+                    "deltas",
+                    {
+                        "relative_minus_legacy": 0.0,
+                        "canonical_minus_legacy": 0.0,
+                        "canonical_minus_relative": 0.0,
+                    },
+                ),
+                "best_strategy": max(
+                    (
+                        ("legacy", float(diagnose_report["methods"][f"{method}-LEGACY"]["final_score"])),
+                        ("relative", float(pose_comparison.get("relative", {}).get("final_score", method_report["final_score"]))),
+                        ("canonical", float(pose_comparison.get("canonical", {}).get("final_score", method_report["final_score"]))),
+                    ),
+                    key=lambda item: item[1],
+                )[0],
+            }
+        comparisons.append(
+            {
+                "run_dir": diagnose_report["run_dir"],
+                "dominant_bottleneck": diagnose_report["dominant_bottleneck"],
+                "methods": method_comparisons,
+                "diagnose": diagnose_report,
+            }
+        )
+
+    return {
+        "mode": "compare-cached",
+        "run_dirs": [str(Path(run_dir).resolve()) for run_dir in run_dirs],
+        "comparisons": comparisons,
+    }
 
 
 def _print_summary(report: dict) -> None:
@@ -1048,7 +1369,7 @@ def _maybe_write_output(report: dict, output_path: Path | None) -> None:
 
 def main() -> int:
     args = parse_args()
-    methods = _normalize_methods(list(args.methods))
+    methods = _normalize_methods(list(args.methods)) if hasattr(args, "methods") else []
 
     if args.command == "smoke":
         report = run_smoke(args.csv, methods, seed=args.seed)
@@ -1058,6 +1379,12 @@ def main() -> int:
 
     if args.command == "diagnose":
         report = run_diagnose(args.run_dir, methods, top_k=args.top_k)
+        _print_summary(report)
+        _maybe_write_output(report, args.output)
+        return 0
+
+    if args.command == "compare-cached":
+        report = run_compare_cached(list(args.run_dirs), top_k=args.top_k)
         _print_summary(report)
         _maybe_write_output(report, args.output)
         return 0
