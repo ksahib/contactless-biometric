@@ -20,6 +20,10 @@ SUPPORTED_METHODS = DEFAULT_METHODS + (
     "LSA-R-LEGACY",
     "LSA-OVERLAP",
     "LSA-R-OVERLAP",
+    "LSA-CANONICAL",
+    "LSA-R-CANONICAL",
+    "LSA-CANONICAL-OVERLAP",
+    "LSA-R-CANONICAL-OVERLAP",
 )
 DEFAULT_COMPARE_RUN_DIRS = (
     Path("match_outputs/match_1773388243"),
@@ -212,7 +216,14 @@ def run_smoke(csv_path: Path, methods: list[str], seed: int) -> dict:
 
         results: dict[str, dict] = {}
         for method in methods:
-            if method in {"LSA-OVERLAP", "LSA-R-OVERLAP"}:
+            if method in {
+                "LSA-OVERLAP",
+                "LSA-R-OVERLAP",
+                "LSA-CANONICAL",
+                "LSA-R-CANONICAL",
+                "LSA-CANONICAL-OVERLAP",
+                "LSA-R-CANONICAL-OVERLAP",
+            }:
                 self_score, self_matrix = mcc.match_minutiae_csv(csv_path, csv_path, method=method)
                 perturb_score, _ = mcc.match_minutiae_csv(csv_path, perturbed_path, method=method)
                 perturb_reverse_score, _ = mcc.match_minutiae_csv(perturbed_path, csv_path, method=method)
@@ -456,7 +467,14 @@ def run_verification(
             right_mask = right_csv.with_name("cropped_mask.png")
             has_masks = left_mask.exists() and right_mask.exists()
 
-            if method in {"LSA-OVERLAP", "LSA-R-OVERLAP"}:
+            if method in {
+                "LSA-OVERLAP",
+                "LSA-R-OVERLAP",
+                "LSA-CANONICAL",
+                "LSA-R-CANONICAL",
+                "LSA-CANONICAL-OVERLAP",
+                "LSA-R-CANONICAL-OVERLAP",
+            }:
                 score, _ = mcc.match_minutiae_csv(
                     left_csv,
                     right_csv,
@@ -881,6 +899,23 @@ def _method_diagnostics(
             mask_b,
             method=method,
         )
+    elif method in {
+        "LSA-CANONICAL",
+        "LSA-R-CANONICAL",
+        "LSA-CANONICAL-OVERLAP",
+        "LSA-R-CANONICAL-OVERLAP",
+    } and csv_a is not None and csv_b is not None and mask_a is not None and mask_b is not None:
+        canonical_use_overlap = method.upper().endswith("-OVERLAP")
+        score, sim_matrix, pose_details = mcc.match_minutiae_csv_pose_normalized_details(
+            csv_a,
+            csv_b,
+            mask_a,
+            mask_b,
+            method=mcc._base_method_for_canonical(method),
+            strategy="canonical",
+            use_common_region_filter=canonical_use_overlap,
+            overlap_mode="auto" if canonical_use_overlap else "off",
+        )
     elif method in {"LSA", "LSA-R"} and csv_a is not None and csv_b is not None and mask_a is not None and mask_b is not None:
         score, sim_matrix, pose_details = mcc.match_minutiae_csv_pose_normalized_details(
             csv_a,
@@ -924,7 +959,7 @@ def _method_diagnostics(
         relaxation_details = pose_details["relaxation_details"]
     elif method == "LSS":
         selected_pairs = mcc._select_lss_pairs(sim_matrix, n_pairs)
-    elif method in {"LSA", "LSA-LEGACY", "LSA-OVERLAP"}:
+    elif method in {"LSA", "LSA-LEGACY", "LSA-OVERLAP", "LSA-CANONICAL", "LSA-CANONICAL-OVERLAP"}:
         selected_pairs = mcc._select_lsa_pairs(sim_matrix, n_pairs)
     elif method == "LSS-R":
         selected_pairs = mcc._select_lss_pairs(
@@ -951,7 +986,7 @@ def _method_diagnostics(
         top_indices = np.argsort(efficiency)[::-1][: min(n_pairs, len(selected_pairs))]
         relaxed_scores = [float(relaxed[index]) for index in top_indices]
 
-    if method not in {"LSS-R", "LSA-R", "LSA-R-LEGACY", "LSA-R-OVERLAP"}:
+    if method not in {"LSS-R", "LSA-R", "LSA-R-LEGACY", "LSA-R-OVERLAP", "LSA-R-CANONICAL", "LSA-R-CANONICAL-OVERLAP"}:
         relaxation_details = None
 
     selected_scores = [float(pair[2]) for pair in selected_pairs[:top_k]]
@@ -1073,7 +1108,7 @@ def _method_diagnostics(
                     "canonical_minus_relative": float(canonical_score - score),
                 },
             }
-    if method in {"LSS-R", "LSA-R", "LSA-R-LEGACY", "LSA-R-OVERLAP"}:
+    if method in {"LSS-R", "LSA-R", "LSA-R-LEGACY", "LSA-R-OVERLAP", "LSA-R-CANONICAL", "LSA-R-CANONICAL-OVERLAP"}:
         strongest_local = report["top_local_pairs"][0]["score"] if report["top_local_pairs"] else 0.0
         report["relaxation_collapse_ratio"] = (
             float(score / strongest_local) if strongest_local > 0 else 0.0

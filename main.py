@@ -565,7 +565,18 @@ def parse_args() -> argparse.Namespace:
         parser.add_argument(
             "--method",
             default="LSA-R",
-            choices=("LSS", "LSA", "LSS-R", "LSA-R", "LSA-OVERLAP", "LSA-R-OVERLAP"),
+            choices=(
+                "LSS",
+                "LSA",
+                "LSS-R",
+                "LSA-R",
+                "LSA-OVERLAP",
+                "LSA-R-OVERLAP",
+                "LSA-CANONICAL",
+                "LSA-R-CANONICAL",
+                "LSA-CANONICAL-OVERLAP",
+                "LSA-R-CANONICAL-OVERLAP",
+            ),
             help="MCC consolidation method.",
         )
         parser.add_argument(
@@ -1878,6 +1889,19 @@ def _base_method_for_legacy(method: str) -> str:
     raise ValueError(f"unsupported legacy MCC method: {method}")
 
 
+def _base_method_for_canonical(method: str) -> str:
+    normalized = method.upper()
+    if normalized in {"LSA-CANONICAL", "LSA-CANONICAL-OVERLAP"}:
+        return "LSA"
+    if normalized in {"LSA-R-CANONICAL", "LSA-R-CANONICAL-OVERLAP"}:
+        return "LSA-R"
+    raise ValueError(f"unsupported canonical MCC method: {method}")
+
+
+def _canonical_method_uses_overlap(method: str) -> bool:
+    return method.upper().endswith("-OVERLAP")
+
+
 def match_minutiae_csv_legacy(
     path_a: Path | pd.DataFrame,
     path_b: Path | pd.DataFrame,
@@ -1904,6 +1928,7 @@ def match_minutiae_csv_pose_normalized_details(
     mask_path_b: Path | np.ndarray | None,
     method: str,
     strategy: str = "relative",
+    use_common_region_filter: bool = True,
     overlap_mode: str = "auto",
 ) -> tuple[float, np.ndarray, dict]:
     base_method = _base_method_for_legacy(method)
@@ -1941,6 +1966,7 @@ def match_minutiae_csv_pose_normalized_details(
         "legacy_score": float(legacy_score),
         "legacy_method": f"{base_method}-LEGACY",
         "strategy": normalized_strategy,
+        "use_common_region_filter": bool(use_common_region_filter),
     }
 
     if mask_path_a is None or mask_path_b is None:
@@ -1986,6 +2012,8 @@ def match_minutiae_csv_pose_normalized_details(
         )
         common_mask_a = overlap_details["common_mask_a"]
         common_mask_b = overlap_details["common_mask_b"]
+        descriptor_mask_a = common_mask_a
+        descriptor_mask_b = common_mask_b
     else:
         transform_left = overlap_details["estimated_transform"]["left"]
         transform_right = overlap_details["estimated_transform"]["right"]
@@ -2003,11 +2031,24 @@ def match_minutiae_csv_pose_normalized_details(
             translation_x=float(transform_right["translation_x"]),
             translation_y=float(transform_right["translation_y"]),
         )
+        left_canonical = _estimate_canonical_transform(mask_a)
+        right_canonical = _estimate_canonical_transform(mask_b)
+        descriptor_mask_a = left_canonical["warped_mask"]
+        descriptor_mask_b = right_canonical["warped_mask"]
         common_mask_a = overlap_details["common_mask_a"]
         common_mask_b = overlap_details["common_mask_b"]
 
-    filtered_a = _filter_minutiae_by_mask(normalized_a, common_mask_a)
-    filtered_b = _filter_minutiae_by_mask(normalized_b, common_mask_b)
+    if use_common_region_filter:
+        filtered_a = _filter_minutiae_by_mask(normalized_a, common_mask_a)
+        filtered_b = _filter_minutiae_by_mask(normalized_b, common_mask_b)
+        active_mask_a = common_mask_a
+        active_mask_b = common_mask_b
+    else:
+        filtered_a = normalized_a.reset_index(drop=True)
+        filtered_b = normalized_b.reset_index(drop=True)
+        active_mask_a = descriptor_mask_a
+        active_mask_b = descriptor_mask_b
+
     details["left_overlap_minutiae_count"] = int(len(filtered_a))
     details["right_overlap_minutiae_count"] = int(len(filtered_b))
     if len(filtered_a) < MCC_OVERLAP_MIN_MINUTIAE or len(filtered_b) < MCC_OVERLAP_MIN_MINUTIAE:
@@ -2019,12 +2060,12 @@ def match_minutiae_csv_pose_normalized_details(
     descriptors_before_b = build_descriptors(raw_frame_b, validity_mask_path=mask_b, validity_mode="mask")
     descriptors_after_a = build_descriptors(
         filtered_a,
-        validity_mask_path=common_mask_a,
+        validity_mask_path=active_mask_a,
         validity_mode="mask",
     )
     descriptors_after_b = build_descriptors(
         filtered_b,
-        validity_mask_path=common_mask_b,
+        validity_mask_path=active_mask_b,
         validity_mode="mask",
     )
     details["left_descriptor_count_before"] = int(len(descriptors_before_a))
@@ -2773,7 +2814,14 @@ def match_descriptors(
         return 0.0, sim_matrix
 
     normalized_method = method.upper()
-    if normalized_method in {"LSA-OVERLAP", "LSA-R-OVERLAP"}:
+    if normalized_method in {
+        "LSA-OVERLAP",
+        "LSA-R-OVERLAP",
+        "LSA-CANONICAL",
+        "LSA-R-CANONICAL",
+        "LSA-CANONICAL-OVERLAP",
+        "LSA-R-CANONICAL-OVERLAP",
+    }:
         raise ValueError(
             f"{normalized_method} requires minutiae CSV inputs and masks, not prebuilt descriptors"
         )
@@ -2825,6 +2873,24 @@ def match_minutiae_csv(
             mask_path_b,
             method=method,
             overlap_mode=overlap_mode,
+        )
+        return score, sim_matrix
+    if normalized_method in {
+        "LSA-CANONICAL",
+        "LSA-R-CANONICAL",
+        "LSA-CANONICAL-OVERLAP",
+        "LSA-R-CANONICAL-OVERLAP",
+    }:
+        canonical_use_overlap = _canonical_method_uses_overlap(method)
+        score, sim_matrix, _ = match_minutiae_csv_pose_normalized_details(
+            path_a,
+            path_b,
+            mask_path_a,
+            mask_path_b,
+            method=_base_method_for_canonical(method),
+            strategy="canonical",
+            use_common_region_filter=canonical_use_overlap,
+            overlap_mode=overlap_mode if canonical_use_overlap else "off",
         )
         return score, sim_matrix
     if normalized_method in {"LSA", "LSA-R"} and mask_path_a is not None and mask_path_b is not None:
@@ -2935,7 +3001,16 @@ def _match_fingerprint_images_with_workspace(
     run_dir.mkdir(parents=True, exist_ok=True)
     csv_a, mask_a = _extract_minutiae_csv_from_image(image_a, run_dir / "a", model_paths)
     csv_b, mask_b = _extract_minutiae_csv_from_image(image_b, run_dir / "b", model_paths)
-    if method.upper() in {"LSA", "LSA-R", "LSA-OVERLAP", "LSA-R-OVERLAP"}:
+    if method.upper() in {
+        "LSA",
+        "LSA-R",
+        "LSA-OVERLAP",
+        "LSA-R-OVERLAP",
+        "LSA-CANONICAL",
+        "LSA-R-CANONICAL",
+        "LSA-CANONICAL-OVERLAP",
+        "LSA-R-CANONICAL-OVERLAP",
+    }:
         score, sim_matrix = match_minutiae_csv(
             csv_a,
             csv_b,
