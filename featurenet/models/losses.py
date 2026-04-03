@@ -94,7 +94,7 @@ class FeatureNetLoss(nn.Module):
         alpha=1.0,
         beta=60.0,
         gamma=300.0,
-        sigma=1.0,
+        sigma=0.5,
         mu_score=300.0,
         mu_x=15.0,
         mu_y=15.0,
@@ -117,8 +117,21 @@ class FeatureNetLoss(nn.Module):
         self.mu_y = mu_y
         self.mu_ori = mu_ori
 
+    def _resolve_minutia_mask(self, targets, mask):
+        minutia_mask = targets.get("minutia_valid_mask", mask)
+        if minutia_mask.dim() == 3:
+            minutia_mask = minutia_mask.unsqueeze(1)
+        minutia_mask = minutia_mask.float() * mask.float()
+        if float(minutia_mask.sum().item()) <= 0.0:
+            return mask.float()
+        return minutia_mask
+
     def forward(self, outputs, targets):
         mask = targets["mask"]
+        if mask.dim() == 3:
+            mask = mask.unsqueeze(1)
+        mask = mask.float()
+        minutia_mask = self._resolve_minutia_mask(targets, mask)
 
         # ---------------------------
         # 1. Orientation loss
@@ -161,12 +174,12 @@ class FeatureNetLoss(nn.Module):
         # --- M2: x
         x_loss_map = self.ce(outputs["minutia_x"], targets["minutia_x"])
         x_loss_map = x_loss_map.unsqueeze(1)
-        L_m2 = (x_loss_map * mask).sum() / (mask.sum() + 1e-8)
+        L_m2 = (x_loss_map * minutia_mask).sum() / (minutia_mask.sum() + 1e-8)
 
         # --- M3: y
         y_loss_map = self.ce(outputs["minutia_y"], targets["minutia_y"])
         y_loss_map = y_loss_map.unsqueeze(1)
-        L_m3 = (y_loss_map * mask).sum() / (mask.sum() + 1e-8)
+        L_m3 = (y_loss_map * minutia_mask).sum() / (minutia_mask.sum() + 1e-8)
 
         # --- M4: orientation
         ori_loss_map = self.ce(
@@ -174,7 +187,7 @@ class FeatureNetLoss(nn.Module):
             targets["minutia_orientation"]
         )
         ori_loss_map = ori_loss_map.unsqueeze(1)
-        L_m4 = (ori_loss_map * mask).sum() / (mask.sum() + 1e-8)
+        L_m4 = (ori_loss_map * minutia_mask).sum() / (minutia_mask.sum() + 1e-8)
 
         # combine minutiae
         L_minu = (

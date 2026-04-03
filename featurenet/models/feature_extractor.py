@@ -7,7 +7,7 @@ class FeatureExtractor(nn.Module):
         super().__init__()
         #branch 1
         self.branch1 = nn.Sequential(
-            ConvBlock(64, 64, kernel_size=3, stride=1, padding=1),
+            ConvBlock(2, 64, kernel_size=3, stride=1, padding=1),
             ConvBlock(64, 64, kernel_size=3, stride=1, padding=1),
             nn.MaxPool2d(kernel_size=2, stride=2),
             ConvBlock(64, 128, kernel_size=3, stride=1, padding=1),
@@ -34,7 +34,7 @@ class FeatureExtractor(nn.Module):
 
         #branch 2 (minuitae branch)
         self.branch2 = nn.Sequential(
-            ConvBlock(64, 64, kernel_size=9, stride=1, padding=4),
+            ConvBlock(2, 64, kernel_size=9, stride=1, padding=4),
             nn.MaxPool2d(kernel_size=2, stride=2),
             ConvBlock(64, 128, kernel_size=5, stride=1, padding=2),
             nn.MaxPool2d(kernel_size=2, stride=2),
@@ -72,7 +72,18 @@ class FeatureExtractor(nn.Module):
             ConvBlock(256, 8, kernel_size=1, stride=1, padding=0)
         )
 
-    def forward(self, x):
+    def forward(self, x, mask=None):
+        if mask is not None:
+            image = x * mask
+            x = torch.cat([image, mask], dim=1)
+        else:
+            raise ValueError("mask is required for feature extractor")
+
+        if x.dim() != 4:
+            raise ValueError(f"expected input with shape [B, 2, H, W], got {tuple(x.shape)}")
+        if x.shape[1] != 2:
+            raise ValueError(f"expected 2 input channels (masked image + mask), got {x.shape[1]}")
+
         x1 = self.branch2(x)
         x = self.branch1(x)
         ridge_interim = self.branch_stem_ridge(x)

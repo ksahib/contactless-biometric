@@ -1,0 +1,861 @@
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import random
+import time
+from collections import defaultdict
+from contextlib import nullcontext
+from pathlib import Path
+from typing import Any, Mapping
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from torch import optim
+from torch.utils.data import DataLoader, Dataset
+
+try:
+    import cv2  # type: ignore
+except ImportError:  # pragma: no cover - exercised only in lighter environments
+    cv2 = None
+
+try:
+    from PIL import Image
+except ImportError:  # pragma: no cover - Pillow may also be unavailable
+    Image = None
+
+from .feature_extractor import FeatureExtractor
+from .losses import FeatureNetLoss
+
+
+FLOAT_TARGET_KEYS = {"mask", "orientation", "ridge_period", "gradient", "minutia_score", "minutia_valid_mask"}
+LONG_TARGET_KEYS = {"minutia_x", "minutia_y", "minutia_orientation"}
+LOSS_KEYS = ("total", "orientation", "ridge", "gradient", "minutia", "m1", "m2", "m3", "m4")
+
+
+def _read_grayscale_image(source: str | Path | np.ndarray) -> np.ndarray:
+    if isinstance(source, np.ndarray):
+        array = source
+    else:
+        if cv2 is not None:
+            image = cv2.imread(str(source), cv2.IMREAD_UNCHANGED)
+            if image is None:
+                raise FileNotFoundError(f"unable to load image from {source}")
+            array = image
+        elif Image is not None:
+            with Image.open(source) as image:
+                array = np.array(image)
+        else:
+            raise RuntimeError("image loading requires either opencv-python or Pillow to be installed")
+
+    if array.ndim == 2:
+        return array
+    if array.ndim == 3 and array.shape[2] == 1:
+        return array[:, :, 0]
+    if array.ndim == 3 and array.shape[2] == 4:
+        if cv2 is not None:
+            return cv2.cvtColor(array, cv2.COLOR_BGRA2GRAY)
+        rgb = array[:, :, :3].astype(np.float32)
+        return np.round(0.299 * rgb[:, :, 0] + 0.587 * rgb[:, :, 1] + 0.114 * rgb[:, :, 2]).astype(array.dtype)
+    if array.ndim == 3 and array.shape[2] == 3:
+        if cv2 is not None:
+            return cv2.cvtColor(array, cv2.COLOR_BGR2GRAY)
+        rgb = array.astype(np.float32)
+        return np.round(0.299 * rgb[:, :, 0] + 0.587 * rgb[:, :, 1] + 0.114 * rgb[:, :, 2]).astype(array.dtype)
+    raise ValueError(f"unsupported image shape: {array.shape}")
+
+
+def _to_image_tensor(image: str | Path | np.ndarray) -> torch.Tensor:
+    image_array = _read_grayscale_image(image).astype(np.float32)
+    if image_array.max() > 1.0:
+        image_array /= 255.0
+    return torch.from_numpy(image_array).unsqueeze(0)
+
+
+def _to_mask_tensor(mask: str | Path | np.ndarray) -> torch.Tensor:
+    mask_array = _read_grayscale_image(mask)
+    mask_array = (mask_array > 0).astype(np.float32)
+    return torch.from_numpy(mask_array).unsqueeze(0)
+
+
+def build_input_tensor(
+    masked_image: str | Path | np.ndarray,
+    mask: str | Path | np.ndarray,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    image_tensor = _to_image_tensor(masked_image)
+    mask_tensor = _to_mask_tensor(mask)
+
+    if image_tensor.shape[-2:] != mask_tensor.shape[-2:]:
+        raise ValueError(
+            "masked image and mask must have the same spatial shape, "
+            f"got {tuple(image_tensor.shape[-2:])} and {tuple(mask_tensor.shape[-2:])}"
+        )
+
+    return torch.cat([image_tensor, mask_tensor], dim=0), mask_tensor
+
+
+def _to_float_target_tensor(value: Any) -> torch.Tensor:
+    tensor = torch.as_tensor(value, dtype=torch.float32)
+    if tensor.dim() == 2:
+        tensor = tensor.unsqueeze(0)
+    elif tensor.dim() == 3 and tensor.shape[0] not in {1, 2, 180, 360} and tensor.shape[-1] in {1, 2, 180, 360}:
+        tensor = tensor.permute(2, 0, 1)
+    return tensor.contiguous()
+
+
+def _to_long_target_tensor(value: Any) -> torch.Tensor:
+    tensor = torch.as_tensor(value, dtype=torch.long)
+    if tensor.dim() == 3 and tensor.shape[-1] == 1:
+        tensor = tensor.squeeze(-1)
+    if tensor.dim() == 3 and tensor.shape[0] == 1:
+        tensor = tensor.squeeze(0)
+    return tensor.contiguous()
+
+
+def prepare_targets(targets: Mapping[str, Any], mask_tensor: torch.Tensor) -> dict[str, torch.Tensor]:
+    prepared: dict[str, torch.Tensor] = {"mask": mask_tensor}
+
+    for key, value in targets.items():
+        if key in FLOAT_TARGET_KEYS:
+            prepared[key] = _to_float_target_tensor(value)
+        elif key in LONG_TARGET_KEYS:
+            prepared[key] = _to_long_target_tensor(value)
+        else:
+            prepared[key] = torch.as_tensor(value)
+
+    return prepared
+
+
+class FeatureNetDataset(Dataset):
+    def __init__(self, samples: list[Mapping[str, Any]]):
+        self.samples = samples
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        sample = self.samples[index]
+        input_tensor, mask_tensor = build_input_tensor(
+            sample["masked_image"],
+            sample["mask"],
+        )
+
+        targets = prepare_targets(sample.get("targets", {}), mask_tensor)
+        return input_tensor, targets
+
+
+def _pad_tensor_to_shape(tensor: torch.Tensor, spatial_shape: tuple[int, int]) -> torch.Tensor:
+    target_height, target_width = spatial_shape
+    pad_height = target_height - tensor.shape[-2]
+    pad_width = target_width - tensor.shape[-1]
+    if pad_height < 0 or pad_width < 0:
+        raise ValueError(f"cannot pad tensor with shape {tuple(tensor.shape)} to smaller shape {spatial_shape}")
+    if pad_height == 0 and pad_width == 0:
+        return tensor
+    return F.pad(tensor, (0, pad_width, 0, pad_height))
+
+
+def _collate_batch(batch: list[tuple[torch.Tensor, dict[str, torch.Tensor]]]) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    inputs, targets = zip(*batch)
+    max_height = max(tensor.shape[-2] for tensor in inputs)
+    max_width = max(tensor.shape[-1] for tensor in inputs)
+    padded_inputs = [_pad_tensor_to_shape(tensor, (max_height, max_width)) for tensor in inputs]
+    collated_inputs = torch.stack(padded_inputs, dim=0)
+
+    collated_targets: dict[str, torch.Tensor] = {}
+    for key in targets[0]:
+        values = [target[key] for target in targets]
+        if values[0].dim() >= 2:
+            max_height = max(value.shape[-2] for value in values)
+            max_width = max(value.shape[-1] for value in values)
+            values = [_pad_tensor_to_shape(value, (max_height, max_width)) for value in values]
+        collated_targets[key] = torch.stack(values, dim=0)
+
+    return collated_inputs, collated_targets
+
+
+def create_dataloader(
+    samples: list[Mapping[str, Any]],
+    batch_size: int,
+    shuffle: bool = True,
+    num_workers: int = 0,
+    pin_memory: bool | None = None,
+    persistent_workers: bool = False,
+    prefetch_factor: int | None = None,
+) -> DataLoader:
+    dataset = FeatureNetDataset(samples)
+    if pin_memory is None:
+        pin_memory = torch.cuda.is_available()
+    dataloader_kwargs: dict[str, Any] = {
+        "dataset": dataset,
+        "batch_size": batch_size,
+        "shuffle": shuffle,
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+        "collate_fn": _collate_batch,
+    }
+    if num_workers > 0:
+        dataloader_kwargs["persistent_workers"] = persistent_workers
+        if prefetch_factor is not None:
+            dataloader_kwargs["prefetch_factor"] = prefetch_factor
+    return DataLoader(
+        **dataloader_kwargs,
+    )
+
+
+def _resolve_device(device: str | torch.device | None) -> torch.device:
+    if device is not None:
+        return torch.device(device)
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
+
+
+def _autocast_context(device: torch.device, enabled: bool):
+    if not enabled or device.type != "cuda":
+        return nullcontext()
+    return torch.autocast(device_type="cuda", dtype=torch.float16)
+
+
+def _maybe_channels_last(model: FeatureExtractor, enabled: bool) -> FeatureExtractor:
+    if enabled:
+        model = model.to(memory_format=torch.channels_last)
+    return model
+
+
+def _prepare_inputs_for_model(inputs: torch.Tensor, channels_last: bool) -> torch.Tensor:
+    if channels_last and inputs.dim() == 4:
+        return inputs.contiguous(memory_format=torch.channels_last)
+    return inputs
+
+
+def _maybe_compile_model(model: FeatureExtractor, enabled: bool) -> FeatureExtractor:
+    if not enabled or not hasattr(torch, "compile"):
+        return model
+    return torch.compile(model)
+
+
+def _make_grad_scaler(enabled: bool):
+    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+        return torch.amp.GradScaler("cuda", enabled=enabled)
+    return torch.cuda.amp.GradScaler(enabled=enabled)
+
+
+def _resize_like(tensor: torch.Tensor, spatial_shape: tuple[int, int], mode: str) -> torch.Tensor:
+    if mode in {"bilinear", "bicubic"}:
+        return F.interpolate(tensor, size=spatial_shape, mode=mode, align_corners=False)
+    return F.interpolate(tensor, size=spatial_shape, mode=mode)
+
+
+def _compute_spatial_shape(output_shapes: Mapping[str, torch.Size | tuple[int, ...]]) -> tuple[int, int]:
+    spatial_shapes = {
+        key: tuple(shape[-2:])
+        for key, shape in output_shapes.items()
+    }
+    unique_shapes = set(spatial_shapes.values())
+    if len(unique_shapes) != 1:
+        raise ValueError(f"expected all heads to share one spatial shape, got {spatial_shapes}")
+    return next(iter(unique_shapes))
+
+
+def _sobel_gradients(image_batch: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    kernel_x = image_batch.new_tensor(
+        [[[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]]]
+    ).unsqueeze(0)
+    kernel_y = image_batch.new_tensor(
+        [[[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]]]
+    ).unsqueeze(0)
+    grad_x = F.conv2d(image_batch, kernel_x, padding=1)
+    grad_y = F.conv2d(image_batch, kernel_y, padding=1)
+    return grad_x, grad_y
+
+
+def _one_hot_from_bins(
+    bins: torch.Tensor,
+    num_bins: int,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    one_hot = F.one_hot(bins.long().clamp(0, num_bins - 1), num_classes=num_bins)
+    one_hot = one_hot.permute(0, 3, 1, 2).float()
+    return one_hot * mask
+
+
+def _build_spatial_bin_targets(
+    batch_size: int,
+    height: int,
+    width: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    y_coords = torch.arange(height, device=device).view(1, height, 1).expand(batch_size, height, width)
+    x_coords = torch.arange(width, device=device).view(1, 1, width).expand(batch_size, height, width)
+
+    x_bins = torch.div(x_coords * 8, max(width, 1), rounding_mode="floor").clamp(0, 7)
+    y_bins = torch.div(y_coords * 8, max(height, 1), rounding_mode="floor").clamp(0, 7)
+    return x_bins.long(), y_bins.long()
+
+
+def build_pseudo_targets(
+    image_batch: torch.Tensor,
+    mask_batch: torch.Tensor,
+    output_shapes: Mapping[str, torch.Size | tuple[int, ...]],
+) -> dict[str, torch.Tensor]:
+    spatial_shape = _compute_spatial_shape(output_shapes)
+    resized_image = _resize_like(image_batch.float(), spatial_shape, mode="bilinear")
+    resized_mask = _resize_like(mask_batch.float(), spatial_shape, mode="nearest")
+    resized_mask = (resized_mask > 0.5).float()
+    masked_image = resized_image * resized_mask
+
+    grad_x, grad_y = _sobel_gradients(masked_image)
+    grad_mag = torch.sqrt(grad_x.pow(2) + grad_y.pow(2) + 1e-8) * resized_mask
+
+    angle = torch.atan2(grad_y, grad_x + 1e-8)
+    angle = torch.remainder(angle, 2 * torch.pi).squeeze(1)
+
+    orientation_bins = torch.floor(angle * 180.0 / (2 * torch.pi)).clamp(0, 179)
+    orientation = _one_hot_from_bins(orientation_bins, 180, resized_mask)
+
+    minutia_orientation = torch.floor(angle * 360.0 / (2 * torch.pi)).clamp(0, 359).long()
+    minutia_orientation = minutia_orientation * resized_mask.squeeze(1).long()
+
+    ridge_period = F.avg_pool2d(masked_image, kernel_size=5, stride=1, padding=2)
+    ridge_period = ridge_period * resized_mask
+    ridge_period = ridge_period / ridge_period.amax(dim=(-2, -1), keepdim=True).clamp_min(1e-6)
+
+    local_mean = F.avg_pool2d(masked_image, kernel_size=9, stride=1, padding=4)
+    contrast = (masked_image - local_mean).abs() * resized_mask
+    response = grad_mag + contrast
+    threshold = response.flatten(2).mean(dim=-1, keepdim=True).view(-1, 1, 1, 1)
+    minutia_score = (response > threshold).float() * resized_mask
+
+    batch_size, _, height, width = resized_mask.shape
+    minutia_x, minutia_y = _build_spatial_bin_targets(batch_size, height, width, resized_mask.device)
+    mask_labels = resized_mask.squeeze(1).long()
+    minutia_x = minutia_x * mask_labels
+    minutia_y = minutia_y * mask_labels
+
+    return {
+        "mask": resized_mask,
+        "orientation": orientation,
+        "ridge_period": ridge_period,
+        "minutia_score": minutia_score,
+        "minutia_valid_mask": minutia_score,
+        "minutia_x": minutia_x,
+        "minutia_y": minutia_y,
+        "minutia_orientation": minutia_orientation,
+    }
+
+
+def _move_targets_to_device(targets: Mapping[str, torch.Tensor], device: torch.device) -> dict[str, torch.Tensor]:
+    return {key: value.to(device, non_blocking=True) for key, value in targets.items()}
+
+
+def _merge_targets(
+    explicit_targets: Mapping[str, torch.Tensor],
+    pseudo_targets: Mapping[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    merged = dict(pseudo_targets)
+    merged.update(explicit_targets)
+    return merged
+
+
+def _loss_dict_to_scalars(losses: Mapping[str, torch.Tensor]) -> dict[str, float]:
+    return {key: float(value.detach().item()) for key, value in losses.items() if key in LOSS_KEYS}
+
+
+def _run_model_step(
+    model: FeatureExtractor,
+    criterion: FeatureNetLoss,
+    inputs: torch.Tensor,
+    targets: Mapping[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    image = inputs[:, :1]
+    mask = inputs[:, 1:2]
+    outputs = model(image, mask=mask)
+    pseudo_targets = build_pseudo_targets(image, mask, {key: value.shape for key, value in outputs.items()})
+    merged_targets = _merge_targets(targets, pseudo_targets)
+    if "gradient" not in merged_targets:
+        raise KeyError("missing explicit reconstruction-derived gradient target for gradient supervision")
+    return criterion(outputs, merged_targets)
+
+
+def train_one_epoch(
+    model: FeatureExtractor,
+    dataloader: DataLoader,
+    criterion: FeatureNetLoss,
+    optimizer: optim.Optimizer,
+    device: str | torch.device,
+    scaler: torch.cuda.amp.GradScaler | None = None,
+    amp: bool = False,
+    channels_last: bool = False,
+    grad_accum_steps: int = 1,
+) -> dict[str, float]:
+    model.train()
+    resolved_device = torch.device(device)
+    running = {key: 0.0 for key in LOSS_KEYS}
+    num_batches = 0
+    grad_accum_steps = max(1, int(grad_accum_steps))
+    optimizer.zero_grad(set_to_none=True)
+
+    for batch_index, (inputs, targets) in enumerate(dataloader, start=1):
+        inputs = inputs.to(resolved_device, non_blocking=True)
+        inputs = _prepare_inputs_for_model(inputs, channels_last)
+        targets = _move_targets_to_device(targets, resolved_device)
+        with _autocast_context(resolved_device, amp):
+            losses = _run_model_step(model, criterion, inputs, targets)
+            total_loss = losses["total"]
+        if not torch.isfinite(total_loss):
+            raise RuntimeError("encountered non-finite total loss during training")
+
+        scaled_loss = total_loss / grad_accum_steps
+        if scaler is not None and amp and resolved_device.type == "cuda":
+            scaler.scale(scaled_loss).backward()
+        else:
+            scaled_loss.backward()
+
+        if batch_index % grad_accum_steps == 0:
+            if scaler is not None and amp and resolved_device.type == "cuda":
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+
+        scalar_losses = _loss_dict_to_scalars(losses)
+        for key in LOSS_KEYS:
+            running[key] += scalar_losses[key]
+        num_batches += 1
+
+    if num_batches % grad_accum_steps != 0:
+        if scaler is not None and amp and resolved_device.type == "cuda":
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+
+    if num_batches == 0:
+        raise ValueError("training dataloader is empty")
+
+    return {key: value / num_batches for key, value in running.items()}
+
+
+@torch.no_grad()
+def evaluate(
+    model: FeatureExtractor,
+    dataloader: DataLoader,
+    criterion: FeatureNetLoss,
+    device: str | torch.device,
+    amp: bool = False,
+    channels_last: bool = False,
+) -> dict[str, float]:
+    model.eval()
+    resolved_device = torch.device(device)
+    running = {key: 0.0 for key in LOSS_KEYS}
+    num_batches = 0
+
+    for inputs, targets in dataloader:
+        inputs = inputs.to(resolved_device, non_blocking=True)
+        inputs = _prepare_inputs_for_model(inputs, channels_last)
+        targets = _move_targets_to_device(targets, resolved_device)
+        with _autocast_context(resolved_device, amp):
+            losses = _run_model_step(model, criterion, inputs, targets)
+
+        scalar_losses = _loss_dict_to_scalars(losses)
+        for key in LOSS_KEYS:
+            running[key] += scalar_losses[key]
+        num_batches += 1
+
+    if num_batches == 0:
+        raise ValueError("validation dataloader is empty")
+
+    return {key: value / num_batches for key, value in running.items()}
+
+
+def fit_debug(
+    samples: list[Mapping[str, Any]],
+    epochs: int = 3,
+    batch_size: int = 2,
+    lr: float = 1e-3,
+    device: str | torch.device | None = None,
+    shuffle: bool = True,
+    num_workers: int = 0,
+    amp: bool = False,
+    channels_last: bool = False,
+) -> dict[str, Any]:
+    if not samples:
+        raise ValueError("fit_debug requires at least one sample")
+    if epochs < 1:
+        raise ValueError("epochs must be at least 1")
+
+    resolved_device = _resolve_device(device)
+    dataloader = create_dataloader(
+        samples=samples,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+    )
+
+    model = _maybe_channels_last(FeatureExtractor().to(resolved_device), channels_last)
+    criterion = FeatureNetLoss().to(resolved_device)
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    scaler = _make_grad_scaler(amp and resolved_device.type == "cuda")
+
+    history: list[dict[str, float]] = []
+    stopped_early = False
+
+    for epoch in range(epochs):
+        metrics = train_one_epoch(
+            model=model,
+            dataloader=dataloader,
+            criterion=criterion,
+            optimizer=optimizer,
+            device=resolved_device,
+            scaler=scaler,
+            amp=amp,
+            channels_last=channels_last,
+        )
+        metrics["epoch"] = float(epoch + 1)
+        history.append(metrics)
+        if not np.isfinite(metrics["total"]):
+            stopped_early = True
+            break
+
+    return {
+        "device": str(resolved_device),
+        "epochs_requested": epochs,
+        "epochs_ran": len(history),
+        "batch_size": batch_size,
+        "lr": lr,
+        "stopped_early": stopped_early,
+        "history": history,
+        "model": model,
+        "criterion": criterion,
+        "optimizer": optimizer,
+    }
+
+
+def _collect_output_shapes(
+    model: FeatureExtractor,
+    dataloader: DataLoader,
+    device: torch.device,
+) -> dict[str, list[int]]:
+    inputs, _ = next(iter(dataloader))
+    inputs = inputs.to(device)
+    image = inputs[:, :1]
+    mask = inputs[:, 1:2]
+
+    model.eval()
+    with torch.no_grad():
+        outputs = model(image, mask=mask)
+    model.train()
+    return {key: list(value.shape) for key, value in outputs.items()}
+
+
+def run_smoke_test(
+    samples: list[Mapping[str, Any]],
+    epochs: int = 2,
+    batch_size: int = 2,
+    lr: float = 1e-3,
+    device: str | torch.device | None = None,
+    amp: bool = False,
+    channels_last: bool = False,
+) -> dict[str, Any]:
+    if not samples:
+        raise ValueError("run_smoke_test requires at least one sample")
+
+    resolved_device = _resolve_device(device)
+    dataloader = create_dataloader(samples=samples, batch_size=batch_size, shuffle=False, num_workers=0)
+    model = _maybe_channels_last(FeatureExtractor().to(resolved_device), channels_last)
+    output_shapes = _collect_output_shapes(model, dataloader, resolved_device)
+
+    result = fit_debug(
+        samples=samples,
+        epochs=epochs,
+        batch_size=batch_size,
+        lr=lr,
+        device=resolved_device,
+        shuffle=False,
+        num_workers=0,
+        amp=amp,
+        channels_last=channels_last,
+    )
+
+    history = result["history"]
+    first_total = history[0]["total"]
+    last_total = history[-1]["total"]
+    return {
+        "device": result["device"],
+        "epochs_ran": result["epochs_ran"],
+        "batch_size": batch_size,
+        "num_samples": len(samples),
+        "output_shapes": output_shapes,
+        "first_total_loss": first_total,
+        "last_total_loss": last_total,
+        "loss_delta": last_total - first_total,
+        "history": history,
+    }
+
+
+def _load_npz_targets(npz_path: Path) -> dict[str, Any]:
+    with np.load(npz_path) as data:
+        targets = {key: data[key] for key in data.files}
+    if "output_mask" in targets and "mask" not in targets:
+        targets["mask"] = targets.pop("output_mask")
+    return targets
+
+
+def load_bundle_samples(ground_truth_root: str | Path, limit: int | None = None) -> list[dict[str, Any]]:
+    root = Path(ground_truth_root)
+    samples_root = root / "samples"
+    if not samples_root.exists():
+        raise FileNotFoundError(f"missing sample directory: {samples_root}")
+
+    sample_dirs = sorted(path for path in samples_root.iterdir() if path.is_dir())
+    if limit is not None:
+        sample_dirs = sample_dirs[:limit]
+
+    samples: list[dict[str, Any]] = []
+    for sample_dir in sample_dirs:
+        meta_path = sample_dir / "meta.json"
+        masked_image_path = sample_dir / "masked_image.png"
+        mask_path = sample_dir / "mask.png"
+        targets_path = sample_dir / "featurenet_targets.npz"
+        if not (meta_path.exists() and masked_image_path.exists() and mask_path.exists() and targets_path.exists()):
+            continue
+
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        if meta.get("raw_view_index") not in {0, 1, 2}:
+            continue
+        targets = _load_npz_targets(targets_path)
+        if "gradient" not in targets:
+            raise ValueError(f"missing reconstruction-derived gradient target in {targets_path}")
+        samples.append(
+            {
+                "sample_id": meta["sample_id"],
+                "finger_class_id": meta.get("finger_class_id"),
+                "subject_id": meta.get("subject_id"),
+                "finger_id": meta.get("finger_id"),
+                "acquisition_id": meta.get("acquisition_id"),
+                "masked_image": masked_image_path,
+                "mask": mask_path,
+                "targets": targets,
+            }
+        )
+
+    if not samples:
+        raise ValueError(f"no usable samples found under {samples_root}")
+    return samples
+
+
+def split_samples(
+    samples: list[dict[str, Any]],
+    val_fraction: float,
+    seed: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if not 0.0 <= val_fraction < 1.0:
+        raise ValueError("val_fraction must be in [0.0, 1.0)")
+    if val_fraction == 0.0 or len(samples) < 2:
+        return samples, []
+
+    groups: dict[Any, list[dict[str, Any]]] = defaultdict(list)
+    for sample in samples:
+        group_key = sample.get("finger_class_id")
+        if group_key is None:
+            group_key = sample["sample_id"]
+        groups[group_key].append(sample)
+
+    group_keys = list(groups.keys())
+    rng = random.Random(seed)
+    rng.shuffle(group_keys)
+
+    val_group_count = max(1, int(round(len(group_keys) * val_fraction)))
+    val_keys = set(group_keys[:val_group_count])
+
+    train_samples = [sample for key, group in groups.items() if key not in val_keys for sample in group]
+    val_samples = [sample for key, group in groups.items() if key in val_keys for sample in group]
+
+    if not train_samples or not val_samples:
+        raise ValueError("split produced an empty train or validation set; reduce val_fraction or add more samples")
+    return train_samples, val_samples
+
+
+def _checkpoint_payload(
+    model: FeatureExtractor,
+    optimizer: optim.Optimizer,
+    epoch: int,
+    metrics: Mapping[str, Any],
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    return {
+        "epoch": epoch,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "metrics": dict(metrics),
+        "args": vars(args),
+    }
+
+
+def _save_json(path: Path, payload: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def train_model(args: argparse.Namespace) -> dict[str, Any]:
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+
+    samples = load_bundle_samples(args.ground_truth_root, limit=args.limit)
+    train_samples, val_samples = split_samples(samples, val_fraction=args.val_fraction, seed=args.seed)
+    resolved_device = _resolve_device(args.device)
+    use_amp = bool(args.amp) and resolved_device.type == "cuda"
+    use_pin_memory = bool(args.pin_memory) and resolved_device.type == "cuda"
+    if args.cudnn_benchmark and resolved_device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+
+    train_loader = create_dataloader(
+        samples=train_samples,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=use_pin_memory,
+        persistent_workers=args.persistent_workers,
+        prefetch_factor=args.prefetch_factor,
+    )
+    val_loader = None
+    if val_samples:
+        val_loader = create_dataloader(
+            samples=val_samples,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=use_pin_memory,
+            persistent_workers=args.persistent_workers,
+            prefetch_factor=args.prefetch_factor,
+        )
+
+    model = _maybe_channels_last(FeatureExtractor().to(resolved_device), args.channels_last)
+    model = _maybe_compile_model(model, args.compile and resolved_device.type == "cuda")
+    criterion = FeatureNetLoss().to(resolved_device)
+    optimizer = optim.Adam(
+        model.parameters(),
+        lr=args.lr,
+        betas=(0.9, 0.999),
+        weight_decay=0.0,
+    )
+    scaler = _make_grad_scaler(use_amp)
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    best_val_total = float("inf")
+    history: list[dict[str, Any]] = []
+    started_at = time.time()
+
+    for epoch in range(1, args.epochs + 1):
+        epoch_started_at = time.time()
+        train_metrics = train_one_epoch(
+            model,
+            train_loader,
+            criterion,
+            optimizer,
+            resolved_device,
+            scaler=scaler,
+            amp=use_amp,
+            channels_last=args.channels_last,
+            grad_accum_steps=args.grad_accum_steps,
+        )
+        record: dict[str, Any] = {
+            "epoch": epoch,
+            "train": train_metrics,
+            "seconds": round(time.time() - epoch_started_at, 3),
+        }
+
+        if val_loader is not None:
+            val_metrics = evaluate(
+                model,
+                val_loader,
+                criterion,
+                resolved_device,
+                amp=use_amp,
+                channels_last=args.channels_last,
+            )
+            record["val"] = val_metrics
+            current_val_total = val_metrics["total"]
+            if current_val_total < best_val_total:
+                best_val_total = current_val_total
+                torch.save(
+                    _checkpoint_payload(model, optimizer, epoch, record, args),
+                    output_dir / "best.pt",
+                )
+
+        history.append(record)
+        print(json.dumps(record), flush=True)
+
+    last_record = history[-1]
+    torch.save(
+        _checkpoint_payload(model, optimizer, args.epochs, last_record, args),
+        output_dir / "last.pt",
+    )
+
+    summary = {
+        "device": str(resolved_device),
+        "sample_count": len(samples),
+        "train_sample_count": len(train_samples),
+        "val_sample_count": len(val_samples),
+        "epochs": args.epochs,
+        "batch_size": args.batch_size,
+        "lr": args.lr,
+        "amp": use_amp,
+        "channels_last": bool(args.channels_last),
+        "compile": bool(args.compile and resolved_device.type == "cuda"),
+        "grad_accum_steps": args.grad_accum_steps,
+        "pin_memory": use_pin_memory,
+        "persistent_workers": args.persistent_workers,
+        "prefetch_factor": args.prefetch_factor,
+        "adam_beta1": 0.9,
+        "adam_beta2": 0.999,
+        "weight_decay": 0.0,
+        "seed": args.seed,
+        "wall_seconds": round(time.time() - started_at, 3),
+        "history": history,
+    }
+    _save_json(output_dir / "history.json", summary)
+    return summary
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train FeatureNet against generated DS1 ground-truth bundles.")
+    parser.add_argument("--ground-truth-root", type=Path, required=True, help="Path to a generated ground_truth/DS1 folder.")
+    parser.add_argument("--output-dir", type=Path, required=True, help="Directory for checkpoints and training history.")
+    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--num-workers", type=int, default=max(1, min((os.cpu_count() or 1), 4)))
+    parser.add_argument("--device", type=str, default=None, help="Explicit torch device, e.g. cuda, cuda:0, or cpu.")
+    parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--channels-last", action="store_true")
+    parser.add_argument("--compile", action="store_true", help="Use torch.compile on supported CUDA runtimes.")
+    parser.add_argument("--persistent-workers", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--prefetch-factor", type=int, default=2)
+    parser.add_argument("--pin-memory", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--grad-accum-steps", type=int, default=1)
+    parser.add_argument("--cudnn-benchmark", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--val-fraction", type=float, default=0.2)
+    parser.add_argument("--seed", type=int, default=13)
+    parser.add_argument("--limit", type=int, default=None)
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    summary = train_model(args)
+    print(json.dumps(summary, indent=2), flush=True)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,9 @@
+# Kaggle/Linux GPU extras for this project.
+# Install after requirements.txt inside a Kaggle notebook or Linux GPU environment.
+
+onnxruntime-gpu==1.24.2
+
+# Kaggle images already ship with CUDA-capable PyTorch in many cases.
+# If you need to reinstall, prefer the matching CUDA wheel for the current image.
+# Example:
+# pip install --index-url https://download.pytorch.org/whl/cu121 torch torchvision torchaudio
