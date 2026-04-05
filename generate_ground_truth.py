@@ -3585,16 +3585,214 @@ def _write_summary(output_root: Path, summary: dict[str, Any]) -> None:
     (output_root / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
 
+def _load_manifest_samples(manifest_json_path: Path) -> list[RawViewSample]:
+    payload = json.loads(manifest_json_path.read_text(encoding="utf-8"))
+    return [RawViewSample(**item) for item in payload]
+
+
+def _group_samples_by_acquisition(samples: list[RawViewSample]) -> list[list[RawViewSample]]:
+    groups: list[list[RawViewSample]] = []
+    current_group: list[RawViewSample] = []
+    current_key: tuple[int, int, int] | None = None
+    for sample in samples:
+        acquisition_key = _acquisition_key(sample.subject_id, sample.finger_id, sample.acquisition_id)
+        if current_group and acquisition_key != current_key:
+            groups.append(current_group)
+            current_group = []
+        current_group.append(sample)
+        current_key = acquisition_key
+    if current_group:
+        groups.append(current_group)
+    return groups
+
+
+def _build_shard_spans(samples: list[RawViewSample], shard_count: int) -> list[tuple[int, int]]:
+    if shard_count < 1:
+        raise ValueError("shard_count must be at least 1")
+    groups = _group_samples_by_acquisition(samples)
+    spans: list[tuple[int, int]] = []
+    group_index = 0
+    sample_index = 0
+    for shard_index in range(shard_count):
+        start_index = sample_index
+        if group_index >= len(groups):
+            spans.append((start_index, start_index))
+            continue
+
+        remaining_shards = shard_count - shard_index
+        remaining_samples = len(samples) - sample_index
+        target_size = max(1, int(math.ceil(remaining_samples / max(remaining_shards, 1))))
+        shard_size = 0
+
+        while group_index < len(groups):
+            next_group = groups[group_index]
+            next_group_size = len(next_group)
+            groups_left_after = len(groups) - group_index - 1
+            must_leave_groups = groups_left_after >= remaining_shards - 1
+            if shard_size > 0 and shard_size + next_group_size > target_size and must_leave_groups:
+                break
+            shard_size += next_group_size
+            sample_index += next_group_size
+            group_index += 1
+            if shard_size >= target_size and must_leave_groups:
+                break
+
+        spans.append((start_index, sample_index))
+    return spans
+
+
+def _resolve_shard_configuration(
+    samples: list[RawViewSample],
+    args: argparse.Namespace,
+    base_output_root: Path,
+) -> tuple[list[RawViewSample], Path, dict[str, Any]]:
+    requested_samples = samples[: args.limit] if args.limit is not None else list(samples)
+    shard_mode = args.shard_mode
+    shard_index = int(args.shard_index)
+
+    if shard_mode == "off":
+        shard_meta = {
+            "mode": "off",
+            "boundary_alignment": "acquisition",
+            "base_output_root": str(base_output_root),
+            "actual_output_root": str(base_output_root),
+            "requested_sample_count": len(requested_samples),
+            "shard_count": 1,
+            "shard_index": 0,
+            "start_index": 0,
+            "end_index_exclusive": len(requested_samples),
+            "sample_count": len(requested_samples),
+            "target_shard_size": None,
+        }
+        return requested_samples, base_output_root, shard_meta
+
+    if shard_mode == "manual":
+        if args.shard_count is None:
+            raise ValueError("--shard-count is required when --shard-mode manual")
+        shard_count = max(1, int(args.shard_count))
+        target_shard_size = None
+    else:
+        if args.shard_count is not None:
+            shard_count = max(1, int(args.shard_count))
+            target_shard_size = None
+        else:
+            target_shard_size = max(1, int(args.target_shard_size or 500))
+            shard_count = max(1, int(math.ceil(len(requested_samples) / float(target_shard_size)))) if requested_samples else 1
+
+    if shard_index < 0 or shard_index >= shard_count:
+        raise ValueError(f"--shard-index must be in [0, {shard_count - 1}]")
+
+    shard_spans = _build_shard_spans(requested_samples, shard_count)
+    start_index, end_index = shard_spans[shard_index]
+    shard_name = f"shard_{shard_index:03d}"
+    actual_output_root = base_output_root / shard_name
+    selected_samples = requested_samples[start_index:end_index]
+    shard_meta = {
+        "mode": shard_mode,
+        "boundary_alignment": "acquisition",
+        "base_output_root": str(base_output_root),
+        "actual_output_root": str(actual_output_root),
+        "requested_sample_count": len(requested_samples),
+        "shard_count": shard_count,
+        "shard_index": shard_index,
+        "start_index": start_index,
+        "end_index_exclusive": end_index,
+        "sample_count": len(selected_samples),
+        "target_shard_size": target_shard_size,
+    }
+    return selected_samples, actual_output_root, shard_meta
+
+
+def _merge_shard_outputs(merge_shards_root: Path, output_root: Path) -> dict[str, Any]:
+    shard_roots = sorted(
+        [
+            child
+            for child in merge_shards_root.iterdir()
+            if child.is_dir() and (child / "manifest.json").exists() and (child / "summary.json").exists()
+        ],
+        key=lambda path: path.name,
+    )
+    if not shard_roots:
+        raise RuntimeError(f"no shard outputs found in {merge_shards_root}")
+    if output_root.exists() and any(output_root.iterdir()):
+        raise RuntimeError(f"refusing to merge into non-empty output root {output_root}")
+
+    output_root.mkdir(parents=True, exist_ok=True)
+    merged_samples_dir = output_root / "samples"
+    merged_recon_dir = output_root / "reconstructions"
+    merged_samples_dir.mkdir(parents=True, exist_ok=True)
+    merged_recon_dir.mkdir(parents=True, exist_ok=True)
+
+    merged_samples: list[RawViewSample] = []
+    seen_sample_ids: set[str] = set()
+    seen_reconstruction_ids: set[str] = set()
+    shard_summaries: list[dict[str, Any]] = []
+
+    for shard_root in shard_roots:
+        shard_samples = _load_manifest_samples(shard_root / "manifest.json")
+        shard_summary = json.loads((shard_root / "summary.json").read_text(encoding="utf-8"))
+        shard_summaries.append(
+            {
+                "shard_root": str(shard_root.resolve()),
+                "sample_count": len(shard_samples),
+                "generated_bundle_count": shard_summary.get("generated_bundle_count"),
+                "skipped_existing_bundle_count": shard_summary.get("skipped_existing_bundle_count"),
+                "error_count": len(shard_summary.get("errors", [])),
+                "shard": shard_summary.get("shard"),
+            }
+        )
+
+        for sample in shard_samples:
+            if sample.sample_id in seen_sample_ids:
+                raise RuntimeError(f"duplicate sample_id during merge: {sample.sample_id}")
+            seen_sample_ids.add(sample.sample_id)
+            merged_samples.append(sample)
+
+        shard_samples_dir = shard_root / "samples"
+        if shard_samples_dir.exists():
+            for sample_dir in sorted([path for path in shard_samples_dir.iterdir() if path.is_dir()], key=lambda path: path.name):
+                destination = merged_samples_dir / sample_dir.name
+                if destination.exists():
+                    raise RuntimeError(f"duplicate sample bundle directory during merge: {sample_dir.name}")
+                shutil.copytree(sample_dir, destination)
+
+        shard_recon_dir = shard_root / "reconstructions"
+        if shard_recon_dir.exists():
+            for reconstruction_dir in sorted([path for path in shard_recon_dir.iterdir() if path.is_dir()], key=lambda path: path.name):
+                if reconstruction_dir.name in seen_reconstruction_ids:
+                    raise RuntimeError(f"duplicate reconstruction directory during merge: {reconstruction_dir.name}")
+                seen_reconstruction_ids.add(reconstruction_dir.name)
+                shutil.copytree(reconstruction_dir, merged_recon_dir / reconstruction_dir.name)
+
+    _write_manifest(merged_samples, output_root)
+    summary = {
+        "merge_source_root": str(merge_shards_root.resolve()),
+        "output_root": str(output_root.resolve()),
+        "merged_bundle_count": len(merged_samples),
+        "merged_reconstruction_count": len(seen_reconstruction_ids),
+        "verification": _verify_manifest(merged_samples),
+        "shards": shard_summaries,
+        "version": 1,
+    }
+    _write_summary(output_root, summary)
+    return summary
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate paper-style approximate ground truth bundles for DS1.")
     parser.add_argument("--dataset-root", type=Path, default=DEFAULT_DATASET_ROOT)
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
+    parser.add_argument("--merge-shards-root", type=Path, default=None, help="Merge shard output roots from this directory into --output-root and exit.")
     parser.add_argument("--execution-target", choices=("local", "kaggle"), default="local")
     parser.add_argument("--gpu-only", action="store_true", help="Require GPU-backed providers for model-backed stages.")
     parser.add_argument("--gpu-batch-size", type=int, default=1, help="Reserved GPU batch size knob for Kaggle runs.")
     parser.add_argument("--cpu-workers", type=int, default=max(1, min((os.cpu_count() or 1), 4)))
     parser.add_argument("--prefetch-samples", type=int, default=2, help="Number of samples to preload ahead of GPU-backed work.")
     parser.add_argument("--skip-existing", action="store_true", help="Skip samples whose bundle files already exist.")
+    parser.add_argument("--shard-mode", choices=("off", "auto", "manual"), default="off")
+    parser.add_argument("--shard-count", type=int, default=None, help="Total number of shards to define when shard mode is active.")
+    parser.add_argument("--shard-index", type=int, default=0, help="Zero-based shard index to run when shard mode is active.")
+    parser.add_argument("--target-shard-size", type=int, default=None, help="Approximate number of samples per shard in auto mode (default: 500).")
     parser.add_argument("--patch-source-root", type=Path, default=None, help="Read an existing full-image ground-truth root and write an offline patch dataset.")
     parser.add_argument("--patch-output-root", type=Path, default=None, help="Output root for offline patch dataset generation.")
     parser.add_argument("--patch-limit-samples", type=int, default=None, help="Only consider the first N eligible source samples when building a patch dataset.")
@@ -3614,6 +3812,11 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.merge_shards_root is not None:
+        merged_summary = _merge_shard_outputs(args.merge_shards_root.resolve(), args.output_root.resolve())
+        print(json.dumps(merged_summary, indent=2))
+        return 0
+
     runtime_config = GeneratorRuntimeConfig(
         execution_target=args.execution_target,
         gpu_only=bool(args.gpu_only),
@@ -3642,8 +3845,7 @@ def main() -> int:
         return 0
 
     dataset_root = args.dataset_root.resolve()
-    output_root = args.output_root.resolve()
-    output_root.mkdir(parents=True, exist_ok=True)
+    base_output_root = args.output_root.resolve()
     runtime_summary = _configure_runtime_environment(runtime_config)
     fingerflow_backend = FingerflowBackendConfig(
         backend=_resolve_fingerflow_backend(args.fingerflow_backend),
@@ -3651,12 +3853,25 @@ def main() -> int:
         wsl_activate=args.wsl_activate,
     )
 
-    samples = _build_manifest(dataset_root)
+    all_samples = _build_manifest(dataset_root)
+    samples, output_root, shard_meta = _resolve_shard_configuration(all_samples, args, base_output_root)
+    output_root.mkdir(parents=True, exist_ok=True)
     _write_manifest(samples, output_root)
+    print(
+        json.dumps(
+            {
+                "shard": shard_meta,
+                "dataset_root": str(dataset_root),
+                "output_root": str(output_root),
+            },
+            indent=2,
+        ),
+        flush=True,
+    )
 
     verification = _verify_manifest(samples)
     reconstruction_candidates = _collect_reconstruction_candidates(samples)
-    total_requested = min(len(samples), args.limit) if args.limit is not None else len(samples)
+    total_requested = len(samples)
     generation_results: dict[str, Any] = {}
     generated = 0
     skipped_existing = 0
@@ -3750,6 +3965,8 @@ def main() -> int:
     summary = {
         "dataset_root": str(dataset_root),
         "output_root": str(output_root),
+        "base_output_root": str(base_output_root),
+        "shard": shard_meta,
         "verification": verification,
         "generated_bundle_count": generated,
         "skipped_existing_bundle_count": skipped_existing,
@@ -3772,6 +3989,8 @@ def main() -> int:
 
     if args.patch_output_root is not None:
         patch_output_root = args.patch_output_root.resolve()
+        if shard_meta["mode"] != "off":
+            patch_output_root = patch_output_root / f"shard_{int(shard_meta['shard_index']):03d}"
         patch_summary = _write_patch_dataset(
             source_root=output_root,
             output_root=patch_output_root,
