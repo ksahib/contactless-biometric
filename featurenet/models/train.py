@@ -613,7 +613,11 @@ def _load_npz_targets(npz_path: Path) -> dict[str, Any]:
     return targets
 
 
-def load_bundle_samples(ground_truth_root: str | Path, limit: int | None = None) -> list[dict[str, Any]]:
+def load_bundle_samples(
+    ground_truth_root: str | Path,
+    limit: int | None = None,
+    strict_gradient_targets: bool = False,
+) -> list[dict[str, Any]]:
     root = Path(ground_truth_root)
     samples_root = root / "samples"
     if not samples_root.exists():
@@ -624,6 +628,7 @@ def load_bundle_samples(ground_truth_root: str | Path, limit: int | None = None)
         sample_dirs = sample_dirs[:limit]
 
     samples: list[dict[str, Any]] = []
+    missing_gradient_paths: list[Path] = []
     for sample_dir in sample_dirs:
         meta_path = sample_dir / "meta.json"
         masked_image_path = sample_dir / "masked_image.png"
@@ -637,7 +642,10 @@ def load_bundle_samples(ground_truth_root: str | Path, limit: int | None = None)
             continue
         targets = _load_npz_targets(targets_path)
         if "gradient" not in targets:
-            raise ValueError(f"missing reconstruction-derived gradient target in {targets_path}")
+            if strict_gradient_targets:
+                raise ValueError(f"missing reconstruction-derived gradient target in {targets_path}")
+            missing_gradient_paths.append(targets_path)
+            continue
         samples.append(
             {
                 "sample_id": meta["sample_id"],
@@ -649,6 +657,17 @@ def load_bundle_samples(ground_truth_root: str | Path, limit: int | None = None)
                 "mask": mask_path,
                 "targets": targets,
             }
+        )
+
+    if missing_gradient_paths:
+        preview_items = [str(path) for path in missing_gradient_paths[:3]]
+        suffix = " ..." if len(missing_gradient_paths) > 3 else ""
+        preview = ", ".join(preview_items)
+        print(
+            "[load_bundle_samples] skipped "
+            f"{len(missing_gradient_paths)} samples missing reconstruction-derived gradient target "
+            f"(strict mode off). Examples: {preview}{suffix}",
+            flush=True,
         )
 
     if not samples:
@@ -770,7 +789,11 @@ def train_model(args: argparse.Namespace) -> dict[str, Any]:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
 
-    samples = load_bundle_samples(args.ground_truth_root, limit=args.limit)
+    samples = load_bundle_samples(
+        args.ground_truth_root,
+        limit=args.limit,
+        strict_gradient_targets=args.strict_gradient_targets,
+    )
     train_samples, val_samples = split_samples(samples, val_fraction=args.val_fraction, seed=args.seed)
     resolved_device = _resolve_device(args.device)
     use_amp = bool(args.amp) and resolved_device.type == "cuda"
@@ -958,6 +981,7 @@ def train_model(args: argparse.Namespace) -> dict[str, Any]:
         "adam_beta2": 0.999,
         "weight_decay": 0.0,
         "seed": args.seed,
+        "strict_gradient_targets": bool(args.strict_gradient_targets),
         "validate_every": args.validate_every,
         "early_stopping": {
             "configured": bool(args.early_stopping),
@@ -1001,6 +1025,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--early-stopping-metric", choices=EARLY_STOPPING_METRICS, default="val_total")
     parser.add_argument("--early-stopping-patience", type=int, default=5)
     parser.add_argument("--early-stopping-min-delta", type=float, default=1e-4)
+    parser.add_argument(
+        "--strict-gradient-targets",
+        action="store_true",
+        help="Fail fast if any selected sample is missing reconstruction-derived gradient targets.",
+    )
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--limit", type=int, default=None)
     args = parser.parse_args()
