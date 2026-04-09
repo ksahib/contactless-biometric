@@ -613,6 +613,33 @@ def _load_npz_targets(npz_path: Path) -> dict[str, Any]:
     return targets
 
 
+def _coerce_hw_shape(value: Any) -> tuple[int, int] | None:
+    if not isinstance(value, (list, tuple)) or len(value) < 2:
+        return None
+    try:
+        height = int(value[0])
+        width = int(value[1])
+    except (TypeError, ValueError):
+        return None
+    if height <= 0 or width <= 0:
+        return None
+    return height, width
+
+
+def _infer_output_shape_from_targets(targets: Mapping[str, Any]) -> tuple[int, int] | None:
+    for key in ("mask", "minutia_score", "minutia_valid_mask"):
+        value = targets.get(key)
+        if value is None:
+            continue
+        array = np.asarray(value)
+        if array.ndim >= 2:
+            height = int(array.shape[-2])
+            width = int(array.shape[-1])
+            if height > 0 and width > 0:
+                return height, width
+    return None
+
+
 def load_bundle_samples(
     ground_truth_root: str | Path,
     limit: int | None = None,
@@ -646,6 +673,18 @@ def load_bundle_samples(
                 raise ValueError(f"missing reconstruction-derived gradient target in {targets_path}")
             missing_gradient_paths.append(targets_path)
             continue
+        shapes = meta.get("shapes", {})
+        input_shape_hw = _coerce_hw_shape(shapes.get("input_image")) if isinstance(shapes, dict) else None
+        output_shape_hw = _coerce_hw_shape(shapes.get("featurenet_output")) if isinstance(shapes, dict) else None
+        if output_shape_hw is None:
+            output_shape_hw = _infer_output_shape_from_targets(targets)
+        if output_shape_hw is None:
+            continue
+        if input_shape_hw is None:
+            input_shape_hw = output_shape_hw
+        targets["raw_view_index"] = np.int64(meta.get("raw_view_index", -1))
+        targets["input_shape_hw"] = np.asarray(input_shape_hw, dtype=np.int64)
+        targets["output_shape_hw"] = np.asarray(output_shape_hw, dtype=np.int64)
         samples.append(
             {
                 "sample_id": meta["sample_id"],
