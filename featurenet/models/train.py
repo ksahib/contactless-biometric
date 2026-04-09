@@ -824,7 +824,14 @@ def train_model(args: argparse.Namespace) -> dict[str, Any]:
 
     model = _maybe_channels_last(FeatureExtractor().to(resolved_device), args.channels_last)
     model = _maybe_compile_model(model, args.compile and resolved_device.type == "cuda")
-    criterion = FeatureNetLoss().to(resolved_device)
+    criterion = FeatureNetLoss(
+        mu_score=args.mu_score,
+        mu_x=args.mu_x,
+        mu_y=args.mu_y,
+        mu_ori=args.mu_ori,
+        m1_focal_gamma=args.m1_focal_gamma,
+        m1_pos_weight_max=args.m1_pos_weight_max,
+    ).to(resolved_device)
     optimizer = optim.Adam(
         model.parameters(),
         lr=args.lr,
@@ -982,6 +989,12 @@ def train_model(args: argparse.Namespace) -> dict[str, Any]:
         "weight_decay": 0.0,
         "seed": args.seed,
         "strict_gradient_targets": bool(args.strict_gradient_targets),
+        "mu_score": args.mu_score,
+        "mu_x": args.mu_x,
+        "mu_y": args.mu_y,
+        "mu_ori": args.mu_ori,
+        "m1_focal_gamma": args.m1_focal_gamma,
+        "m1_pos_weight_max": args.m1_pos_weight_max,
         "validate_every": args.validate_every,
         "early_stopping": {
             "configured": bool(args.early_stopping),
@@ -1025,6 +1038,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--early-stopping-metric", choices=EARLY_STOPPING_METRICS, default="val_total")
     parser.add_argument("--early-stopping-patience", type=int, default=5)
     parser.add_argument("--early-stopping-min-delta", type=float, default=1e-4)
+    parser.add_argument("--mu-score", type=float, default=120.0)
+    parser.add_argument("--mu-x", type=float, default=20.0)
+    parser.add_argument("--mu-y", type=float, default=20.0)
+    parser.add_argument("--mu-ori", type=float, default=20.0)
+    parser.add_argument("--m1-focal-gamma", type=float, default=2.0)
+    parser.add_argument("--m1-pos-weight-max", type=float, default=30.0)
     parser.add_argument(
         "--strict-gradient-targets",
         action="store_true",
@@ -1039,6 +1058,12 @@ def parse_args() -> argparse.Namespace:
         parser.error("--early-stopping-patience must be at least 1")
     if args.early_stopping_min_delta < 0.0:
         parser.error("--early-stopping-min-delta must be non-negative")
+    if args.mu_score <= 0.0 or args.mu_x <= 0.0 or args.mu_y <= 0.0 or args.mu_ori <= 0.0:
+        parser.error("--mu-score, --mu-x, --mu-y, and --mu-ori must be positive")
+    if args.m1_focal_gamma < 0.0:
+        parser.error("--m1-focal-gamma must be non-negative")
+    if args.m1_pos_weight_max < 1.0:
+        parser.error("--m1-pos-weight-max must be at least 1.0")
     return args
 
 

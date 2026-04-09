@@ -95,10 +95,12 @@ class FeatureNetLoss(nn.Module):
         beta=60.0,
         gamma=300.0,
         sigma=0.5,
-        mu_score=300.0,
-        mu_x=15.0,
-        mu_y=15.0,
-        mu_ori=15.0
+        mu_score=120.0,
+        mu_x=20.0,
+        mu_y=20.0,
+        mu_ori=20.0,
+        m1_focal_gamma=2.0,
+        m1_pos_weight_max=30.0,
     ):
         super().__init__()
 
@@ -109,13 +111,14 @@ class FeatureNetLoss(nn.Module):
 
         # minutiae losses
         self.ce = nn.CrossEntropyLoss(reduction='none')
-        self.bce = nn.BCEWithLogitsLoss(reduction='none')
 
         # weights
         self.mu_score = mu_score
         self.mu_x = mu_x
         self.mu_y = mu_y
         self.mu_ori = mu_ori
+        self.m1_focal_gamma = m1_focal_gamma
+        self.m1_pos_weight_max = m1_pos_weight_max
 
     def _resolve_minutia_mask(self, targets, mask):
         minutia_mask = targets.get("minutia_valid_mask", mask)
@@ -125,6 +128,22 @@ class FeatureNetLoss(nn.Module):
         if float(minutia_mask.sum().item()) <= 0.0:
             return mask.float()
         return minutia_mask
+
+    def _compute_m1_score_loss(self, logits, target_score, minutia_mask):
+        eps = 1e-8
+        valid = minutia_mask > 0.5
+        positive = ((target_score > 0.5) & valid).float().sum()
+        negative = ((target_score <= 0.5) & valid).float().sum()
+        pos_weight = (negative / (positive + eps)).clamp(min=1.0, max=self.m1_pos_weight_max)
+        bce_map = F.binary_cross_entropy_with_logits(
+            logits,
+            target_score,
+            reduction="none",
+            pos_weight=pos_weight,
+        )
+        pt = torch.exp(-bce_map)
+        focal_map = torch.pow((1.0 - pt).clamp(min=0.0), self.m1_focal_gamma) * bce_map
+        return (focal_map * minutia_mask).sum() / (minutia_mask.sum() + eps)
 
     def forward(self, outputs, targets):
         mask = targets["mask"]
@@ -165,11 +184,11 @@ class FeatureNetLoss(nn.Module):
         # ---------------------------
 
         # --- M1: score (binary)
-        score_loss_map = self.bce(
+        L_m1 = self._compute_m1_score_loss(
             outputs["minutia_score"],
-            targets["minutia_score"]
+            targets["minutia_score"],
+            minutia_mask,
         )
-        L_m1 = (score_loss_map * mask).sum() / (mask.sum() + 1e-8)
 
         # --- M2: x
         x_loss_map = self.ce(outputs["minutia_x"], targets["minutia_x"])
