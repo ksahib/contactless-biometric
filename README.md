@@ -44,3 +44,5 @@ python generate_ground_truth.py \
 ```
 
 FeatureNet train/eval now expose CUDA throughput knobs such as `--amp`, `--channels-last`, `--compile`, `--persistent-workers`, `--prefetch-factor`, `--pin-memory`, `--grad-accum-steps`, and `--cudnn-benchmark`.
+
+If you adopt the raw-logit head refactor (final head layers changed from `ConvBlock` to plain `nn.Conv2d`), treat it as a new architecture run. Do not resume or evaluate with older checkpoints from the pre-refactor head design.

@@ -48,28 +48,28 @@ class FeatureExtractor(nn.Module):
             ConvBlock(256, 256, kernel_size=3, stride=1, padding=1),
             ConvBlock(256, 256, kernel_size=3, stride=1, padding=1),
             ConvBlock(256, 256, kernel_size=3, stride=1, padding=1),
-            ConvBlock(256, 2, kernel_size=1, stride=1, padding=0),
+            nn.Conv2d(256, 2, kernel_size=1, stride=1, padding=0),
         )
         self.orientation_conv = nn.Conv2d(256, 180, kernel_size=1, stride=1, padding=0)
 
         self.minuiae_orient_head = nn.Sequential(
             ConvBlock(512, 256, kernel_size=1, stride=1, padding=0),
-            ConvBlock(256, 360, kernel_size=1, stride=1, padding=0)
+            nn.Conv2d(256, 360, kernel_size=1, stride=1, padding=0),
         )
 
         self.minutiae_score_head = nn.Sequential(
             ConvBlock(256, 256, kernel_size=1, stride=1, padding=0),
-            ConvBlock(256, 1, kernel_size=1, stride=1, padding=0)
+            nn.Conv2d(256, 1, kernel_size=1, stride=1, padding=0),
         )
 
         self.minutia_head_x = nn.Sequential(
             ConvBlock(256, 256, kernel_size=1, stride=1, padding=0),
-            ConvBlock(256, 8, kernel_size=1, stride=1, padding=0)
+            nn.Conv2d(256, 8, kernel_size=1, stride=1, padding=0),
         )
 
         self.minutia_head_y = nn.Sequential(
             ConvBlock(256, 256, kernel_size=1, stride=1, padding=0),
-            ConvBlock(256, 8, kernel_size=1, stride=1, padding=0)
+            nn.Conv2d(256, 8, kernel_size=1, stride=1, padding=0),
         )
 
     def forward(self, x, mask=None):
