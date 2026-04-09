@@ -5,6 +5,7 @@ import csv
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -3778,11 +3779,268 @@ def _merge_shard_outputs(merge_shards_root: Path, output_root: Path) -> dict[str
     return summary
 
 
+def _slugify_merge_label(label: str) -> str:
+    slug = re.sub(r"[^0-9A-Za-z]+", "_", label.strip()).strip("_").lower()
+    if not slug:
+        raise ValueError(f"could not derive a usable merge label from {label!r}")
+    return slug
+
+
+def _parse_merge_generated_roots(values: list[str] | None) -> list[tuple[str, Path]]:
+    parsed: list[tuple[str, Path]] = []
+    seen_labels: set[str] = set()
+    for raw_value in values or []:
+        if "=" in raw_value:
+            raw_label, raw_path = raw_value.split("=", 1)
+            label = raw_label.strip() or Path(raw_path).name
+        else:
+            raw_path = raw_value
+            label = Path(raw_path).name
+        source_root = Path(raw_path).expanduser().resolve()
+        slug = _slugify_merge_label(label)
+        if slug in seen_labels:
+            raise ValueError(f"duplicate merge label {slug!r}; use unique labels for each --merge-generated-root")
+        seen_labels.add(slug)
+        parsed.append((slug, source_root))
+    if not parsed:
+        raise ValueError("at least one --merge-generated-root must be provided")
+    return parsed
+
+
+def _merged_sample_id(source_label: str, sample: RawViewSample) -> str:
+    return f"{source_label}_{sample.sample_id}"
+
+
+def _merged_reconstruction_id(source_label: str, sample: RawViewSample) -> str:
+    return f"{source_label}_{_acquisition_name(sample.subject_id, sample.finger_id, sample.acquisition_id)}"
+
+
+def _rewrite_merged_reconstruction_meta(
+    meta_path: Path,
+    *,
+    merged_acquisition_id: str,
+    merged_subject_id: int,
+    source_label: str,
+    source_subject_id: int,
+) -> None:
+    if not meta_path.exists():
+        return
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta["acquisition_id"] = merged_acquisition_id
+    meta["subject_id"] = merged_subject_id
+    meta["merge_source"] = {
+        "label": source_label,
+        "subject_id": source_subject_id,
+    }
+    meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+
+def _rewrite_merged_bundle_meta(
+    meta_path: Path,
+    *,
+    merged_sample_id: str,
+    merged_subject_id: int,
+    merged_subject_index: int,
+    merged_finger_class_id: int,
+    merged_reconstruction_id: str | None,
+    source_label: str,
+    source_root: Path,
+    source_sample: RawViewSample,
+    output_root: Path,
+) -> dict[str, Any] | None:
+    if not meta_path.exists():
+        return None
+
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta["sample_id"] = merged_sample_id
+    meta["subject_id"] = merged_subject_id
+    meta["subject_index"] = merged_subject_index
+    meta["finger_class_id"] = merged_finger_class_id
+    meta["merge_source"] = {
+        "label": source_label,
+        "root": str(source_root.resolve()),
+        "sample_id": source_sample.sample_id,
+        "subject_id": source_sample.subject_id,
+        "subject_index": source_sample.subject_index,
+        "finger_class_id": source_sample.finger_class_id,
+    }
+
+    if merged_reconstruction_id is not None and "multiview_reconstruction" in meta:
+        reconstruction = dict(meta["multiview_reconstruction"])
+        reconstruction_root = output_root / "reconstructions" / merged_reconstruction_id
+        reconstruction["acquisition_id"] = merged_reconstruction_id
+        reconstruction["reconstruction_dir"] = str(reconstruction_root.resolve())
+        reconstruction["depth_front_path"] = str((reconstruction_root / "depth_front.npy").resolve())
+        reconstruction["depth_left_path"] = str((reconstruction_root / "depth_left.npy").resolve())
+        reconstruction["depth_right_path"] = str((reconstruction_root / "depth_right.npy").resolve())
+        reconstruction["depth_gradient_labels_path"] = str((reconstruction_root / "depth_gradient_labels.npz").resolve())
+        reconstruction["support_mask_path"] = str((reconstruction_root / "support_mask.png").resolve())
+        reconstruction["preview_path"] = str((reconstruction_root / "preview.png").resolve())
+        reconstruction["surface_front_3d_html_path"] = str((reconstruction_root / "surface_front_3d.html").resolve())
+        reconstruction["surface_front_3d_png_path"] = str((reconstruction_root / "surface_front_3d.png").resolve())
+        reconstruction["surface_all_branches_3d_html_path"] = str((reconstruction_root / "surface_all_branches_3d.html").resolve())
+        reconstruction["surface_all_branches_3d_png_path"] = str((reconstruction_root / "surface_all_branches_3d.png").resolve())
+        reconstruction["reprojection_report_path"] = str((reconstruction_root / "reprojection_report.json").resolve())
+        reconstruction["reprojection_preview_path"] = str((reconstruction_root / "reprojection_preview.png").resolve())
+        meta["multiview_reconstruction"] = reconstruction
+
+    meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    return meta
+
+
+def _merge_generated_ground_truth_roots(merge_sources: list[tuple[str, Path]], output_root: Path) -> dict[str, Any]:
+    if output_root.exists() and any(output_root.iterdir()):
+        raise RuntimeError(f"refusing to merge into non-empty output root {output_root}")
+
+    output_root.mkdir(parents=True, exist_ok=True)
+    merged_samples_dir = output_root / "samples"
+    merged_recon_dir = output_root / "reconstructions"
+    merged_samples_dir.mkdir(parents=True, exist_ok=True)
+    merged_recon_dir.mkdir(parents=True, exist_ok=True)
+
+    merged_samples: list[RawViewSample] = []
+    merged_source_summaries: list[dict[str, Any]] = []
+    subject_map: dict[tuple[str, int], int] = {}
+    copied_reconstruction_ids: set[str] = set()
+
+    for source_label, source_root in merge_sources:
+        manifest_path = source_root / "manifest.json"
+        summary_path = source_root / "summary.json"
+        if not manifest_path.exists():
+            raise FileNotFoundError(f"missing manifest.json under {source_root}")
+        if not summary_path.exists():
+            raise FileNotFoundError(f"missing summary.json under {source_root}")
+
+        source_samples = _load_manifest_samples(manifest_path)
+        source_summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        source_subject_ids: set[int] = set()
+        copied_bundle_count = 0
+        missing_bundle_count = 0
+        copied_reconstruction_count = 0
+
+        for sample in source_samples:
+            source_subject_ids.add(sample.subject_id)
+            subject_key = (source_label, sample.subject_id)
+            if subject_key not in subject_map:
+                subject_map[subject_key] = len(subject_map)
+            merged_subject_index = subject_map[subject_key]
+            merged_subject_id = merged_subject_index + 1
+            merged_finger_class_id = merged_subject_index * 10 + (sample.finger_id - 1)
+            merged_sample_id = _merged_sample_id(source_label, sample)
+            merged_reconstruction_id = _merged_reconstruction_id(source_label, sample)
+
+            merged_samples.append(
+                RawViewSample(
+                    sample_id=merged_sample_id,
+                    subject_id=merged_subject_id,
+                    subject_index=merged_subject_index,
+                    finger_id=sample.finger_id,
+                    acquisition_id=sample.acquisition_id,
+                    finger_class_id=merged_finger_class_id,
+                    raw_image_path=sample.raw_image_path,
+                    raw_view_index=sample.raw_view_index,
+                    sire_path=sample.sire_path,
+                    raw_view_paths=list(sample.raw_view_paths),
+                    variant_paths=dict(sample.variant_paths),
+                    is_extra_acquisition=sample.is_extra_acquisition,
+                )
+            )
+
+            source_sample_dir = source_root / "samples" / sample.sample_id
+            if not source_sample_dir.exists():
+                missing_bundle_count += 1
+                continue
+
+            destination_sample_dir = merged_samples_dir / merged_sample_id
+            if destination_sample_dir.exists():
+                raise RuntimeError(f"duplicate merged sample bundle directory: {destination_sample_dir.name}")
+            shutil.copytree(source_sample_dir, destination_sample_dir)
+            copied_bundle_count += 1
+
+            updated_meta = _rewrite_merged_bundle_meta(
+                destination_sample_dir / "meta.json",
+                merged_sample_id=merged_sample_id,
+                merged_subject_id=merged_subject_id,
+                merged_subject_index=merged_subject_index,
+                merged_finger_class_id=merged_finger_class_id,
+                merged_reconstruction_id=merged_reconstruction_id,
+                source_label=source_label,
+                source_root=source_root,
+                source_sample=sample,
+                output_root=output_root,
+            )
+
+            if updated_meta is None or "multiview_reconstruction" not in updated_meta:
+                continue
+
+            if merged_reconstruction_id in copied_reconstruction_ids:
+                continue
+
+            source_reconstruction_dir = source_root / "reconstructions" / _acquisition_name(
+                sample.subject_id,
+                sample.finger_id,
+                sample.acquisition_id,
+            )
+            if not source_reconstruction_dir.exists():
+                continue
+
+            destination_reconstruction_dir = merged_recon_dir / merged_reconstruction_id
+            shutil.copytree(source_reconstruction_dir, destination_reconstruction_dir)
+            _rewrite_merged_reconstruction_meta(
+                destination_reconstruction_dir / "meta.json",
+                merged_acquisition_id=merged_reconstruction_id,
+                merged_subject_id=merged_subject_id,
+                source_label=source_label,
+                source_subject_id=sample.subject_id,
+            )
+            copied_reconstruction_ids.add(merged_reconstruction_id)
+            copied_reconstruction_count += 1
+
+        merged_source_summaries.append(
+            {
+                "label": source_label,
+                "source_root": str(source_root.resolve()),
+                "manifest_sample_count": len(source_samples),
+                "source_subject_count": len(source_subject_ids),
+                "copied_bundle_count": copied_bundle_count,
+                "missing_bundle_count": missing_bundle_count,
+                "copied_reconstruction_count": copied_reconstruction_count,
+                "source_summary": {
+                    "generated_bundle_count": source_summary.get("generated_bundle_count"),
+                    "skipped_existing_bundle_count": source_summary.get("skipped_existing_bundle_count"),
+                    "error_count": len(source_summary.get("errors", [])),
+                    "dataset_root": source_summary.get("dataset_root"),
+                    "output_root": source_summary.get("output_root"),
+                },
+            }
+        )
+
+    _write_manifest(merged_samples, output_root)
+    summary = {
+        "merge_strategy": "merge_generated_roots_with_global_identity_remap",
+        "output_root": str(output_root.resolve()),
+        "merged_bundle_count": sum(item["copied_bundle_count"] for item in merged_source_summaries),
+        "merged_reconstruction_count": len(copied_reconstruction_ids),
+        "merged_subject_count": len(subject_map),
+        "verification": _verify_manifest(merged_samples),
+        "sources": merged_source_summaries,
+        "version": 2,
+    }
+    _write_summary(output_root, summary)
+    return summary
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate paper-style approximate ground truth bundles for DS1.")
     parser.add_argument("--dataset-root", type=Path, default=DEFAULT_DATASET_ROOT)
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--merge-shards-root", type=Path, default=None, help="Merge shard output roots from this directory into --output-root and exit.")
+    parser.add_argument(
+        "--merge-generated-root",
+        action="append",
+        default=None,
+        help="Merge separately generated ground-truth roots into --output-root. Pass LABEL=PATH, or PATH to infer LABEL from the folder name.",
+    )
     parser.add_argument("--execution-target", choices=("local", "kaggle"), default="local")
     parser.add_argument("--gpu-only", action="store_true", help="Require GPU-backed providers for model-backed stages.")
     parser.add_argument("--gpu-batch-size", type=int, default=1, help="Reserved GPU batch size knob for Kaggle runs.")
@@ -3812,6 +4070,15 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.merge_shards_root is not None and args.merge_generated_root:
+        raise ValueError("use either --merge-shards-root or --merge-generated-root, not both")
+    if args.merge_generated_root:
+        merged_summary = _merge_generated_ground_truth_roots(
+            _parse_merge_generated_roots(args.merge_generated_root),
+            args.output_root.resolve(),
+        )
+        print(json.dumps(merged_summary, indent=2))
+        return 0
     if args.merge_shards_root is not None:
         merged_summary = _merge_shard_outputs(args.merge_shards_root.resolve(), args.output_root.resolve())
         print(json.dumps(merged_summary, indent=2))
