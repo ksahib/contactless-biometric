@@ -33,6 +33,13 @@ from .losses import FeatureNetLoss
 FLOAT_TARGET_KEYS = {"mask", "orientation", "ridge_period", "gradient", "minutia_score", "minutia_valid_mask"}
 LONG_TARGET_KEYS = {"minutia_x", "minutia_y", "minutia_orientation"}
 LOSS_KEYS = ("total", "orientation", "ridge", "gradient", "minutia", "m1", "m2", "m3", "m4")
+EARLY_STOPPING_METRICS = (
+    "val_total",
+    "best_score_f1",
+    "minutia_x_accuracy",
+    "minutia_y_accuracy",
+    "minutia_orientation_accuracy",
+)
 
 
 def _read_grayscale_image(source: str | Path | np.ndarray) -> np.ndarray:
@@ -702,6 +709,60 @@ def _save_json(path: Path, payload: Mapping[str, Any]) -> None:
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
+def _compute_extended_validation_metrics(
+    model: FeatureExtractor,
+    dataloader: DataLoader,
+    device: torch.device,
+    amp: bool,
+    channels_last: bool,
+) -> dict[str, Any]:
+    from .evaluate import _default_thresholds, compute_validation_metrics
+
+    return compute_validation_metrics(
+        model=model,
+        dataloader=dataloader,
+        device=device,
+        score_thresholds=_default_thresholds(),
+        target_threshold=0.0,
+        amp=amp,
+        channels_last=channels_last,
+    )
+
+
+def _select_monitored_metric(
+    metric_name: str,
+    val_losses: Mapping[str, float],
+    val_metrics: Mapping[str, Any] | None,
+) -> tuple[float, str]:
+    if metric_name == "val_total":
+        return float(val_losses["total"]), "min"
+
+    if val_metrics is None:
+        raise ValueError(f"validation metrics are required to monitor {metric_name}")
+
+    if metric_name == "best_score_f1":
+        return float(val_metrics["best_score_f1"]), "max"
+
+    if metric_name == "minutia_x_accuracy":
+        return float(val_metrics["label_accuracy"]["minutia_x"]["accuracy"]), "max"
+
+    if metric_name == "minutia_y_accuracy":
+        return float(val_metrics["label_accuracy"]["minutia_y"]["accuracy"]), "max"
+
+    if metric_name == "minutia_orientation_accuracy":
+        return float(val_metrics["label_accuracy"]["minutia_orientation"]["accuracy"]), "max"
+
+    raise ValueError(f"unsupported early stopping metric: {metric_name}")
+
+
+def _is_metric_improved(current: float, best: float, mode: str, min_delta: float) -> bool:
+    if mode == "min":
+        return current < best - min_delta
+    if mode == "max":
+        return current > best + min_delta
+    raise ValueError(f"unsupported monitor mode: {mode}")
+
+
 def train_model(args: argparse.Namespace) -> dict[str, Any]:
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -752,9 +813,19 @@ def train_model(args: argparse.Namespace) -> dict[str, Any]:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    best_val_total = float("inf")
+    monitor_name = args.early_stopping_metric
+    best_monitor_value = float("inf") if monitor_name == "val_total" else float("-inf")
+    monitor_mode = "min" if monitor_name == "val_total" else "max"
     history: list[dict[str, Any]] = []
     started_at = time.time()
+    validation_checks = 0
+    patience_counter = 0
+    stop_reason = "max_epochs"
+    effective_early_stopping = bool(args.early_stopping)
+    early_stopping_disabled_reason: str | None = None
+    if val_loader is None and effective_early_stopping:
+        effective_early_stopping = False
+        early_stopping_disabled_reason = "no_validation_data"
 
     for epoch in range(1, args.epochs + 1):
         epoch_started_at = time.time()
@@ -773,9 +844,28 @@ def train_model(args: argparse.Namespace) -> dict[str, Any]:
             "epoch": epoch,
             "train": train_metrics,
             "seconds": round(time.time() - epoch_started_at, 3),
+            "validation_ran": False,
+            "early_stopping": {
+                "enabled": effective_early_stopping,
+                "configured": bool(args.early_stopping),
+                "metric": monitor_name,
+                "mode": monitor_mode,
+                "patience": args.early_stopping_patience,
+                "min_delta": args.early_stopping_min_delta,
+                "validate_every": args.validate_every,
+                "checks_run": validation_checks,
+                "patience_counter": patience_counter,
+                "disabled_reason": early_stopping_disabled_reason,
+            },
         }
+        if not np.isfinite(train_metrics["total"]):
+            stop_reason = "non_finite_loss"
+            history.append(record)
+            print(json.dumps(record), flush=True)
+            break
 
-        if val_loader is not None:
+        should_validate = val_loader is not None and (epoch % args.validate_every == 0 or epoch == args.epochs)
+        if should_validate:
             val_metrics = evaluate(
                 model,
                 val_loader,
@@ -785,20 +875,65 @@ def train_model(args: argparse.Namespace) -> dict[str, Any]:
                 channels_last=args.channels_last,
             )
             record["val"] = val_metrics
-            current_val_total = val_metrics["total"]
-            if current_val_total < best_val_total:
-                best_val_total = current_val_total
+            record["validation_ran"] = True
+            validation_checks += 1
+            extended_val_metrics: dict[str, Any] | None = None
+            if monitor_name != "val_total":
+                extended_val_metrics = _compute_extended_validation_metrics(
+                    model=model,
+                    dataloader=val_loader,
+                    device=resolved_device,
+                    amp=use_amp,
+                    channels_last=args.channels_last,
+                )
+                record["val_metrics"] = extended_val_metrics
+
+            current_monitor_value, monitor_mode = _select_monitored_metric(
+                monitor_name,
+                val_metrics,
+                extended_val_metrics,
+            )
+            improved = _is_metric_improved(
+                current=current_monitor_value,
+                best=best_monitor_value,
+                mode=monitor_mode,
+                min_delta=args.early_stopping_min_delta,
+            )
+            if improved:
+                best_monitor_value = current_monitor_value
+                patience_counter = 0
                 torch.save(
                     _checkpoint_payload(model, optimizer, epoch, record, args),
                     output_dir / "best.pt",
                 )
+            else:
+                patience_counter += 1
+
+            record["monitor"] = {
+                "name": monitor_name,
+                "mode": monitor_mode,
+                "value": current_monitor_value,
+                "best_value": best_monitor_value,
+                "improved": improved,
+            }
+            record["early_stopping"].update(
+                {
+                    "checks_run": validation_checks,
+                    "patience_counter": patience_counter,
+                }
+            )
+            if effective_early_stopping and patience_counter >= args.early_stopping_patience:
+                stop_reason = "early_stopping_plateau"
+                history.append(record)
+                print(json.dumps(record), flush=True)
+                break
 
         history.append(record)
         print(json.dumps(record), flush=True)
 
     last_record = history[-1]
     torch.save(
-        _checkpoint_payload(model, optimizer, args.epochs, last_record, args),
+        _checkpoint_payload(model, optimizer, int(last_record["epoch"]), last_record, args),
         output_dir / "last.pt",
     )
 
@@ -808,6 +943,8 @@ def train_model(args: argparse.Namespace) -> dict[str, Any]:
         "train_sample_count": len(train_samples),
         "val_sample_count": len(val_samples),
         "epochs": args.epochs,
+        "epochs_requested": args.epochs,
+        "epochs_ran": len(history),
         "batch_size": args.batch_size,
         "lr": args.lr,
         "amp": use_amp,
@@ -821,6 +958,19 @@ def train_model(args: argparse.Namespace) -> dict[str, Any]:
         "adam_beta2": 0.999,
         "weight_decay": 0.0,
         "seed": args.seed,
+        "validate_every": args.validate_every,
+        "early_stopping": {
+            "configured": bool(args.early_stopping),
+            "enabled": effective_early_stopping,
+            "metric": monitor_name,
+            "mode": monitor_mode,
+            "patience": args.early_stopping_patience,
+            "min_delta": args.early_stopping_min_delta,
+            "validation_checks": validation_checks,
+            "best_value": None if validation_checks == 0 else best_monitor_value,
+            "disabled_reason": early_stopping_disabled_reason,
+        },
+        "stop_reason": stop_reason,
         "wall_seconds": round(time.time() - started_at, 3),
         "history": history,
     }
@@ -846,9 +996,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grad-accum-steps", type=int, default=1)
     parser.add_argument("--cudnn-benchmark", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--val-fraction", type=float, default=0.2)
+    parser.add_argument("--validate-every", type=int, default=1)
+    parser.add_argument("--early-stopping", action="store_true", help="Stop training when the monitored validation metric plateaus.")
+    parser.add_argument("--early-stopping-metric", choices=EARLY_STOPPING_METRICS, default="val_total")
+    parser.add_argument("--early-stopping-patience", type=int, default=5)
+    parser.add_argument("--early-stopping-min-delta", type=float, default=1e-4)
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--limit", type=int, default=None)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.validate_every < 1:
+        parser.error("--validate-every must be at least 1")
+    if args.early_stopping_patience < 1:
+        parser.error("--early-stopping-patience must be at least 1")
+    if args.early_stopping_min_delta < 0.0:
+        parser.error("--early-stopping-min-delta must be non-negative")
+    return args
 
 
 def main() -> None:
