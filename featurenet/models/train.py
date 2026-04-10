@@ -870,6 +870,9 @@ def train_model(args: argparse.Namespace) -> dict[str, Any]:
         mu_ori=args.mu_ori,
         m1_focal_gamma=args.m1_focal_gamma,
         m1_pos_weight_max=args.m1_pos_weight_max,
+        m1_hard_neg_enable=args.m1_hard_neg_enable,
+        m1_hard_neg_ratio=args.m1_hard_neg_ratio,
+        m1_hard_neg_min=args.m1_hard_neg_min,
     ).to(resolved_device)
     optimizer = optim.Adam(
         model.parameters(),
@@ -1034,6 +1037,9 @@ def train_model(args: argparse.Namespace) -> dict[str, Any]:
         "mu_ori": args.mu_ori,
         "m1_focal_gamma": args.m1_focal_gamma,
         "m1_pos_weight_max": args.m1_pos_weight_max,
+        "m1_hard_neg_enable": bool(args.m1_hard_neg_enable),
+        "m1_hard_neg_ratio": args.m1_hard_neg_ratio,
+        "m1_hard_neg_min": args.m1_hard_neg_min,
         "validate_every": args.validate_every,
         "early_stopping": {
             "configured": bool(args.early_stopping),
@@ -1083,6 +1089,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mu-ori", type=float, default=20.0)
     parser.add_argument("--m1-focal-gamma", type=float, default=2.0)
     parser.add_argument("--m1-pos-weight-max", type=float, default=30.0)
+    parser.add_argument("--m1-hard-neg-enable", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--m1-hard-neg-ratio", type=float, default=3.0)
+    parser.add_argument("--m1-hard-neg-min", type=int, default=128)
     parser.add_argument(
         "--strict-gradient-targets",
         action="store_true",
@@ -1103,6 +1112,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--m1-focal-gamma must be non-negative")
     if args.m1_pos_weight_max < 1.0:
         parser.error("--m1-pos-weight-max must be at least 1.0")
+    if args.m1_hard_neg_ratio < 0.0:
+        parser.error("--m1-hard-neg-ratio must be non-negative")
+    if args.m1_hard_neg_min < 0:
+        parser.error("--m1-hard-neg-min must be non-negative")
     return args
 
 

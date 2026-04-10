@@ -101,6 +101,9 @@ class FeatureNetLoss(nn.Module):
         mu_ori=20.0,
         m1_focal_gamma=2.0,
         m1_pos_weight_max=30.0,
+        m1_hard_neg_enable=True,
+        m1_hard_neg_ratio=3.0,
+        m1_hard_neg_min=128,
     ):
         super().__init__()
 
@@ -119,19 +122,72 @@ class FeatureNetLoss(nn.Module):
         self.mu_ori = mu_ori
         self.m1_focal_gamma = m1_focal_gamma
         self.m1_pos_weight_max = m1_pos_weight_max
+        self.m1_hard_neg_enable = bool(m1_hard_neg_enable)
+        self.m1_hard_neg_ratio = float(m1_hard_neg_ratio)
+        self.m1_hard_neg_min = int(m1_hard_neg_min)
 
-    def _resolve_minutia_mask(self, targets, mask):
-        minutia_mask = targets.get("minutia_valid_mask", mask)
+    def _resolve_score_mask(self, mask):
+        score_mask = mask
+        if score_mask.dim() == 3:
+            score_mask = score_mask.unsqueeze(1)
+        score_mask = score_mask.float()
+        if float(score_mask.sum().item()) <= 0.0:
+            return torch.ones_like(score_mask, dtype=torch.float32)
+        return score_mask
+
+    def _resolve_minutia_mask(self, targets, score_mask):
+        minutia_mask = targets.get("minutia_valid_mask", score_mask)
         if minutia_mask.dim() == 3:
             minutia_mask = minutia_mask.unsqueeze(1)
-        minutia_mask = minutia_mask.float() * mask.float()
+        minutia_mask = minutia_mask.float() * score_mask.float()
         if float(minutia_mask.sum().item()) <= 0.0:
-            return mask.float()
+            return score_mask.float()
         return minutia_mask
 
-    def _compute_m1_score_loss(self, logits, target_score, minutia_mask):
+    def _select_hard_negative_mask(self, focal_map, target_score, valid_mask):
+        if not self.m1_hard_neg_enable:
+            return valid_mask
+
+        selected = torch.zeros_like(valid_mask, dtype=torch.bool)
+        batch_size = focal_map.shape[0]
+        for batch_index in range(batch_size):
+            valid_b = valid_mask[batch_index, 0]
+            if not bool(valid_b.any().item()):
+                continue
+            target_b = target_score[batch_index, 0]
+            focal_b = focal_map[batch_index, 0]
+            positive_b = (target_b > 0.5) & valid_b
+            negative_b = (~positive_b) & valid_b
+
+            selected_b = positive_b.clone()
+            negative_count = int(negative_b.sum().item())
+            positive_count = int(positive_b.sum().item())
+            if negative_count > 0:
+                if positive_count > 0:
+                    hard_k = max(int(positive_count * self.m1_hard_neg_ratio), self.m1_hard_neg_min)
+                else:
+                    hard_k = self.m1_hard_neg_min
+                hard_k = min(hard_k, negative_count)
+                if hard_k > 0:
+                    negative_scores = focal_b[negative_b]
+                    negative_indices = torch.nonzero(negative_b, as_tuple=False)
+                    if hard_k < negative_count:
+                        topk_indices = torch.topk(negative_scores, k=hard_k, sorted=False).indices
+                        chosen_indices = negative_indices[topk_indices]
+                    else:
+                        chosen_indices = negative_indices
+                    selected_b[chosen_indices[:, 0], chosen_indices[:, 1]] = True
+            selected[batch_index, 0] = selected_b
+
+        if float(selected.float().sum().item()) <= 0.0:
+            return valid_mask
+        return selected
+
+    def _compute_m1_score_loss(self, logits, target_score, score_mask):
         eps = 1e-8
-        valid = minutia_mask > 0.5
+        if target_score.dim() == 3:
+            target_score = target_score.unsqueeze(1)
+        valid = score_mask > 0.5
         positive = ((target_score > 0.5) & valid).float().sum()
         negative = ((target_score <= 0.5) & valid).float().sum()
         pos_weight = (negative / (positive + eps)).clamp(min=1.0, max=self.m1_pos_weight_max)
@@ -143,14 +199,20 @@ class FeatureNetLoss(nn.Module):
         )
         pt = torch.exp(-bce_map)
         focal_map = torch.pow((1.0 - pt).clamp(min=0.0), self.m1_focal_gamma) * bce_map
-        return (focal_map * minutia_mask).sum() / (minutia_mask.sum() + eps)
+        selected_mask = self._select_hard_negative_mask(
+            focal_map=focal_map,
+            target_score=target_score,
+            valid_mask=valid,
+        )
+        selected_mask_float = selected_mask.float()
+        return (focal_map * selected_mask_float).sum() / (selected_mask_float.sum() + eps)
 
     def forward(self, outputs, targets):
         mask = targets["mask"]
         if mask.dim() == 3:
             mask = mask.unsqueeze(1)
-        mask = mask.float()
-        minutia_mask = self._resolve_minutia_mask(targets, mask)
+        score_mask = self._resolve_score_mask(mask)
+        minutia_mask = self._resolve_minutia_mask(targets, score_mask)
 
         # ---------------------------
         # 1. Orientation loss
@@ -158,7 +220,7 @@ class FeatureNetLoss(nn.Module):
         L_ori = self.orientation_loss(
             outputs["orientation"],
             targets["orientation"],
-            mask
+            score_mask
         )
 
         # ---------------------------
@@ -167,7 +229,7 @@ class FeatureNetLoss(nn.Module):
         L_ridge = self.ridge_loss(
             outputs["ridge_period"],
             targets["ridge_period"],
-            mask
+            score_mask
         )
 
         # ---------------------------
@@ -176,7 +238,7 @@ class FeatureNetLoss(nn.Module):
         L_grad = self.gradient_loss(
             outputs["gradient"],
             targets["gradient"],
-            mask
+            score_mask
         )
 
         # ---------------------------
@@ -187,7 +249,7 @@ class FeatureNetLoss(nn.Module):
         L_m1 = self._compute_m1_score_loss(
             outputs["minutia_score"],
             targets["minutia_score"],
-            minutia_mask,
+            score_mask,
         )
 
         # --- M2: x
