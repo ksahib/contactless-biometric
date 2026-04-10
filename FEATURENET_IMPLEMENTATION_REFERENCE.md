@@ -135,6 +135,8 @@ Keys in `featurenet_targets.npz`:
   - 8-bin y-subcell label (`0..7`) for active minutia cells
 - `minutia_orientation`: `int64`, shape `[Ho, Wo]`
   - 360-bin orientation label (`0..359`) for active minutia cells
+- `minutia_orientation_vec` (optional): `float32`, shape `[2, Ho, Wo]`
+  - continuous orientation target as `[cos(theta), sin(theta)]`
 - `output_mask`: `float32`, shape `[1, Ho, Wo]`
   - downsampled binary mask
 
@@ -223,7 +225,7 @@ Minutia heads:
 - `minuiae_orient_head`:
   - input is concatenation of `[branch2_features, orient_stem_features]` => 512 channels
   - `ConvBlock(512,256,k=1,p=0)`
-  - `Conv2d(256,360,k=1)` (raw logits)
+  - `Conv2d(256,2,k=1)` (raw orientation vector channels: cos/sin)
 
 All heads output at the same `/8` spatial grid.
 
@@ -233,7 +235,7 @@ All heads output at the same `/8` spatial grid.
 - `orientation`: `[B,180,Ho,Wo]`
 - `ridge_period`: `[B,1,Ho,Wo]`
 - `gradient`: `[B,2,Ho,Wo]`
-- `minutia_orientation`: `[B,360,Ho,Wo]`
+- `minutia_orientation`: `[B,2,Ho,Wo]`
 - `minutia_score`: `[B,1,Ho,Wo]`
 - `minutia_x`: `[B,8,Ho,Wo]`
 - `minutia_y`: `[B,8,Ho,Wo]`
@@ -248,7 +250,7 @@ Defaults:
 - `beta=60.0` (ridge smoothness)
 - `gamma=300.0` (gradient smoothness)
 - `sigma=0.5` (gradient weighting)
-- minutia weights: `mu_score=120`, `mu_x=20`, `mu_y=20`, `mu_ori=20`
+- minutia weights: `mu_score=120`, `mu_x=20`, `mu_y=20`, `mu_ori=5`
 - M1 focal params:
   - `m1_focal_gamma=2.0`
   - `m1_pos_weight_max=100.0`
@@ -325,13 +327,18 @@ Loss = masked binwise BCE-like term + coherence regularizer:
 - if selection becomes empty, fallback to full valid mask
 5. Normalize by selected-cell count.
 
-### M2/M3/M4 (x/y/orientation labels)
+### M2/M3/M4 (x/y/orientation)
 
 - CE loss per cell (`reduction='none'`) on:
   - `minutia_x` (8 classes)
   - `minutia_y` (8 classes)
-  - `minutia_orientation` (360 classes)
-- each is masked by `minutia_mask` and normalized by `minutia_mask.sum()`.
+- `M4` is continuous orientation regression:
+  - predicted vector is normalized to unit length per cell
+  - target vector priority:
+    - `minutia_orientation_vec` if present
+    - else derived from legacy `minutia_orientation` bin centers
+  - per-cell loss: `(cos_pred - cos_gt)^2 + (sin_pred - sin_gt)^2`
+- each term is masked by `minutia_mask` and normalized by `minutia_mask.sum()`.
 
 ### Combined Minutia + Total
 
@@ -348,7 +355,7 @@ Loss = masked binwise BCE-like term + coherence regularizer:
   - padding uses zeros (`torch.nn.functional.pad`)
 
 Target key typing:
-- float keys: `mask`, `orientation`, `ridge_period`, `gradient`, `minutia_score`, `minutia_valid_mask`
+- float keys: `mask`, `orientation`, `ridge_period`, `gradient`, `minutia_score`, `minutia_valid_mask`, `minutia_orientation_vec`
 - long keys: `minutia_x`, `minutia_y`, `minutia_orientation`
 - extra keys (`raw_view_index`, `input_shape_hw`, `output_shape_hw`) are kept as tensors
 
@@ -359,7 +366,7 @@ Each step builds pseudo targets from input image/mask and output shapes:
 - ridge from local avg pooling
 - minutia score from response heuristic
 - x/y bins from grid coordinates
-- minutia orientation from Sobel angle
+- minutia orientation from Sobel angle (legacy bin pseudo-target)
 
 Then:
 - `merged = pseudo_targets`
@@ -397,7 +404,7 @@ Monitored metric options:
 - `best_score_f1` (mode `max`)
 - `minutia_x_accuracy` (mode `max`)
 - `minutia_y_accuracy` (mode `max`)
-- `minutia_orientation_accuracy` (mode `max`)
+- `minutia_orientation_accuracy` (mode `max`, now angular within-15deg)
 
 Improvement test:
 - `min` mode: `current < best - min_delta`
@@ -453,7 +460,7 @@ Loss tuning:
 - `--mu-score` (default `120.0`, must be >0)
 - `--mu-x` (default `20.0`, must be >0)
 - `--mu-y` (default `20.0`, must be >0)
-- `--mu-ori` (default `20.0`, must be >0)
+- `--mu-ori` (default `5.0`, must be >0)
 - `--m1-focal-gamma` (default `2.0`, must be >=0)
 - `--m1-pos-weight-max` (default `100.0`, must be >=1.0)
 - `--m1-hard-neg-enable/--no-m1-hard-neg-enable` (default `True`)
@@ -484,7 +491,8 @@ Data selection:
 3. Label accuracies on minutia-positive cells (`minutia_valid_mask`):
 - `minutia_x`
 - `minutia_y`
-- `minutia_orientation`
+- `minutia_orientation` (within-15deg angular accuracy)
+- plus `orientation_mae_deg` (mean absolute angular error in degrees)
 
 ## 7.2 Paper-Style Minutia Matching Details
 
@@ -501,7 +509,10 @@ Pred decode:
 - coordinate conversion to input pixels:
   - scale by `input_shape_hw / output_shape_hw` from targets
 - orientation decode:
-  - angle degrees = `(ori_bin + 0.5) * (360 / 360)` with wrap to `[0,360)`
+  - predicted vector `[cos,sin]` is normalized then decoded:
+    - `theta = atan2(sin, cos)`
+    - `theta_deg = (theta * 180/pi) % 360`
+  - GT angle uses `minutia_orientation_vec` when present, otherwise legacy bin-center decode
 
 Matching rule (paper-style):
 - spatial distance `< 8` pixels (strict)
@@ -622,3 +633,4 @@ So yes, segmentation/masking and normalization are already baked into the genera
 - `best.pt` tracks whichever metric is configured for monitoring.
 - `last.pt` is always written at training end (including early stop).
 - If using old checkpoints after architecture or head changes, state_dict loading may fail unless architecture matches exactly.
+- This branch changes `minutia_orientation` head shape from `360` to `2`; old checkpoints are intentionally incompatible and require a new training run.

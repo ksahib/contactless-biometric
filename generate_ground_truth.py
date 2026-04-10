@@ -2859,6 +2859,7 @@ def _rasterize_minutiae(
     minutia_x = np.zeros((target_height, target_width), dtype=np.int64)
     minutia_y = np.zeros((target_height, target_width), dtype=np.int64)
     minutia_orientation = np.zeros((target_height, target_width), dtype=np.int64)
+    minutia_orientation_vec = np.zeros((2, target_height, target_width), dtype=np.float32)
     ownership = np.full((target_height, target_width), -1.0, dtype=np.float32)
     center_distance = np.full((target_height, target_width), np.inf, dtype=np.float32)
     cell_width = float(source_width) / float(max(target_width, 1))
@@ -2901,6 +2902,8 @@ def _rasterize_minutiae(
         minutia_x[cell_y, cell_x] = minutia_x_bin
         minutia_y[cell_y, cell_x] = minutia_y_bin
         minutia_orientation[cell_y, cell_x] = minutia_orientation_bin
+        minutia_orientation_vec[0, cell_y, cell_x] = float(math.cos(minutia_theta))
+        minutia_orientation_vec[1, cell_y, cell_x] = float(math.sin(minutia_theta))
 
     valid_mask *= mask_small
     score_map *= mask_small
@@ -2912,6 +2915,7 @@ def _rasterize_minutiae(
         "minutia_x": minutia_x.astype(np.int64),
         "minutia_y": minutia_y.astype(np.int64),
         "minutia_orientation": minutia_orientation.astype(np.int64),
+        "minutia_orientation_vec": minutia_orientation_vec.astype(np.float32),
     }
 
 
@@ -2943,6 +2947,7 @@ def _build_featurenet_targets(
         "minutia_x": minutia_targets["minutia_x"],
         "minutia_y": minutia_targets["minutia_y"],
         "minutia_orientation": minutia_targets["minutia_orientation"],
+        "minutia_orientation_vec": minutia_targets["minutia_orientation_vec"],
         "output_mask": mask_small[np.newaxis, ...].astype(np.float32),
     }
     if gradient is not None:
@@ -3119,7 +3124,7 @@ def _build_bundle_meta(
             "enhancement": "fingerprint_enhancer.enhance_fingerprint",
             "minutiae": minutiae_source,
             "featurenet_adapter": "dense orientation/ridge/gradient resize plus paper-style minutiae heatmap and precise subcell labels",
-            "minutiae_targets": "binary score heatmap with 8-bin x/y subcell labels and 360-bin orientation labels",
+            "minutiae_targets": "binary score heatmap with 8-bin x/y subcell labels, legacy 360-bin orientation labels, and optional cos/sin orientation vectors",
         },
         "shapes": {
             "input_image": list(prepared.gray_image.shape),
@@ -3280,6 +3285,8 @@ def _load_featurenet_samples(output_root: Path, limit: int | None = None) -> lis
                 "minutia_y": data["minutia_y"],
                 "minutia_orientation": data["minutia_orientation"],
             }
+            if "minutia_orientation_vec" in data:
+                targets["minutia_orientation_vec"] = data["minutia_orientation_vec"]
         samples.append(
             {
                 "masked_image": bundle_dir / "masked_image.png",

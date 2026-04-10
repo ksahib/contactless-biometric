@@ -47,6 +47,8 @@ FeatureNet train/eval now expose CUDA throughput knobs such as `--amp`, `--chann
 
 If you adopt the raw-logit head refactor (final head layers changed from `ConvBlock` to plain `nn.Conv2d`), treat it as a new architecture run. Do not resume or evaluate with older checkpoints from the pre-refactor head design.
 
+If you adopt the continuous minutia-orientation refactor (`minutia_orientation` head changed from `360` bins to `2` channels `[cos,sin]`), this is also a new architecture run. Older checkpoints with 360-bin minutia orientation heads are intentionally incompatible.
+
 For paper-style minutia optimization with full-negative score supervision and hard-negative mining, use F1-aligned validation:
 
 ```bash

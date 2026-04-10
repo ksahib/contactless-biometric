@@ -54,7 +54,7 @@ class FeatureExtractor(nn.Module):
 
         self.minuiae_orient_head = nn.Sequential(
             ConvBlock(512, 256, kernel_size=1, stride=1, padding=0),
-            nn.Conv2d(256, 360, kernel_size=1, stride=1, padding=0),
+            nn.Conv2d(256, 2, kernel_size=1, stride=1, padding=0),
         )
 
         self.minutiae_score_head = nn.Sequential(

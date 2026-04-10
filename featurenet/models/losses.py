@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+MINUTIA_ORIENTATION_BINS = 360
+
 class OrientationLoss(nn.Module):
     def __init__(self, num_bins=180, alpha=1.0, eps=1e-8):
         super().__init__()
@@ -98,7 +100,7 @@ class FeatureNetLoss(nn.Module):
         mu_score=120.0,
         mu_x=20.0,
         mu_y=20.0,
-        mu_ori=20.0,
+        mu_ori=5.0,
         m1_focal_gamma=2.0,
         m1_pos_weight_max=100.0,
         m1_hard_neg_enable=True,
@@ -127,6 +129,32 @@ class FeatureNetLoss(nn.Module):
         self.m1_hard_neg_ratio = float(m1_hard_neg_ratio)
         self.m1_hard_neg_min = int(m1_hard_neg_min)
         self.m1_hard_neg_fraction = float(m1_hard_neg_fraction)
+
+    def _orientation_bins_to_unit_vectors(self, bins: torch.Tensor) -> torch.Tensor:
+        if bins.dim() == 4 and bins.shape[1] == 1:
+            bins = bins.squeeze(1)
+        angle = (bins.float().clamp(0, MINUTIA_ORIENTATION_BINS - 1) + 0.5) * (
+            2.0 * torch.pi / float(MINUTIA_ORIENTATION_BINS)
+        )
+        cos_gt = torch.cos(angle)
+        sin_gt = torch.sin(angle)
+        return torch.stack([cos_gt, sin_gt], dim=1)
+
+    def _resolve_minutia_orientation_target_vectors(self, targets: dict[str, torch.Tensor]) -> torch.Tensor:
+        if "minutia_orientation_vec" in targets:
+            target_vec = targets["minutia_orientation_vec"]
+            if target_vec.dim() == 3:
+                target_vec = target_vec.unsqueeze(0)
+            if target_vec.dim() == 4 and target_vec.shape[-1] == 2 and target_vec.shape[1] != 2:
+                target_vec = target_vec.permute(0, 3, 1, 2)
+            if target_vec.dim() != 4 or target_vec.shape[1] != 2:
+                raise ValueError(
+                    f"expected minutia_orientation_vec with shape [B,2,H,W], got {tuple(target_vec.shape)}"
+                )
+            return F.normalize(target_vec.float(), dim=1, eps=1e-8)
+        if "minutia_orientation" in targets:
+            return self._orientation_bins_to_unit_vectors(targets["minutia_orientation"])
+        raise KeyError("missing minutia orientation targets: expected minutia_orientation_vec or minutia_orientation")
 
     def _resolve_score_mask(self, mask):
         score_mask = mask
@@ -263,12 +291,20 @@ class FeatureNetLoss(nn.Module):
         y_loss_map = y_loss_map.unsqueeze(1)
         L_m3 = (y_loss_map * minutia_mask).sum() / (minutia_mask.sum() + 1e-8)
 
-        # --- M4: orientation
-        ori_loss_map = self.ce(
-            outputs["minutia_orientation"],
-            targets["minutia_orientation"]
-        )
-        ori_loss_map = ori_loss_map.unsqueeze(1)
+        # --- M4: orientation (continuous cos/sin)
+        pred_ori = outputs["minutia_orientation"]
+        if pred_ori.dim() != 4 or pred_ori.shape[1] != 2:
+            raise ValueError(
+                f"expected minutia_orientation output with shape [B,2,H,W], got {tuple(pred_ori.shape)}"
+            )
+        pred_ori = F.normalize(pred_ori, dim=1, eps=1e-8)
+        target_ori = self._resolve_minutia_orientation_target_vectors(targets).to(pred_ori.device)
+        if target_ori.shape != pred_ori.shape:
+            raise ValueError(
+                f"target minutia orientation vector shape {tuple(target_ori.shape)} "
+                f"does not match prediction shape {tuple(pred_ori.shape)}"
+            )
+        ori_loss_map = (pred_ori - target_ori).pow(2).sum(dim=1, keepdim=True)
         L_m4 = (ori_loss_map * minutia_mask).sum() / (minutia_mask.sum() + 1e-8)
 
         # combine minutiae

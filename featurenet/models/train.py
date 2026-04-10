@@ -30,7 +30,15 @@ from .feature_extractor import FeatureExtractor
 from .losses import FeatureNetLoss
 
 
-FLOAT_TARGET_KEYS = {"mask", "orientation", "ridge_period", "gradient", "minutia_score", "minutia_valid_mask"}
+FLOAT_TARGET_KEYS = {
+    "mask",
+    "orientation",
+    "ridge_period",
+    "gradient",
+    "minutia_score",
+    "minutia_valid_mask",
+    "minutia_orientation_vec",
+}
 LONG_TARGET_KEYS = {"minutia_x", "minutia_y", "minutia_orientation"}
 LOSS_KEYS = ("total", "orientation", "ridge", "gradient", "minutia", "m1", "m2", "m3", "m4")
 EARLY_STOPPING_METRICS = (
@@ -1088,7 +1096,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mu-score", type=float, default=120.0)
     parser.add_argument("--mu-x", type=float, default=20.0)
     parser.add_argument("--mu-y", type=float, default=20.0)
-    parser.add_argument("--mu-ori", type=float, default=20.0)
+    parser.add_argument("--mu-ori", type=float, default=5.0)
     parser.add_argument("--m1-focal-gamma", type=float, default=2.0)
     parser.add_argument("--m1-pos-weight-max", type=float, default=100.0)
     parser.add_argument("--m1-hard-neg-enable", action=argparse.BooleanOptionalAction, default=True)
