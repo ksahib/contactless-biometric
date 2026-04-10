@@ -100,10 +100,11 @@ class FeatureNetLoss(nn.Module):
         mu_y=20.0,
         mu_ori=20.0,
         m1_focal_gamma=2.0,
-        m1_pos_weight_max=30.0,
+        m1_pos_weight_max=100.0,
         m1_hard_neg_enable=True,
-        m1_hard_neg_ratio=3.0,
-        m1_hard_neg_min=128,
+        m1_hard_neg_ratio=20.0,
+        m1_hard_neg_min=2000,
+        m1_hard_neg_fraction=0.05,
     ):
         super().__init__()
 
@@ -125,6 +126,7 @@ class FeatureNetLoss(nn.Module):
         self.m1_hard_neg_enable = bool(m1_hard_neg_enable)
         self.m1_hard_neg_ratio = float(m1_hard_neg_ratio)
         self.m1_hard_neg_min = int(m1_hard_neg_min)
+        self.m1_hard_neg_fraction = float(m1_hard_neg_fraction)
 
     def _resolve_score_mask(self, mask):
         score_mask = mask
@@ -163,10 +165,9 @@ class FeatureNetLoss(nn.Module):
             negative_count = int(negative_b.sum().item())
             positive_count = int(positive_b.sum().item())
             if negative_count > 0:
-                if positive_count > 0:
-                    hard_k = max(int(positive_count * self.m1_hard_neg_ratio), self.m1_hard_neg_min)
-                else:
-                    hard_k = self.m1_hard_neg_min
+                ratio_k = int(positive_count * self.m1_hard_neg_ratio)
+                fraction_k = int(negative_count * self.m1_hard_neg_fraction)
+                hard_k = max(ratio_k, self.m1_hard_neg_min, fraction_k)
                 hard_k = min(hard_k, negative_count)
                 if hard_k > 0:
                     negative_scores = focal_b[negative_b]
@@ -190,7 +191,7 @@ class FeatureNetLoss(nn.Module):
         valid = score_mask > 0.5
         positive = ((target_score > 0.5) & valid).float().sum()
         negative = ((target_score <= 0.5) & valid).float().sum()
-        pos_weight = (negative / (positive + eps)).clamp(min=1.0, max=self.m1_pos_weight_max)
+        pos_weight = torch.sqrt(negative / (positive + eps)).clamp(min=1.0, max=self.m1_pos_weight_max)
         bce_map = F.binary_cross_entropy_with_logits(
             logits,
             target_score,
