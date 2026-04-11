@@ -226,8 +226,13 @@ X/Y fusion path:
 - upsample `branch2_feat_8x` to `/4` using bilinear interpolation
 - concatenate with `branch2_feat_4x` (`384` channels total)
 - two `ConvBlock` refinement layers at `/4`
-- stride-2 `ConvBlock` to compress back to `/8`
-- x/y heads read this fused `/8` descriptor
+- pad bottom/right by at most 1 pixel if `/4` dims are odd
+- `pixel_unshuffle(..., downscale_factor=2)` to regroup each `2x2` `/4` patch into channels on `/8`
+- patch refinement on `/8`:
+  - `ConvBlock(1024,256,k=1,p=0)`
+  - `ConvBlock(256,256,k=3,p=1)`
+- crop patch-aware `/8` descriptor to exact score-grid shape from `branch2_feat_8x`
+- x/y heads read this patch-aware `/8` descriptor
 
 Minutia heads:
 - `minutiae_score_head`:
