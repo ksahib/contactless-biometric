@@ -65,6 +65,7 @@ python -m featurenet.models.train \
   --early-stopping-metric best_score_f1 \
   --early-stopping-patience 15 \
   --early-stopping-min-delta 1e-4 \
+  --xy-soft-target-sigma 1.0 \
   --m1-hard-neg-enable \
   --m1-hard-neg-ratio 3.0 \
   --m1-hard-neg-min 128 \
@@ -73,3 +74,4 @@ python -m featurenet.models.train \
 ```
 
 The evaluator keeps the paper-style threshold + NMS protocol (no top-K post-cap in default behavior).
+Minutia x/y supervision now uses Gaussian soft-target cross-entropy over ordered 8 bins (always enabled), controlled by `--xy-soft-target-sigma` (default `1.0`).

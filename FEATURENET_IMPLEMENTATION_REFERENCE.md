@@ -134,9 +134,9 @@ Keys in `featurenet_targets.npz`:
 - `minutia_y`: `int64`, shape `[Ho, Wo]`
   - 8-bin y-subcell label (`0..7`) for active minutia cells
 - `minutia_orientation`: `int64`, shape `[Ho, Wo]`
-  - 360-bin orientation label (`0..359`) for active minutia cells
-- `minutia_orientation_vec` (optional): `float32`, shape `[2, Ho, Wo]`
-  - continuous orientation target as `[cos(theta), sin(theta)]`
+  - legacy 360-bin orientation label (`0..359`) for active minutia cells
+- `minutia_orientation_vec`: `float32`, shape `[2, Ho, Wo]`
+  - continuous orientation target vector `[cos(theta), sin(theta)]` for active minutia cells
 - `output_mask`: `float32`, shape `[1, Ho, Wo]`
   - downsampled binary mask
 
@@ -145,6 +145,7 @@ Rasterization details:
 - if multiple minutiae land in one cell, tie-break prefers higher score, then center proximity
 - subcell bins use local coordinate in cell: `floor(local * 8)`
 - orientation bin: `floor(theta * 360 / (2*pi))`
+- orientation vector: `[cos(theta), sin(theta)]`
 
 ## 3.3 Train/Eval-Time Input Tensor Build (`train.py`)
 
@@ -250,6 +251,7 @@ Defaults:
 - `beta=60.0` (ridge smoothness)
 - `gamma=300.0` (gradient smoothness)
 - `sigma=0.5` (gradient weighting)
+- `xy_soft_target_sigma=1.0` (Gaussian smoothing for x/y soft targets)
 - minutia weights: `mu_score=120`, `mu_x=20`, `mu_y=20`, `mu_ori=5`
 - M1 focal params:
   - `m1_focal_gamma=2.0`
@@ -329,11 +331,17 @@ Loss = masked binwise BCE-like term + coherence regularizer:
 
 ### M2/M3/M4 (x/y/orientation)
 
-- CE loss per cell (`reduction='none'`) on:
-  - `minutia_x` (8 classes)
-  - `minutia_y` (8 classes)
+- `M2` and `M3` use masked soft-target cross-entropy over ordered 8 bins:
+  - build Gaussian target distribution from integer labels (`0..7`) with sigma `xy_soft_target_sigma`:
+    - `w_k = exp(-0.5 * ((k - y) / sigma)^2)` (non-circular)
+    - normalized across 8 bins per cell
+  - compute:
+    - `log_probs = log_softmax(logits, dim=1)`
+    - `soft_ce = -(soft_targets * log_probs).sum(dim=1, keepdim=True)`
+  - apply `minutia_mask` and normalize by `minutia_mask.sum()`
+  - active-cell labels are validated to be in `[0,7]`; out-of-range labels raise a `ValueError`
 - `M4` is continuous orientation regression:
-  - predicted vector is normalized to unit length per cell
+  - prediction is normalized per-cell to unit vector
   - target vector priority:
     - `minutia_orientation_vec` if present
     - else derived from legacy `minutia_orientation` bin centers
@@ -461,6 +469,7 @@ Loss tuning:
 - `--mu-x` (default `20.0`, must be >0)
 - `--mu-y` (default `20.0`, must be >0)
 - `--mu-ori` (default `5.0`, must be >0)
+- `--xy-soft-target-sigma` (default `1.0`, must be >0)
 - `--m1-focal-gamma` (default `2.0`, must be >=0)
 - `--m1-pos-weight-max` (default `100.0`, must be >=1.0)
 - `--m1-hard-neg-enable/--no-m1-hard-neg-enable` (default `True`)
@@ -509,10 +518,10 @@ Pred decode:
 - coordinate conversion to input pixels:
   - scale by `input_shape_hw / output_shape_hw` from targets
 - orientation decode:
-  - predicted vector `[cos,sin]` is normalized then decoded:
-    - `theta = atan2(sin, cos)`
-    - `theta_deg = (theta * 180/pi) % 360`
-  - GT angle uses `minutia_orientation_vec` when present, otherwise legacy bin-center decode
+  - normalize predicted orientation vector `[cos,sin]`
+  - `theta = atan2(sin, cos)`
+  - `theta_deg = (theta * 180/pi) % 360`
+  - GT angle uses `minutia_orientation_vec` when present, otherwise bin-center decode from legacy labels
 
 Matching rule (paper-style):
 - spatial distance `< 8` pixels (strict)
@@ -533,8 +542,9 @@ Split mapping:
 - if split fails or empty, falls back to all samples
 
 Important implementation detail:
-- standalone `evaluate.py` instantiates `FeatureNetLoss()` with default weights, not necessarily the custom training weights in checkpoint args.
-- detection metrics (`best_score_f1` etc.) are independent of loss weights.
+- standalone `evaluate.py` instantiates `FeatureNetLoss()` with default weights, not necessarily the custom training weights in checkpoint args
+- detection metrics (`best_score_f1` etc.) are independent of loss weights
+- old 360-bin orientation checkpoints are rejected with a clear compatibility error because current model expects 2-channel minutia orientation output
 
 ## 7.4 Evaluate CLI (all args)
 
@@ -622,7 +632,7 @@ Forward contract:
 - call `model(image, mask=mask)` where each is `[B,1,H,W]`
 - model internally computes `image * mask` and concatenates mask to create 2-channel tensor
 
-So yes, segmentation/masking and normalization are already baked into the generated bundle inputs, and the model always receives the mask during both training and evaluation.
+So segmentation/masking and normalization are already baked into the generated bundle inputs, and the model always receives the mask during both training and evaluation.
 
 ## 10) Practical Notes and Edge Cases
 
@@ -632,5 +642,4 @@ So yes, segmentation/masking and normalization are already baked into the genera
 - Validation metrics can be computed every N epochs; patience counts only validation checks.
 - `best.pt` tracks whichever metric is configured for monitoring.
 - `last.pt` is always written at training end (including early stop).
-- If using old checkpoints after architecture or head changes, state_dict loading may fail unless architecture matches exactly.
 - This branch changes `minutia_orientation` head shape from `360` to `2`; old checkpoints are intentionally incompatible and require a new training run.
