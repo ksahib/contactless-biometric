@@ -2858,6 +2858,8 @@ def _rasterize_minutiae(
     valid_mask = np.zeros((target_height, target_width), dtype=np.float32)
     minutia_x = np.zeros((target_height, target_width), dtype=np.int64)
     minutia_y = np.zeros((target_height, target_width), dtype=np.int64)
+    minutia_x_offset = np.zeros((target_height, target_width), dtype=np.float32)
+    minutia_y_offset = np.zeros((target_height, target_width), dtype=np.float32)
     minutia_orientation = np.zeros((target_height, target_width), dtype=np.int64)
     minutia_orientation_vec = np.zeros((2, target_height, target_width), dtype=np.float32)
     ownership = np.full((target_height, target_width), -1.0, dtype=np.float32)
@@ -2901,6 +2903,8 @@ def _rasterize_minutiae(
         minutia_orientation_bin = int(np.clip(math.floor(minutia_theta * (360.0 / (2.0 * math.pi))), 0, 359))
         minutia_x[cell_y, cell_x] = minutia_x_bin
         minutia_y[cell_y, cell_x] = minutia_y_bin
+        minutia_x_offset[cell_y, cell_x] = local_x
+        minutia_y_offset[cell_y, cell_x] = local_y
         minutia_orientation[cell_y, cell_x] = minutia_orientation_bin
         minutia_orientation_vec[0, cell_y, cell_x] = float(math.cos(minutia_theta))
         minutia_orientation_vec[1, cell_y, cell_x] = float(math.sin(minutia_theta))
@@ -2914,6 +2918,8 @@ def _rasterize_minutiae(
         "minutia_valid_mask": valid_mask[np.newaxis, ...].astype(np.float32),
         "minutia_x": minutia_x.astype(np.int64),
         "minutia_y": minutia_y.astype(np.int64),
+        "minutia_x_offset": minutia_x_offset[np.newaxis, ...].astype(np.float32),
+        "minutia_y_offset": minutia_y_offset[np.newaxis, ...].astype(np.float32),
         "minutia_orientation": minutia_orientation.astype(np.int64),
         "minutia_orientation_vec": minutia_orientation_vec.astype(np.float32),
     }
@@ -2946,6 +2952,8 @@ def _build_featurenet_targets(
         "minutia_valid_mask": minutia_targets["minutia_valid_mask"],
         "minutia_x": minutia_targets["minutia_x"],
         "minutia_y": minutia_targets["minutia_y"],
+        "minutia_x_offset": minutia_targets["minutia_x_offset"],
+        "minutia_y_offset": minutia_targets["minutia_y_offset"],
         "minutia_orientation": minutia_targets["minutia_orientation"],
         "minutia_orientation_vec": minutia_targets["minutia_orientation_vec"],
         "output_mask": mask_small[np.newaxis, ...].astype(np.float32),
@@ -3124,7 +3132,7 @@ def _build_bundle_meta(
             "enhancement": "fingerprint_enhancer.enhance_fingerprint",
             "minutiae": minutiae_source,
             "featurenet_adapter": "dense orientation/ridge/gradient resize plus paper-style minutiae heatmap and precise subcell labels",
-            "minutiae_targets": "binary score heatmap with 8-bin x/y subcell labels, legacy 360-bin orientation labels, and optional cos/sin orientation vectors",
+            "minutiae_targets": "binary score heatmap with continuous x/y offsets plus legacy 8-bin x/y labels, legacy 360-bin orientation labels, and optional cos/sin orientation vectors",
         },
         "shapes": {
             "input_image": list(prepared.gray_image.shape),
@@ -3275,6 +3283,12 @@ def _load_featurenet_samples(output_root: Path, limit: int | None = None) -> lis
         with np.load(npz_path) as data:
             if "gradient" not in data:
                 continue
+            if "minutia_x_offset" in data and "minutia_y_offset" in data:
+                minutia_x_offset = data["minutia_x_offset"]
+                minutia_y_offset = data["minutia_y_offset"]
+            else:
+                minutia_x_offset = ((data["minutia_x"].astype(np.float32) + 0.5) / 8.0)[np.newaxis, ...]
+                minutia_y_offset = ((data["minutia_y"].astype(np.float32) + 0.5) / 8.0)[np.newaxis, ...]
             targets = {
                 "orientation": data["orientation"],
                 "ridge_period": data["ridge_period"],
@@ -3283,6 +3297,8 @@ def _load_featurenet_samples(output_root: Path, limit: int | None = None) -> lis
                 "minutia_valid_mask": data["minutia_valid_mask"],
                 "minutia_x": data["minutia_x"],
                 "minutia_y": data["minutia_y"],
+                "minutia_x_offset": minutia_x_offset,
+                "minutia_y_offset": minutia_y_offset,
                 "minutia_orientation": data["minutia_orientation"],
             }
             if "minutia_orientation_vec" in data:

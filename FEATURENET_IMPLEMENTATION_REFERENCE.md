@@ -133,6 +133,10 @@ Keys in `featurenet_targets.npz`:
   - 8-bin x-subcell label (`0..7`) for active minutia cells
 - `minutia_y`: `int64`, shape `[Ho, Wo]`
   - 8-bin y-subcell label (`0..7`) for active minutia cells
+- `minutia_x_offset`: `float32`, shape `[1, Ho, Wo]`
+  - continuous x offset inside the selected `/8` output cell in `[0, 1)`
+- `minutia_y_offset`: `float32`, shape `[1, Ho, Wo]`
+  - continuous y offset inside the selected `/8` output cell in `[0, 1)`
 - `minutia_orientation`: `int64`, shape `[Ho, Wo]`
   - legacy 360-bin orientation label (`0..359`) for active minutia cells
 - `minutia_orientation_vec`: `float32`, shape `[2, Ho, Wo]`
@@ -144,6 +148,7 @@ Rasterization details:
 - minutiae are assigned to output cells by floor mapping from input pixel coordinates
 - if multiple minutiae land in one cell, tie-break prefers higher score, then center proximity
 - subcell bins use local coordinate in cell: `floor(local * 8)`
+- continuous offsets use the same local coordinate before binning (`local_x`, `local_y`)
 - orientation bin: `floor(theta * 360 / (2*pi))`
 - orientation vector: `[cos(theta), sin(theta)]`
 
@@ -213,16 +218,27 @@ Head projections from stems:
 - `ConvBlock(128,256,k=3,p=1)`
 - `MaxPool2d(2,2)`   -> `/8`
 
+For x/y localization, branch2 now exposes both:
+- shallow `branch2_feat_4x` (`/4`)
+- deep `branch2_feat_8x` (`/8`)
+
+X/Y fusion path:
+- upsample `branch2_feat_8x` to `/4` using bilinear interpolation
+- concatenate with `branch2_feat_4x` (`384` channels total)
+- two `ConvBlock` refinement layers at `/4`
+- stride-2 `ConvBlock` to compress back to `/8`
+- x/y heads read this fused `/8` descriptor
+
 Minutia heads:
 - `minutiae_score_head`:
   - `ConvBlock(256,256,k=1,p=0)`
   - `Conv2d(256,1,k=1)`  (raw logit)
 - `minutia_head_x`:
   - `ConvBlock(256,256,k=1,p=0)`
-  - `Conv2d(256,8,k=1)`  (raw logits)
+  - `Conv2d(256,1,k=1)`  (raw x-offset logits)
 - `minutia_head_y`:
   - `ConvBlock(256,256,k=1,p=0)`
-  - `Conv2d(256,8,k=1)`  (raw logits)
+  - `Conv2d(256,1,k=1)`  (raw y-offset logits)
 - `minuiae_orient_head`:
   - input is concatenation of `[branch2_features, orient_stem_features]` => 512 channels
   - `ConvBlock(512,256,k=1,p=0)`
@@ -238,8 +254,8 @@ All heads output at the same `/8` spatial grid.
 - `gradient`: `[B,2,Ho,Wo]`
 - `minutia_orientation`: `[B,2,Ho,Wo]`
 - `minutia_score`: `[B,1,Ho,Wo]`
-- `minutia_x`: `[B,8,Ho,Wo]`
-- `minutia_y`: `[B,8,Ho,Wo]`
+- `minutia_x`: `[B,1,Ho,Wo]` (raw x-offset logits)
+- `minutia_y`: `[B,1,Ho,Wo]` (raw y-offset logits)
 
 ## 5) Losses (`losses.py`)
 
@@ -269,7 +285,7 @@ Defaults:
 - `minutia_mask` for M2/M3/M4:
   - from `targets["minutia_valid_mask"]` if present, else `score_mask`
   - multiplied by `score_mask`
-  - if empty, fallback to `score_mask`
+  - if empty, M2/M3/M4 are effectively zero (positive-only supervision)
 
 ## 5.2 Orientation Loss (`OrientationLoss`)
 
@@ -330,9 +346,11 @@ Loss = masked binwise BCE-like term + coherence regularizer:
 
 ### M2/M3/M4 (x/y/orientation)
 
-- CE loss per cell (`reduction='none'`) on:
-  - `minutia_x` (8 classes)
-  - `minutia_y` (8 classes)
+- `M2` and `M3` are masked SmoothL1 regression on continuous offsets:
+  - predictions: `sigmoid(outputs["minutia_x"])`, `sigmoid(outputs["minutia_y"])`
+  - targets: `minutia_x_offset`, `minutia_y_offset`
+  - each loss map is masked by `minutia_mask` and normalized by `minutia_mask.sum()`
+  - x/y offsets are validated on active cells to be in `[0,1]`
 - `M4` is continuous orientation regression:
   - prediction is normalized per-cell to unit vector
   - target vector priority:
@@ -356,7 +374,7 @@ Loss = masked binwise BCE-like term + coherence regularizer:
   - padding uses zeros (`torch.nn.functional.pad`)
 
 Target key typing:
-- float keys: `mask`, `orientation`, `ridge_period`, `gradient`, `minutia_score`, `minutia_valid_mask`, `minutia_orientation_vec`
+- float keys: `mask`, `orientation`, `ridge_period`, `gradient`, `minutia_score`, `minutia_valid_mask`, `minutia_x_offset`, `minutia_y_offset`, `minutia_orientation_vec`
 - long keys: `minutia_x`, `minutia_y`, `minutia_orientation`
 - extra keys (`raw_view_index`, `input_shape_hw`, `output_shape_hw`) are kept as tensors
 
@@ -367,12 +385,14 @@ Each step builds pseudo targets from input image/mask and output shapes:
 - ridge from local avg pooling
 - minutia score from response heuristic
 - x/y bins from grid coordinates
+- x/y offsets from bin centers (`(bin + 0.5)/8`) as pseudo fallback
 - minutia orientation from Sobel angle (legacy bin pseudo-target)
 
 Then:
 - `merged = pseudo_targets`
 - overwrite with explicit bundle targets (`merged.update(explicit_targets)`)
 - explicit `gradient` is required; missing gradient raises `KeyError`
+- if `minutia_x_offset` / `minutia_y_offset` are missing in a bundle, loader recovers exact offsets on the fly from `minutiae.json` using the same cell assignment/tie-break policy
 
 So, in practice, generated bundle targets drive supervision.
 
@@ -493,6 +513,10 @@ Data selection:
 - `minutia_x`
 - `minutia_y`
 - `minutia_orientation` (within-15deg angular accuracy)
+- `minutia_x` and `minutia_y` are tolerance-based regression accuracies (`abs(error_cell) < 0.125`), not class exact-match
+- plus regression quality metrics:
+  - `minutia_x_mae_cell`, `minutia_y_mae_cell`
+  - `minutia_x_mae_px`, `minutia_y_mae_px`
 - plus `orientation_mae_deg` (mean absolute angular error in degrees)
 
 ## 7.2 Paper-Style Minutia Matching Details
@@ -505,8 +529,8 @@ Pred decode:
 - eval region: `targets["mask"] > 0.5`
 - local NMS: 3x3 max-pool; keep cells where `score >= pooled - 1e-8`
 - subcell decode:
-  - `x = col + (x_bin + 0.5)/8`
-  - `y = row + (y_bin + 0.5)/8`
+  - `x = col + sigmoid(x_logit)`
+  - `y = row + sigmoid(y_logit)`
 - coordinate conversion to input pixels:
   - scale by `input_shape_hw / output_shape_hw` from targets
 - orientation decode:
@@ -537,6 +561,7 @@ Important implementation detail:
 - standalone `evaluate.py` instantiates `FeatureNetLoss()` with default weights, not necessarily the custom training weights in checkpoint args
 - detection metrics (`best_score_f1` etc.) are independent of loss weights
 - old 360-bin orientation checkpoints are rejected with a clear compatibility error because current model expects 2-channel minutia orientation output
+- checkpoints with 8-channel x/y heads are also rejected because current model expects 1-channel continuous x/y offsets
 
 ## 7.4 Evaluate CLI (all args)
 
@@ -634,4 +659,4 @@ So segmentation/masking and normalization are already baked into the generated b
 - Validation metrics can be computed every N epochs; patience counts only validation checks.
 - `best.pt` tracks whichever metric is configured for monitoring.
 - `last.pt` is always written at training end (including early stop).
-- This branch changes `minutia_orientation` head shape from `360` to `2`; old checkpoints are intentionally incompatible and require a new training run.
+- This branch changes `minutia_orientation` head shape from `360` to `2` and `minutia_x/minutia_y` from `8` to `1`; old checkpoints are intentionally incompatible and require a new training run.

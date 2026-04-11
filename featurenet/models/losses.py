@@ -3,7 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 MINUTIA_ORIENTATION_BINS = 360
-MINUTIA_XY_BINS = 8
 
 class OrientationLoss(nn.Module):
     def __init__(self, num_bins=180, alpha=1.0, eps=1e-8):
@@ -108,7 +107,6 @@ class FeatureNetLoss(nn.Module):
         m1_hard_neg_ratio=20.0,
         m1_hard_neg_min=2000,
         m1_hard_neg_fraction=0.05,
-        xy_soft_target_sigma=1.0,
     ):
         super().__init__()
 
@@ -128,9 +126,6 @@ class FeatureNetLoss(nn.Module):
         self.m1_hard_neg_ratio = float(m1_hard_neg_ratio)
         self.m1_hard_neg_min = int(m1_hard_neg_min)
         self.m1_hard_neg_fraction = float(m1_hard_neg_fraction)
-        self.xy_soft_target_sigma = float(xy_soft_target_sigma)
-        if self.xy_soft_target_sigma <= 0.0:
-            raise ValueError("xy_soft_target_sigma must be positive")
 
     def _orientation_bins_to_unit_vectors(self, bins: torch.Tensor) -> torch.Tensor:
         if bins.dim() == 4 and bins.shape[1] == 1:
@@ -172,8 +167,6 @@ class FeatureNetLoss(nn.Module):
         if minutia_mask.dim() == 3:
             minutia_mask = minutia_mask.unsqueeze(1)
         minutia_mask = minutia_mask.float() * score_mask.float()
-        if float(minutia_mask.sum().item()) <= 0.0:
-            return score_mask.float()
         return minutia_mask
 
     def _select_hard_negative_mask(self, focal_map, target_score, valid_mask):
@@ -238,62 +231,50 @@ class FeatureNetLoss(nn.Module):
         selected_mask_float = selected_mask.float()
         return (focal_map * selected_mask_float).sum() / (selected_mask_float.sum() + eps)
 
-    def _ensure_xy_target_bins(self, target_bins: torch.Tensor, head_name: str) -> torch.Tensor:
-        if target_bins.dim() == 4 and target_bins.shape[1] == 1:
-            target_bins = target_bins.squeeze(1)
-        if target_bins.dim() != 3:
-            raise ValueError(
-                f"expected {head_name} targets with shape [B,H,W] or [B,1,H,W], got {tuple(target_bins.shape)}"
-            )
-        return target_bins
-
-    def _validate_xy_bins_on_active_cells(
+    def _resolve_offset_target(
         self,
-        target_bins: torch.Tensor,
-        active_mask: torch.Tensor,
+        target_offsets: torch.Tensor,
+        output_like: torch.Tensor,
         head_name: str,
-    ) -> None:
-        invalid = ((target_bins < 0) | (target_bins >= MINUTIA_XY_BINS)) & active_mask
-        if not bool(invalid.any().item()):
-            return
-        invalid_values = target_bins[invalid]
-        min_invalid = int(invalid_values.min().item())
-        max_invalid = int(invalid_values.max().item())
-        raise ValueError(
-            f"{head_name} targets contain out-of-range labels on active cells; expected [0, {MINUTIA_XY_BINS - 1}], "
-            f"got min={min_invalid}, max={max_invalid}"
-        )
+    ) -> torch.Tensor:
+        if target_offsets.dim() == 3:
+            target_offsets = target_offsets.unsqueeze(1)
+        if target_offsets.dim() != 4 or target_offsets.shape[1] != 1:
+            raise ValueError(
+                f"expected {head_name} targets with shape [B,1,H,W] or [B,H,W], got {tuple(target_offsets.shape)}"
+            )
+        if target_offsets.shape[-2:] != output_like.shape[-2:]:
+            raise ValueError(
+                f"{head_name} target shape {tuple(target_offsets.shape[-2:])} does not match output shape "
+                f"{tuple(output_like.shape[-2:])}"
+            )
+        return target_offsets.float().to(output_like.device)
 
-    def _gaussian_soft_targets_from_bins(self, target_bins: torch.Tensor) -> torch.Tensor:
-        # Ordered (non-circular) bin smoothing over 8 x/y bins.
-        bin_positions = torch.arange(
-            MINUTIA_XY_BINS,
-            device=target_bins.device,
-            dtype=torch.float32,
-        ).view(1, MINUTIA_XY_BINS, 1, 1)
-        centers = target_bins.float().unsqueeze(1)
-        weights = torch.exp(-0.5 * ((bin_positions - centers) / self.xy_soft_target_sigma).pow(2))
-        return weights / weights.sum(dim=1, keepdim=True).clamp_min(1e-8)
-
-    def _compute_xy_soft_ce_loss(
+    def _compute_xy_offset_loss(
         self,
         logits: torch.Tensor,
-        target_bins: torch.Tensor,
+        target_offsets: torch.Tensor,
         minutia_mask: torch.Tensor,
         head_name: str,
     ) -> torch.Tensor:
-        if logits.dim() != 4 or logits.shape[1] != MINUTIA_XY_BINS:
+        if logits.dim() != 4 or logits.shape[1] != 1:
             raise ValueError(
-                f"expected {head_name} logits with shape [B,{MINUTIA_XY_BINS},H,W], got {tuple(logits.shape)}"
+                f"expected {head_name} logits with shape [B,1,H,W], got {tuple(logits.shape)}"
             )
-        target_bins = self._ensure_xy_target_bins(target_bins, head_name=head_name)
-        active_mask = (minutia_mask > 0.5).squeeze(1)
-        self._validate_xy_bins_on_active_cells(target_bins, active_mask, head_name=head_name)
-
-        soft_targets = self._gaussian_soft_targets_from_bins(target_bins).to(dtype=logits.dtype)
-        log_probs = F.log_softmax(logits, dim=1)
-        soft_ce_map = -(soft_targets * log_probs).sum(dim=1, keepdim=True)
-        return (soft_ce_map * minutia_mask).sum() / (minutia_mask.sum() + 1e-8)
+        target_offsets = self._resolve_offset_target(target_offsets, output_like=logits, head_name=head_name)
+        active_mask = minutia_mask > 0.5
+        invalid = ((target_offsets < 0.0) | (target_offsets > 1.0)) & active_mask
+        if bool(invalid.any().item()):
+            invalid_values = target_offsets[invalid]
+            min_invalid = float(invalid_values.min().item())
+            max_invalid = float(invalid_values.max().item())
+            raise ValueError(
+                f"{head_name} offsets contain out-of-range values on active cells; expected [0,1], "
+                f"got min={min_invalid:.6f}, max={max_invalid:.6f}"
+            )
+        pred_offsets = torch.sigmoid(logits)
+        loss_map = F.smooth_l1_loss(pred_offsets, target_offsets, reduction="none")
+        return (loss_map * minutia_mask).sum() / (minutia_mask.sum() + 1e-8)
 
     def forward(self, outputs, targets):
         mask = targets["mask"]
@@ -340,18 +321,18 @@ class FeatureNetLoss(nn.Module):
             score_mask,
         )
 
-        # --- M2: x (Gaussian soft-target CE over ordered 8 bins)
-        L_m2 = self._compute_xy_soft_ce_loss(
+        # --- M2: x offset regression (continuous within-cell target)
+        L_m2 = self._compute_xy_offset_loss(
             outputs["minutia_x"],
-            targets["minutia_x"],
+            targets["minutia_x_offset"],
             minutia_mask=minutia_mask,
             head_name="minutia_x",
         )
 
-        # --- M3: y (Gaussian soft-target CE over ordered 8 bins)
-        L_m3 = self._compute_xy_soft_ce_loss(
+        # --- M3: y offset regression (continuous within-cell target)
+        L_m3 = self._compute_xy_offset_loss(
             outputs["minutia_y"],
-            targets["minutia_y"],
+            targets["minutia_y_offset"],
             minutia_mask=minutia_mask,
             head_name="minutia_y",
         )

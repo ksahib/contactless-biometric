@@ -25,6 +25,7 @@ PAPER_DISTANCE_THRESHOLD_PIXELS = 8.0
 PAPER_ANGLE_THRESHOLD_DEGREES = 15.0
 MINUTIA_SUBCELL_BINS = 8
 MINUTIA_ORIENTATION_BINS = 360
+MINUTIA_OFFSET_TOLERANCE_CELL = 0.125
 POSE_SPLITS = ("all", "front", "side")
 
 
@@ -84,14 +85,15 @@ def _split_keys_for_raw_view(raw_view_index: int) -> tuple[str, ...]:
 
 def _decode_minutia_points(
     score_map: torch.Tensor,
-    x_bins: torch.Tensor,
-    y_bins: torch.Tensor,
+    x_offsets: torch.Tensor,
+    y_offsets: torch.Tensor,
     orientation_degrees_map: torch.Tensor,
     eval_mask: torch.Tensor,
     threshold: float,
     apply_nms: bool,
     input_shape_hw: tuple[int, int],
     output_shape_hw: tuple[int, int],
+    offsets_are_logits: bool,
     inclusive_threshold: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if inclusive_threshold:
@@ -113,10 +115,15 @@ def _decode_minutia_points(
 
     rows = indices[:, 0]
     cols = indices[:, 1]
-    x_labels = x_bins.long().clamp(0, MINUTIA_SUBCELL_BINS - 1)
-    y_labels = y_bins.long().clamp(0, MINUTIA_SUBCELL_BINS - 1)
-    sub_x = (x_labels[rows, cols].float() + 0.5) / float(MINUTIA_SUBCELL_BINS)
-    sub_y = (y_labels[rows, cols].float() + 0.5) / float(MINUTIA_SUBCELL_BINS)
+    if x_offsets.dim() == 3 and x_offsets.shape[0] == 1:
+        x_offsets = x_offsets.squeeze(0)
+    if y_offsets.dim() == 3 and y_offsets.shape[0] == 1:
+        y_offsets = y_offsets.squeeze(0)
+    if offsets_are_logits:
+        x_offsets = torch.sigmoid(x_offsets)
+        y_offsets = torch.sigmoid(y_offsets)
+    sub_x = x_offsets[rows, cols].float().clamp(0.0, 1.0 - 1e-6)
+    sub_y = y_offsets[rows, cols].float().clamp(0.0, 1.0 - 1e-6)
     x_out = cols.float() + sub_x
     y_out = rows.float() + sub_y
 
@@ -160,6 +167,31 @@ def _resolve_target_orientation_degrees(targets: dict[str, torch.Tensor]) -> tor
     if "minutia_orientation" in targets:
         return _orientation_bins_to_degrees(targets["minutia_orientation"])
     raise KeyError("missing minutia orientation targets: expected minutia_orientation_vec or minutia_orientation")
+
+
+def _resolve_target_offsets(targets: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+    x_offset = targets.get("minutia_x_offset")
+    y_offset = targets.get("minutia_y_offset")
+    if x_offset is not None and y_offset is not None:
+        if x_offset.dim() == 4 and x_offset.shape[1] == 1:
+            x_offset = x_offset.squeeze(1)
+        if y_offset.dim() == 4 and y_offset.shape[1] == 1:
+            y_offset = y_offset.squeeze(1)
+        return x_offset.float(), y_offset.float()
+
+    x_bins = targets.get("minutia_x")
+    y_bins = targets.get("minutia_y")
+    if x_bins is None or y_bins is None:
+        raise KeyError(
+            "missing minutia x/y targets: expected minutia_x_offset/minutia_y_offset or fallback minutia_x/minutia_y"
+        )
+    if x_bins.dim() == 4 and x_bins.shape[1] == 1:
+        x_bins = x_bins.squeeze(1)
+    if y_bins.dim() == 4 and y_bins.shape[1] == 1:
+        y_bins = y_bins.squeeze(1)
+    x_offset = (x_bins.float().clamp(0, MINUTIA_SUBCELL_BINS - 1) + 0.5) / float(MINUTIA_SUBCELL_BINS)
+    y_offset = (y_bins.float().clamp(0, MINUTIA_SUBCELL_BINS - 1) + 0.5) / float(MINUTIA_SUBCELL_BINS)
+    return x_offset, y_offset
 
 
 def _max_bipartite_match_count(adjacency: list[list[int]], right_size: int) -> int:
@@ -234,11 +266,16 @@ def compute_validation_metrics(
     channels_last: bool = False,
 ) -> dict[str, Any]:
     score_stats = _init_score_stats(score_thresholds)
-    argmax_stats = {
+    label_stats = {
         "minutia_x": {"correct": 0, "total": 0},
         "minutia_y": {"correct": 0, "total": 0},
         "minutia_orientation": {"correct": 0, "total": 0},
     }
+    x_abs_error_sum_cell = 0.0
+    y_abs_error_sum_cell = 0.0
+    x_abs_error_sum_px = 0.0
+    y_abs_error_sum_px = 0.0
+    xy_error_count = 0
     orientation_abs_error_sum = 0.0
     orientation_error_count = 0
 
@@ -265,11 +302,14 @@ def compute_validation_metrics(
         if pred_score.dim() == 4:
             pred_score = pred_score.squeeze(1)
 
-        pred_x_bins = outputs["minutia_x"].argmax(dim=1)
-        pred_y_bins = outputs["minutia_y"].argmax(dim=1)
+        pred_x_offsets = torch.sigmoid(outputs["minutia_x"])
+        pred_y_offsets = torch.sigmoid(outputs["minutia_y"])
+        if pred_x_offsets.dim() == 4 and pred_x_offsets.shape[1] == 1:
+            pred_x_offsets = pred_x_offsets.squeeze(1)
+        if pred_y_offsets.dim() == 4 and pred_y_offsets.shape[1] == 1:
+            pred_y_offsets = pred_y_offsets.squeeze(1)
         pred_ori_degrees = _orientation_vectors_to_degrees(outputs["minutia_orientation"])
-        gt_x_bins = targets["minutia_x"]
-        gt_y_bins = targets["minutia_y"]
+        gt_x_offsets, gt_y_offsets = _resolve_target_offsets(targets)
         gt_ori_degrees = _resolve_target_orientation_degrees(targets)
 
         raw_view_tensor = targets.get("raw_view_index")
@@ -294,14 +334,15 @@ def compute_validation_metrics(
 
             gt_points, gt_angles = _decode_minutia_points(
                 score_map=gt_score[sample_index].float(),
-                x_bins=gt_x_bins[sample_index],
-                y_bins=gt_y_bins[sample_index],
+                x_offsets=gt_x_offsets[sample_index],
+                y_offsets=gt_y_offsets[sample_index],
                 orientation_degrees_map=gt_ori_degrees[sample_index],
                 eval_mask=sample_eval_mask,
                 threshold=target_threshold,
                 apply_nms=False,
                 input_shape_hw=sample_input_shape_hw,
                 output_shape_hw=sample_output_shape_hw,
+                offsets_are_logits=False,
                 inclusive_threshold=False,
             )
 
@@ -309,14 +350,15 @@ def compute_validation_metrics(
                 key = f"{threshold:.2f}"
                 pred_points, pred_angles = _decode_minutia_points(
                     score_map=pred_score[sample_index],
-                    x_bins=pred_x_bins[sample_index],
-                    y_bins=pred_y_bins[sample_index],
+                    x_offsets=pred_x_offsets[sample_index],
+                    y_offsets=pred_y_offsets[sample_index],
                     orientation_degrees_map=pred_ori_degrees[sample_index],
                     eval_mask=sample_eval_mask,
                     threshold=threshold,
                     apply_nms=True,
                     input_shape_hw=sample_input_shape_hw,
                     output_shape_hw=sample_output_shape_hw,
+                    offsets_are_logits=False,
                     inclusive_threshold=True,
                 )
                 tp = _count_valid_matches(pred_points, pred_angles, gt_points, gt_angles)
@@ -329,18 +371,45 @@ def compute_validation_metrics(
                     stats["fn"] += fn
 
         positive_mask = targets["minutia_valid_mask"] > 0.5
-        for head_name in ("minutia_x", "minutia_y"):
-            pred_label = outputs[head_name].argmax(dim=1)
-            target_label = targets[head_name]
-            active = positive_mask.squeeze(1) if positive_mask.dim() == 4 else positive_mask
-            stats = argmax_stats[head_name]
-            stats["correct"] += int(((pred_label == target_label) & active).sum().item())
-            stats["total"] += int(active.sum().item())
+        active = positive_mask.squeeze(1) if positive_mask.dim() == 4 else positive_mask
+        x_error_cell = torch.abs(pred_x_offsets - gt_x_offsets)
+        y_error_cell = torch.abs(pred_y_offsets - gt_y_offsets)
+        active_count = int(active.sum().item())
+        if active_count > 0:
+            label_stats["minutia_x"]["correct"] += int((x_error_cell[active] < MINUTIA_OFFSET_TOLERANCE_CELL).sum().item())
+            label_stats["minutia_y"]["correct"] += int((y_error_cell[active] < MINUTIA_OFFSET_TOLERANCE_CELL).sum().item())
+            label_stats["minutia_x"]["total"] += active_count
+            label_stats["minutia_y"]["total"] += active_count
+            x_abs_error_sum_cell += float(x_error_cell[active].sum().item())
+            y_abs_error_sum_cell += float(y_error_cell[active].sum().item())
+            xy_error_count += active_count
+
+            for sample_index in range(active.shape[0]):
+                sample_active = active[sample_index]
+                sample_count = int(sample_active.sum().item())
+                if sample_count == 0:
+                    continue
+                fallback_output_shape = (int(sample_active.shape[0]), int(sample_active.shape[1]))
+                sample_output_shape_hw = _resolve_hw_for_sample(
+                    output_shape_hw_tensor,
+                    sample_index,
+                    fallback_output_shape,
+                )
+                sample_input_shape_hw = _resolve_hw_for_sample(
+                    input_shape_hw_tensor,
+                    sample_index,
+                    sample_output_shape_hw,
+                )
+                scale_x = float(sample_input_shape_hw[1]) / max(float(sample_output_shape_hw[1]), 1.0)
+                scale_y = float(sample_input_shape_hw[0]) / max(float(sample_output_shape_hw[0]), 1.0)
+                x_abs_error_sum_px += float((x_error_cell[sample_index][sample_active] * scale_x).sum().item())
+                y_abs_error_sum_px += float((y_error_cell[sample_index][sample_active] * scale_y).sum().item())
+
         active = positive_mask.squeeze(1) if positive_mask.dim() == 4 else positive_mask
         diff = torch.abs(pred_ori_degrees - gt_ori_degrees)
         diff = torch.minimum(diff, 360.0 - diff)
         active_diff = diff[active]
-        stats = argmax_stats["minutia_orientation"]
+        stats = label_stats["minutia_orientation"]
         stats["correct"] += int((active_diff < PAPER_ANGLE_THRESHOLD_DEGREES).sum().item())
         stats["total"] += int(active.sum().item())
         orientation_abs_error_sum += float(active_diff.sum().item())
@@ -360,7 +429,7 @@ def compute_validation_metrics(
             best_threshold = key
 
     label_metrics = {}
-    for head_name, stats in argmax_stats.items():
+    for head_name, stats in label_stats.items():
         total = stats["total"]
         label_metrics[head_name] = {
             "correct": stats["correct"],
@@ -373,6 +442,10 @@ def compute_validation_metrics(
         "best_score_threshold": best_threshold,
         "best_score_f1": best_f1,
         "label_accuracy": label_metrics,
+        "minutia_x_mae_cell": (x_abs_error_sum_cell / xy_error_count) if xy_error_count > 0 else 0.0,
+        "minutia_y_mae_cell": (y_abs_error_sum_cell / xy_error_count) if xy_error_count > 0 else 0.0,
+        "minutia_x_mae_px": (x_abs_error_sum_px / xy_error_count) if xy_error_count > 0 else 0.0,
+        "minutia_y_mae_px": (y_abs_error_sum_px / xy_error_count) if xy_error_count > 0 else 0.0,
         "orientation_mae_deg": (orientation_abs_error_sum / orientation_error_count) if orientation_error_count > 0 else 0.0,
     }
 
@@ -385,7 +458,8 @@ def _load_checkpoint(path: Path, device: torch.device) -> tuple[FeatureExtractor
     except RuntimeError as exc:
         raise RuntimeError(
             "checkpoint is incompatible with the current FeatureExtractor architecture. "
-            "This branch expects minutia_orientation to output 2 channels (cos/sin). "
+            "This branch expects minutia_orientation to output 2 channels (cos/sin) and minutia_x/minutia_y "
+            "to output 1 channel each (continuous offsets). "
             "Start a new training run with the updated model."
         ) from exc
     model.eval()

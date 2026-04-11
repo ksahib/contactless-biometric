@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import random
 import time
@@ -37,6 +38,8 @@ FLOAT_TARGET_KEYS = {
     "gradient",
     "minutia_score",
     "minutia_valid_mask",
+    "minutia_x_offset",
+    "minutia_y_offset",
     "minutia_orientation_vec",
 }
 LONG_TARGET_KEYS = {"minutia_x", "minutia_y", "minutia_orientation"}
@@ -349,6 +352,8 @@ def build_pseudo_targets(
     mask_labels = resized_mask.squeeze(1).long()
     minutia_x = minutia_x * mask_labels
     minutia_y = minutia_y * mask_labels
+    minutia_x_offset = ((minutia_x.float() + 0.5) / 8.0).unsqueeze(1) * resized_mask
+    minutia_y_offset = ((minutia_y.float() + 0.5) / 8.0).unsqueeze(1) * resized_mask
 
     return {
         "mask": resized_mask,
@@ -358,6 +363,8 @@ def build_pseudo_targets(
         "minutia_valid_mask": minutia_score,
         "minutia_x": minutia_x,
         "minutia_y": minutia_y,
+        "minutia_x_offset": minutia_x_offset,
+        "minutia_y_offset": minutia_y_offset,
         "minutia_orientation": minutia_orientation,
     }
 
@@ -648,6 +655,86 @@ def _infer_output_shape_from_targets(targets: Mapping[str, Any]) -> tuple[int, i
     return None
 
 
+def _resolve_output_mask_from_targets(targets: Mapping[str, Any], output_shape_hw: tuple[int, int]) -> np.ndarray:
+    mask_value = targets.get("mask", targets.get("minutia_valid_mask"))
+    if mask_value is None:
+        return np.ones(output_shape_hw, dtype=np.float32)
+    mask_array = np.asarray(mask_value, dtype=np.float32)
+    if mask_array.ndim == 3 and mask_array.shape[0] == 1:
+        mask_array = mask_array[0]
+    elif mask_array.ndim != 2:
+        mask_array = np.asarray(mask_array).reshape(output_shape_hw)
+    return np.where(mask_array > 0.0, 1.0, 0.0).astype(np.float32)
+
+
+def _recover_offset_maps_from_minutiae(
+    minutiae_path: Path,
+    input_shape_hw: tuple[int, int],
+    output_shape_hw: tuple[int, int],
+    output_mask: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    if not minutiae_path.exists():
+        raise FileNotFoundError(f"missing minutiae.json required for offset recovery: {minutiae_path}")
+    rows = json.loads(minutiae_path.read_text(encoding="utf-8"))
+    if not isinstance(rows, list):
+        raise ValueError(f"invalid minutiae payload in {minutiae_path}: expected a list")
+
+    target_height, target_width = int(output_shape_hw[0]), int(output_shape_hw[1])
+    source_height, source_width = int(input_shape_hw[0]), int(input_shape_hw[1])
+    if target_height <= 0 or target_width <= 0:
+        raise ValueError(f"invalid output shape for offset recovery: {output_shape_hw}")
+    if source_height <= 0 or source_width <= 0:
+        raise ValueError(f"invalid input shape for offset recovery: {input_shape_hw}")
+
+    x_offset = np.zeros((target_height, target_width), dtype=np.float32)
+    y_offset = np.zeros((target_height, target_width), dtype=np.float32)
+    ownership = np.full((target_height, target_width), -1.0, dtype=np.float32)
+    center_distance = np.full((target_height, target_width), np.inf, dtype=np.float32)
+    cell_width = float(source_width) / float(max(target_width, 1))
+    cell_height = float(source_height) / float(max(target_height, 1))
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        x_value = row.get("x")
+        y_value = row.get("y")
+        if x_value is None or y_value is None:
+            continue
+        x = float(x_value)
+        y = float(y_value)
+        if not math.isfinite(x) or not math.isfinite(y):
+            continue
+        cell_x = int(np.clip(math.floor(x * target_width / max(source_width, 1)), 0, target_width - 1))
+        cell_y = int(np.clip(math.floor(y * target_height / max(source_height, 1)), 0, target_height - 1))
+        if output_mask[cell_y, cell_x] <= 0.0:
+            continue
+        score = row.get("score")
+        score_value = float(score) if score is not None and math.isfinite(float(score)) else 1.0
+        score_value = float(np.clip(score_value, 0.0, 1.0))
+        cell_origin_x = cell_x * cell_width
+        cell_origin_y = cell_y * cell_height
+        local_x = (x - cell_origin_x) / max(cell_width, 1e-6)
+        local_y = (y - cell_origin_y) / max(cell_height, 1e-6)
+        local_x = float(np.clip(local_x, 0.0, 1.0 - 1e-6))
+        local_y = float(np.clip(local_y, 0.0, 1.0 - 1e-6))
+        distance = float((local_x - 0.5) ** 2 + (local_y - 0.5) ** 2)
+        replace = False
+        if score_value > ownership[cell_y, cell_x]:
+            replace = True
+        elif abs(score_value - ownership[cell_y, cell_x]) <= 1e-6 and distance < center_distance[cell_y, cell_x]:
+            replace = True
+        if not replace:
+            continue
+        ownership[cell_y, cell_x] = score_value
+        center_distance[cell_y, cell_x] = distance
+        x_offset[cell_y, cell_x] = local_x
+        y_offset[cell_y, cell_x] = local_y
+
+    x_offset *= output_mask
+    y_offset *= output_mask
+    return x_offset[np.newaxis, ...].astype(np.float32), y_offset[np.newaxis, ...].astype(np.float32)
+
+
 def load_bundle_samples(
     ground_truth_root: str | Path,
     limit: int | None = None,
@@ -664,6 +751,7 @@ def load_bundle_samples(
 
     samples: list[dict[str, Any]] = []
     missing_gradient_paths: list[Path] = []
+    recovered_offset_paths: list[Path] = []
     for sample_dir in sample_dirs:
         meta_path = sample_dir / "meta.json"
         masked_image_path = sample_dir / "masked_image.png"
@@ -689,7 +777,25 @@ def load_bundle_samples(
         if output_shape_hw is None:
             continue
         if input_shape_hw is None:
-            input_shape_hw = output_shape_hw
+            image_height, image_width = _read_grayscale_image(masked_image_path).shape[-2:]
+            input_shape_hw = (int(image_height), int(image_width))
+        if "minutia_x_offset" not in targets or "minutia_y_offset" not in targets:
+            output_mask = _resolve_output_mask_from_targets(targets, output_shape_hw)
+            minutiae_path = sample_dir / "minutiae.json"
+            try:
+                recovered_x, recovered_y = _recover_offset_maps_from_minutiae(
+                    minutiae_path=minutiae_path,
+                    input_shape_hw=input_shape_hw,
+                    output_shape_hw=output_shape_hw,
+                    output_mask=output_mask,
+                )
+            except Exception as exc:
+                raise ValueError(
+                    f"missing continuous offset targets in {targets_path} and failed recovery from {minutiae_path}: {exc}"
+                ) from exc
+            targets["minutia_x_offset"] = recovered_x
+            targets["minutia_y_offset"] = recovered_y
+            recovered_offset_paths.append(minutiae_path)
         targets["raw_view_index"] = np.int64(meta.get("raw_view_index", -1))
         targets["input_shape_hw"] = np.asarray(input_shape_hw, dtype=np.int64)
         targets["output_shape_hw"] = np.asarray(output_shape_hw, dtype=np.int64)
@@ -714,6 +820,16 @@ def load_bundle_samples(
             "[load_bundle_samples] skipped "
             f"{len(missing_gradient_paths)} samples missing reconstruction-derived gradient target "
             f"(strict mode off). Examples: {preview}{suffix}",
+            flush=True,
+        )
+    if recovered_offset_paths:
+        preview_items = [str(path) for path in recovered_offset_paths[:3]]
+        suffix = " ..." if len(recovered_offset_paths) > 3 else ""
+        preview = ", ".join(preview_items)
+        print(
+            "[load_bundle_samples] recovered "
+            f"{len(recovered_offset_paths)} samples missing continuous x/y offsets from minutiae.json. "
+            f"Examples: {preview}{suffix}",
             flush=True,
         )
 
