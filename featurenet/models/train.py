@@ -876,7 +876,6 @@ def train_model(args: argparse.Namespace) -> dict[str, Any]:
         mu_x=args.mu_x,
         mu_y=args.mu_y,
         mu_ori=args.mu_ori,
-        xy_soft_target_sigma=args.xy_soft_target_sigma,
         m1_focal_gamma=args.m1_focal_gamma,
         m1_pos_weight_max=args.m1_pos_weight_max,
         m1_hard_neg_enable=args.m1_hard_neg_enable,
@@ -1045,7 +1044,6 @@ def train_model(args: argparse.Namespace) -> dict[str, Any]:
         "mu_x": args.mu_x,
         "mu_y": args.mu_y,
         "mu_ori": args.mu_ori,
-        "xy_soft_target_sigma": args.xy_soft_target_sigma,
         "m1_focal_gamma": args.m1_focal_gamma,
         "m1_pos_weight_max": args.m1_pos_weight_max,
         "m1_hard_neg_enable": bool(args.m1_hard_neg_enable),
@@ -1099,7 +1097,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mu-x", type=float, default=20.0)
     parser.add_argument("--mu-y", type=float, default=20.0)
     parser.add_argument("--mu-ori", type=float, default=5.0)
-    parser.add_argument("--xy-soft-target-sigma", type=float, default=1.0)
     parser.add_argument("--m1-focal-gamma", type=float, default=2.0)
     parser.add_argument("--m1-pos-weight-max", type=float, default=100.0)
     parser.add_argument("--m1-hard-neg-enable", action=argparse.BooleanOptionalAction, default=True)
@@ -1122,8 +1119,6 @@ def parse_args() -> argparse.Namespace:
         parser.error("--early-stopping-min-delta must be non-negative")
     if args.mu_score <= 0.0 or args.mu_x <= 0.0 or args.mu_y <= 0.0 or args.mu_ori <= 0.0:
         parser.error("--mu-score, --mu-x, --mu-y, and --mu-ori must be positive")
-    if args.xy_soft_target_sigma <= 0.0:
-        parser.error("--xy-soft-target-sigma must be positive")
     if args.m1_focal_gamma < 0.0:
         parser.error("--m1-focal-gamma must be non-negative")
     if args.m1_pos_weight_max < 1.0:

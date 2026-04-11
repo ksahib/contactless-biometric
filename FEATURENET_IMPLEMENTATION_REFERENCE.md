@@ -251,7 +251,6 @@ Defaults:
 - `beta=60.0` (ridge smoothness)
 - `gamma=300.0` (gradient smoothness)
 - `sigma=0.5` (gradient weighting)
-- `xy_soft_target_sigma=1.0` (Gaussian smoothing for x/y soft targets)
 - minutia weights: `mu_score=120`, `mu_x=20`, `mu_y=20`, `mu_ori=5`
 - M1 focal params:
   - `m1_focal_gamma=2.0`
@@ -331,15 +330,9 @@ Loss = masked binwise BCE-like term + coherence regularizer:
 
 ### M2/M3/M4 (x/y/orientation)
 
-- `M2` and `M3` use masked soft-target cross-entropy over ordered 8 bins:
-  - build Gaussian target distribution from integer labels (`0..7`) with sigma `xy_soft_target_sigma`:
-    - `w_k = exp(-0.5 * ((k - y) / sigma)^2)` (non-circular)
-    - normalized across 8 bins per cell
-  - compute:
-    - `log_probs = log_softmax(logits, dim=1)`
-    - `soft_ce = -(soft_targets * log_probs).sum(dim=1, keepdim=True)`
-  - apply `minutia_mask` and normalize by `minutia_mask.sum()`
-  - active-cell labels are validated to be in `[0,7]`; out-of-range labels raise a `ValueError`
+- CE loss per cell (`reduction='none'`) on:
+  - `minutia_x` (8 classes)
+  - `minutia_y` (8 classes)
 - `M4` is continuous orientation regression:
   - prediction is normalized per-cell to unit vector
   - target vector priority:
@@ -469,7 +462,6 @@ Loss tuning:
 - `--mu-x` (default `20.0`, must be >0)
 - `--mu-y` (default `20.0`, must be >0)
 - `--mu-ori` (default `5.0`, must be >0)
-- `--xy-soft-target-sigma` (default `1.0`, must be >0)
 - `--m1-focal-gamma` (default `2.0`, must be >=0)
 - `--m1-pos-weight-max` (default `100.0`, must be >=1.0)
 - `--m1-hard-neg-enable/--no-m1-hard-neg-enable` (default `True`)
