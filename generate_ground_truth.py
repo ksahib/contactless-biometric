@@ -2147,8 +2147,12 @@ def _reconstruct_multiview_acquisition(sample: RawViewSample, output_root: Path)
     valid_rows = front_geometry.valid_rows & left_geometry.valid_rows & right_geometry.valid_rows
 
     semi_major = 0.5 * front_geometry.widths
-    right_term = np.maximum((0.5 * right_geometry.widths) ** 2 - semi_major**2, 0.0)
-    left_term = np.maximum((0.5 * left_geometry.widths) ** 2 - semi_major**2, 0.0)
+    d_right = 0.5 * right_geometry.widths
+    d_left = 0.5 * left_geometry.widths
+    # Paper Eq. from Algorithm 1 section:
+    # d = sqrt((a^2 + b^2) / 2)  =>  b = sqrt(max(2*d^2 - a^2, 0))
+    right_term = np.maximum(2.0 * d_right**2 - semi_major**2, 0.0)
+    left_term = np.maximum(2.0 * d_left**2 - semi_major**2, 0.0)
     semi_minor_right = np.sqrt(right_term, dtype=np.float32)
     semi_minor_left = np.sqrt(left_term, dtype=np.float32)
     semi_minor = 0.5 * (semi_minor_right + semi_minor_left)
@@ -2310,7 +2314,12 @@ def _reconstruct_multiview_acquisition(sample: RawViewSample, output_root: Path)
             "front_formula": "z_up = (b/a)*sqrt(max(a^2 - x^2, 0)) + c_z",
             "lower_formula": "z_down = -(b/a)*sqrt(max(a^2 - x^2, 0)) + c_z",
             "semi_major": "a = d_front / 2",
-            "semi_minor": "b = (sqrt(max((d_right/2)^2-a^2,0)) + sqrt(max((d_left/2)^2-a^2,0))) / 2",
+            "semi_minor": (
+                "d_right = right_width / 2, d_left = left_width / 2, "
+                "b_right = sqrt(max(2*d_right^2 - a^2, 0)), "
+                "b_left = sqrt(max(2*d_left^2 - a^2, 0)), "
+                "b = 0.5 * (b_right + b_left)"
+            ),
             "center_depth": "c_z = 0.5 * (sqrt(2)/2 * (l_f + l_r) + sqrt(2)/2 * (l_f + l_l))",
             "vanishing_angle": "theta = arctan(b^2 / a^2)",
             "critical_point": "x_crit = a * cos(theta)",
