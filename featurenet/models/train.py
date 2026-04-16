@@ -1212,7 +1212,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mu-score", type=float, default=120.0)
     parser.add_argument("--mu-x", type=float, default=20.0)
     parser.add_argument("--mu-y", type=float, default=20.0)
-    parser.add_argument("--mu-ori", type=float, default=5.0)
+    parser.add_argument("--mu-ori", type=float, default=15.0)
     parser.add_argument("--m1-focal-gamma", type=float, default=2.0)
     parser.add_argument("--m1-pos-weight-max", type=float, default=100.0)
     parser.add_argument("--m1-hard-neg-enable", action=argparse.BooleanOptionalAction, default=True)

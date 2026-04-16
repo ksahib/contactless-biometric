@@ -3,19 +3,46 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import importlib.util
 import math
 import os
 import re
 import shutil
 import subprocess
+import sys
+import sysconfig
 import time
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable
 from urllib import error as urlerror
 from urllib import request as urlrequest
+
+
+def ensure_stdlib_copy_module() -> None:
+    existing = sys.modules.get("copy")
+    repo_root = Path(__file__).resolve().parent
+    if existing is not None:
+        existing_path = getattr(existing, "__file__", None)
+        if existing_path is None:
+            return
+        if Path(existing_path).resolve().parent != repo_root:
+            return
+        del sys.modules["copy"]
+
+    stdlib_copy = Path(sysconfig.get_paths()["stdlib"]) / "copy.py"
+    spec = importlib.util.spec_from_file_location("copy", stdlib_copy)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not resolve stdlib copy module from {stdlib_copy}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["copy"] = module
+    spec.loader.exec_module(module)
+
+
+ensure_stdlib_copy_module()
+
+from dataclasses import asdict, dataclass
 
 import cv2
 import numpy as np
