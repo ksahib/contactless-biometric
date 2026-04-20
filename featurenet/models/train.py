@@ -802,6 +802,7 @@ def load_bundle_samples(
         samples.append(
             {
                 "sample_id": meta["sample_id"],
+                "parent_sample_id": meta.get("parent_sample_id"),
                 "finger_class_id": meta.get("finger_class_id"),
                 "subject_id": meta.get("subject_id"),
                 "finger_id": meta.get("finger_id"),
@@ -838,6 +839,42 @@ def load_bundle_samples(
     return samples
 
 
+def _split_group_key(sample: Mapping[str, Any]) -> Any:
+    finger_class_id = sample.get("finger_class_id")
+    if finger_class_id is not None:
+        return ("finger_class_id", finger_class_id)
+
+    subject_id = sample.get("subject_id")
+    finger_id = sample.get("finger_id")
+    if subject_id is not None and finger_id is not None:
+        return ("subject_finger", subject_id, finger_id)
+
+    parent_sample_id = sample.get("parent_sample_id")
+    if parent_sample_id:
+        return ("parent_sample_id", parent_sample_id)
+
+    return ("sample_id", sample["sample_id"])
+
+
+def _assert_disjoint_split(
+    train_samples: list[dict[str, Any]],
+    val_samples: list[dict[str, Any]],
+) -> None:
+    train_sample_ids = {str(sample["sample_id"]) for sample in train_samples}
+    val_sample_ids = {str(sample["sample_id"]) for sample in val_samples}
+    overlapping_sample_ids = train_sample_ids & val_sample_ids
+    if overlapping_sample_ids:
+        preview = ", ".join(sorted(overlapping_sample_ids)[:3])
+        raise ValueError(f"train/validation split leaked sample_ids across both sets: {preview}")
+
+    train_group_keys = {_split_group_key(sample) for sample in train_samples}
+    val_group_keys = {_split_group_key(sample) for sample in val_samples}
+    overlapping_group_keys = train_group_keys & val_group_keys
+    if overlapping_group_keys:
+        preview = ", ".join(str(key) for key in sorted(overlapping_group_keys, key=str)[:3])
+        raise ValueError(f"train/validation split leaked grouping identities across both sets: {preview}")
+
+
 def split_samples(
     samples: list[dict[str, Any]],
     val_fraction: float,
@@ -850,10 +887,7 @@ def split_samples(
 
     groups: dict[Any, list[dict[str, Any]]] = defaultdict(list)
     for sample in samples:
-        group_key = sample.get("finger_class_id")
-        if group_key is None:
-            group_key = sample["sample_id"]
-        groups[group_key].append(sample)
+        groups[_split_group_key(sample)].append(sample)
 
     group_keys = list(groups.keys())
     rng = random.Random(seed)
@@ -867,6 +901,7 @@ def split_samples(
 
     if not train_samples or not val_samples:
         raise ValueError("split produced an empty train or validation set; reduce val_fraction or add more samples")
+    _assert_disjoint_split(train_samples, val_samples)
     return train_samples, val_samples
 
 
