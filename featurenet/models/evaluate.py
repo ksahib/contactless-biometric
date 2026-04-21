@@ -1,10 +1,26 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
+import sys
+import sysconfig
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
+
+
+def ensure_stdlib_copy_module() -> None:
+    stdlib_copy = Path(sysconfig.get_paths()["stdlib"]) / "copy.py"
+    spec = importlib.util.spec_from_file_location("copy", stdlib_copy)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not resolve stdlib copy module from {stdlib_copy}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["copy"] = module
+    spec.loader.exec_module(module)
+
+
+ensure_stdlib_copy_module()
 
 import torch
 
