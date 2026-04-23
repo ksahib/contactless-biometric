@@ -47,6 +47,7 @@ from dataclasses import asdict, dataclass
 import cv2
 import numpy as np
 import pyfing
+from center_unwarping import run_center_unwarping
 
 try:
     from rembg import new_session, remove
@@ -109,6 +110,7 @@ _FINGERFLOW_EXTRACTOR_CLASS = None
 _GENERATOR_RUNTIME: "GeneratorRuntimeConfig | None" = None
 _SELECTED_REMBG_PROVIDERS: list[str] | None = None
 _SELECTED_FINGERFLOW_DEVICE: str = "cpu"
+_RECONSTRUCTION_MINUTIAE_CACHE: dict[str, dict[str, Any]] = {}
 _PIPELINE_STAGE_TOTALS: dict[str, float] = {
     "load_input": 0.0,
     "rembg": 0.0,
@@ -176,10 +178,14 @@ class AcquisitionReconstructionResult:
     depth_left_path: str
     depth_right_path: str
     depth_gradient_labels_path: str
+    reconstruction_maps_path: str
     support_mask_path: str
     row_measurements_path: str
     meta_path: str
     preview_path: str
+    center_unwarp_maps_path: str
+    center_unwarped_image_path: str
+    center_unwarped_mask_path: str
     surface_front_3d_html_path: str
     surface_front_3d_png_path: str
     surface_all_branches_3d_html_path: str
@@ -420,6 +426,10 @@ def _to_uint8_image(image: np.ndarray) -> np.ndarray:
     if array.max(initial=0.0) <= 1.0:
         array = array * 255.0
     return np.clip(array, 0.0, 255.0).astype(np.uint8)
+
+
+def _save_uint8_png(path: Path, image: np.ndarray) -> None:
+    cv2.imwrite(str(path), _to_uint8_image(image))
 
 
 def _resize_float(array: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
@@ -2086,6 +2096,309 @@ def _load_reconstruction_gradient_for_sample(
     return np.transpose(gradient, (1, 2, 0)).astype(np.float32)
 
 
+def _view_role_for_sample(sample: RawViewSample) -> str | None:
+    return {0: "front", 1: "left", 2: "right"}.get(sample.raw_view_index)
+
+
+def _load_npz_arrays(path: Path) -> dict[str, np.ndarray]:
+    with np.load(path) as data:
+        return {key: data[key] for key in data.files}
+
+
+def _build_inverse_unwarp_maps(
+    x_out: np.ndarray,
+    y_out: np.ndarray,
+    valid_mask: np.ndarray,
+    output_shape: tuple[int, int] | list[int],
+) -> dict[str, np.ndarray]:
+    height_out, width_out = int(output_shape[0]), int(output_shape[1])
+    source_x_map = np.full((height_out, width_out), np.nan, dtype=np.float32)
+    source_y_map = np.full((height_out, width_out), np.nan, dtype=np.float32)
+    best_dist = np.full((height_out, width_out), np.inf, dtype=np.float32)
+    valid = np.asarray(valid_mask, dtype=bool) & np.isfinite(x_out) & np.isfinite(y_out)
+    src_y, src_x = np.nonzero(valid)
+    sample_x = x_out[valid].astype(np.float32)
+    sample_y = y_out[valid].astype(np.float32)
+    base_x = np.floor(sample_x).astype(np.int32)
+    base_y = np.floor(sample_y).astype(np.int32)
+
+    for off_x in (0, 1):
+        for off_y in (0, 1):
+            tx = base_x + off_x
+            ty = base_y + off_y
+            inside = (tx >= 0) & (tx < width_out) & (ty >= 0) & (ty < height_out)
+            if not np.any(inside):
+                continue
+            tx_inside = tx[inside]
+            ty_inside = ty[inside]
+            dist = ((sample_x[inside] - tx_inside.astype(np.float32)) ** 2) + (
+                (sample_y[inside] - ty_inside.astype(np.float32)) ** 2
+            )
+            replace = dist < best_dist[ty_inside, tx_inside]
+            if not np.any(replace):
+                continue
+            best_ty = ty_inside[replace]
+            best_tx = tx_inside[replace]
+            best_dist[best_ty, best_tx] = dist[replace]
+            source_x_map[best_ty, best_tx] = src_x[inside][replace].astype(np.float32)
+            source_y_map[best_ty, best_tx] = src_y[inside][replace].astype(np.float32)
+
+    valid_inverse = np.isfinite(source_x_map) & np.isfinite(source_y_map)
+    return {
+        "source_x_map": source_x_map.astype(np.float32),
+        "source_y_map": source_y_map.astype(np.float32),
+        "source_valid_mask": valid_inverse.astype(np.uint8),
+    }
+
+
+def _sample_1d_linear(values: np.ndarray, position: float) -> float | None:
+    if values.ndim != 1 or values.size == 0 or not math.isfinite(position):
+        return None
+    if position < 0.0 or position > float(values.size - 1):
+        return None
+    low = int(math.floor(position))
+    high = int(math.ceil(position))
+    if low == high:
+        value = float(values[low])
+        return value if math.isfinite(value) else None
+    weight = float(position - low)
+    v0 = float(values[low])
+    v1 = float(values[high])
+    if not (math.isfinite(v0) and math.isfinite(v1)):
+        return None
+    return ((1.0 - weight) * v0) + (weight * v1)
+
+
+def _sample_2d_bilinear(array: np.ndarray, x: float, y: float, valid_mask: np.ndarray | None = None) -> float | None:
+    if array.ndim != 2 or not math.isfinite(x) or not math.isfinite(y):
+        return None
+    height, width = array.shape
+    if x < 0.0 or y < 0.0 or x > float(width - 1) or y > float(height - 1):
+        return None
+    x0 = int(math.floor(x))
+    y0 = int(math.floor(y))
+    x1 = min(x0 + 1, width - 1)
+    y1 = min(y0 + 1, height - 1)
+    samples: list[tuple[float, float]] = []
+    for yy in (y0, y1):
+        for xx in (x0, x1):
+            if valid_mask is not None and valid_mask[yy, xx] <= 0:
+                continue
+            value = float(array[yy, xx])
+            if not math.isfinite(value):
+                continue
+            weight_x = 1.0 - abs(float(xx) - x)
+            weight_y = 1.0 - abs(float(yy) - y)
+            weight = max(weight_x, 0.0) * max(weight_y, 0.0)
+            if weight > 0.0:
+                samples.append((weight, value))
+    if not samples:
+        return None
+    weight_sum = sum(weight for weight, _ in samples)
+    if weight_sum <= 1e-8:
+        return None
+    return sum(weight * value for weight, value in samples) / weight_sum
+
+
+def _map_unwarped_to_front_source(unwarp_maps: dict[str, np.ndarray], x: float, y: float) -> tuple[float, float] | None:
+    valid_mask = unwarp_maps["source_valid_mask"]
+    source_x = _sample_2d_bilinear(unwarp_maps["source_x_map"], x, y, valid_mask=valid_mask)
+    source_y = _sample_2d_bilinear(unwarp_maps["source_y_map"], x, y, valid_mask=valid_mask)
+    if source_x is None or source_y is None:
+        return None
+    return float(source_x), float(source_y)
+
+
+def _project_front_source_to_pose_frame(
+    reconstruction_maps: dict[str, np.ndarray],
+    role: str,
+    x_front: float,
+    y_front: float,
+) -> tuple[float, float] | None:
+    support_mask = reconstruction_maps["support_mask"]
+    x_relative = _sample_2d_bilinear(reconstruction_maps["x_relative"], x_front, y_front, valid_mask=support_mask)
+    if x_relative is None:
+        return None
+    if role == "front":
+        center = _sample_1d_linear(reconstruction_maps["front_centers"], y_front)
+        if center is None:
+            return None
+        return float(center + x_relative), float(y_front)
+
+    depth_front = _sample_2d_bilinear(reconstruction_maps["depth_front"], x_front, y_front, valid_mask=support_mask)
+    if depth_front is None:
+        return None
+    angle = -45.0 if role == "left" else 45.0
+    theta = math.radians(angle)
+    x_rot = (x_relative * math.cos(theta)) + (depth_front * math.sin(theta))
+    centers_key = "left_centers" if role == "left" else "right_centers"
+    center = _sample_1d_linear(reconstruction_maps[centers_key], y_front)
+    if center is None:
+        return None
+    return float(center + x_rot), float(y_front)
+
+
+def _project_front_source_to_training_frame(
+    reconstruction_maps: dict[str, np.ndarray],
+    role: str,
+    x_front: float,
+    y_front: float,
+    scale_factor: float,
+) -> tuple[float, float] | None:
+    pose_point = _project_front_source_to_pose_frame(reconstruction_maps, role, x_front, y_front)
+    if pose_point is None:
+        return None
+    scale = float(scale_factor) if math.isfinite(float(scale_factor)) and float(scale_factor) > 0.0 else 1.0
+    return float(pose_point[0] * scale), float(pose_point[1] * scale)
+
+
+def _remap_unwarped_minutiae_to_sample(
+    canonical_minutiae: list[dict[str, Any]],
+    unwarp_maps: dict[str, np.ndarray],
+    reconstruction_maps: dict[str, np.ndarray],
+    sample: RawViewSample,
+    preprocessed: PreprocessedContactlessImage,
+) -> list[dict[str, Any]]:
+    role = _view_role_for_sample(sample)
+    if role is None:
+        return []
+
+    remapped: list[dict[str, Any]] = []
+    height, width = preprocessed.preprocessed_gray.shape
+    delta = 4.0
+    for minutia in canonical_minutiae:
+        source_point = _map_unwarped_to_front_source(unwarp_maps, float(minutia["x"]), float(minutia["y"]))
+        if source_point is None:
+            continue
+        destination = _project_front_source_to_training_frame(
+            reconstruction_maps,
+            role,
+            source_point[0],
+            source_point[1],
+            preprocessed.ridge_scale_factor,
+        )
+        if destination is None:
+            continue
+        x_dst, y_dst = destination
+        if x_dst < 0.0 or y_dst < 0.0 or x_dst >= float(width) or y_dst >= float(height):
+            continue
+
+        theta = float(minutia["theta"])
+        dx = math.cos(theta) * delta
+        dy = math.sin(theta) * delta
+        forward = _map_unwarped_to_front_source(unwarp_maps, float(minutia["x"]) + dx, float(minutia["y"]) + dy)
+        backward = _map_unwarped_to_front_source(unwarp_maps, float(minutia["x"]) - dx, float(minutia["y"]) - dy)
+
+        projected_points: list[tuple[float, float]] = []
+        for candidate in (forward, backward):
+            if candidate is None:
+                continue
+            projected = _project_front_source_to_training_frame(
+                reconstruction_maps,
+                role,
+                candidate[0],
+                candidate[1],
+                preprocessed.ridge_scale_factor,
+            )
+            if projected is not None:
+                projected_points.append(projected)
+
+        if len(projected_points) == 2:
+            theta_dst = math.atan2(
+                float(projected_points[0][1] - projected_points[1][1]),
+                float(projected_points[0][0] - projected_points[1][0]),
+            )
+        elif len(projected_points) == 1:
+            theta_dst = math.atan2(
+                float(projected_points[0][1] - y_dst),
+                float(projected_points[0][0] - x_dst),
+            )
+        else:
+            theta_dst = theta
+
+        remapped.append(
+            {
+                "x": float(x_dst),
+                "y": float(y_dst),
+                "theta": _normalize_angle_2pi_scalar(theta_dst),
+                "score": minutia.get("score"),
+                "type": minutia.get("type"),
+                "source": str(minutia.get("source", "reconstruction_unwarp")),
+            }
+        )
+    return remapped
+
+
+def _write_minutiae_json(path: Path, minutiae: list[dict[str, Any]]) -> None:
+    path.write_text(json.dumps(minutiae, indent=2), encoding="utf-8")
+
+
+def _load_or_extract_canonical_reconstruction_minutiae(
+    reconstruction: AcquisitionReconstructionResult,
+    fingerflow_model_dir: Path,
+    fingerflow_backend: FingerflowBackendConfig,
+) -> tuple[list[dict[str, Any]], str, dict[str, Any]]:
+    cache_key = reconstruction.acquisition_id
+    cached = _RECONSTRUCTION_MINUTIAE_CACHE.get(cache_key)
+    if cached is not None:
+        return (
+            list(cached["minutiae"]),
+            str(cached["source"]),
+            dict(cached["details"]),
+        )
+
+    reconstruction_dir = Path(reconstruction.reconstruction_dir)
+    unwarped_path = Path(reconstruction.center_unwarped_image_path)
+    enhanced_path = reconstruction_dir / "center_unwarped_enhanced.png"
+    canonical_json_path = reconstruction_dir / "canonical_unwarped_minutiae.json"
+    canonical_gray = _require_grayscale(unwarped_path)
+    enhanced = _enhance_for_minutiae(canonical_gray)
+    _save_uint8_png(enhanced_path, enhanced)
+
+    minutiae_source = f"fingerflow_{fingerflow_backend.backend}_reconstruction_unwarp"
+    try:
+        if fingerflow_backend.backend == "wsl":
+            minutiae = _extract_fingerflow_minutiae_wsl(
+                unwarped_path,
+                enhanced_path,
+                reconstruction_dir,
+                fingerflow_model_dir,
+                backend=fingerflow_backend,
+            )
+        else:
+            minutiae = _extract_fingerflow_minutiae(
+                unwarped_path,
+                enhanced_path,
+                reconstruction_dir,
+                fingerflow_model_dir,
+            )
+    except Exception:
+        minutiae_source = "pyfing_fallback_reconstruction_unwarp"
+        fallback_started_at = time.perf_counter()
+        minutiae = _extract_pyfing_minutiae(enhanced)
+        _record_stage_time("pyfing_fallback", time.perf_counter() - fallback_started_at)
+
+    canonical_minutiae = [
+        {
+            **item,
+            "source": minutiae_source,
+        }
+        for item in minutiae
+    ]
+    _write_minutiae_json(canonical_json_path, canonical_minutiae)
+    details = {
+        "canonical_unwarped_minutiae_path": str(canonical_json_path.resolve()),
+        "center_unwarped_enhanced_path": str(enhanced_path.resolve()),
+        "canonical_minutiae_count": len(canonical_minutiae),
+    }
+    _RECONSTRUCTION_MINUTIAE_CACHE[cache_key] = {
+        "minutiae": canonical_minutiae,
+        "source": minutiae_source,
+        "details": details,
+    }
+    return canonical_minutiae, minutiae_source, details
+
+
 def _write_reconstruction_preview(
     reconstruction_dir: Path,
     view_geometries: dict[str, ReconstructionViewGeometry],
@@ -2254,6 +2567,10 @@ def _reconstruct_multiview_acquisition(sample: RawViewSample, output_root: Path)
     debug_views_dir = reconstruction_dir / "debug_views"
     debug_views_dir.mkdir(parents=True, exist_ok=True)
 
+    front_centers = _interpolate_row_centers(front_geometry, front_geometry.centers.astype(np.float32))
+    left_centers = _interpolate_row_centers(left_geometry, front_centers)
+    right_centers = _interpolate_row_centers(right_geometry, front_centers)
+
     debug_view_paths: dict[str, dict[str, str]] = {}
     for role, raw_path in triplet_paths.items():
         # The reconstruction geometry is derived from the pose-normalized mask,
@@ -2275,7 +2592,58 @@ def _reconstruct_multiview_acquisition(sample: RawViewSample, output_root: Path)
     np.save(reconstruction_dir / "depth_left.npy", depth_left)
     np.save(reconstruction_dir / "depth_right.npy", depth_right)
     _save_npz(reconstruction_dir / "depth_gradient_labels.npz", depth_gradient_labels)
+    _save_npz(
+        reconstruction_dir / "reconstruction_maps.npz",
+        {
+            "support_mask": (support_mask > 0).astype(np.uint8),
+            "x_relative": x_relative_masked.astype(np.float32),
+            "depth_front": depth_front.astype(np.float32),
+            "depth_left": depth_left.astype(np.float32),
+            "depth_right": depth_right.astype(np.float32),
+            "stitched_left": stitched_left.astype(np.float32),
+            "stitched_right": stitched_right.astype(np.float32),
+            "front_centers": front_centers.astype(np.float32),
+            "left_centers": left_centers.astype(np.float32),
+            "right_centers": right_centers.astype(np.float32),
+            "x_crit": x_crit.astype(np.float32),
+        },
+    )
     cv2.imwrite(str(reconstruction_dir / "support_mask.png"), support_mask)
+    front_gradient = depth_gradient_labels["gradient_front"]
+    unwarp = run_center_unwarping(
+        image=preprocessed_views["front"].pose_normalized_gray,
+        mask=support_mask,
+        gradient_x=np.nan_to_num(front_gradient[0], nan=0.0),
+        gradient_y=np.nan_to_num(front_gradient[1], nan=0.0),
+    )
+    center_unwarped_image_path = reconstruction_dir / "center_unwarped.png"
+    center_unwarped_mask_path = reconstruction_dir / "center_unwarped_mask.png"
+    center_unwarp_maps_path = reconstruction_dir / "center_unwarp_maps.npz"
+    _save_uint8_png(center_unwarped_image_path, unwarp["unwarped_image"])
+    cv2.imwrite(str(center_unwarped_mask_path), _to_uint8_mask(unwarp["unwarped_mask"]))
+    inverse_unwarp = _build_inverse_unwarp_maps(
+        unwarp["x_out"],
+        unwarp["y_out"],
+        unwarp["valid_mask"],
+        unwarp["output_shape"],
+    )
+    _save_npz(
+        center_unwarp_maps_path,
+        {
+            "u": unwarp["u"].astype(np.float32),
+            "v": unwarp["v"].astype(np.float32),
+            "x_new": unwarp["x_new"].astype(np.float32),
+            "y_new": unwarp["y_new"].astype(np.float32),
+            "x_out": unwarp["x_out"].astype(np.float32),
+            "y_out": unwarp["y_out"].astype(np.float32),
+            "center_point": np.asarray(unwarp["center_point"], dtype=np.int32),
+            "valid_mask": unwarp["valid_mask"].astype(np.uint8),
+            "unwarped_mask": unwarp["unwarped_mask"].astype(np.uint8),
+            "output_offset_x": np.asarray(unwarp["output_offset_x"], dtype=np.int32),
+            "output_offset_y": np.asarray(unwarp["output_offset_y"], dtype=np.int32),
+            **inverse_unwarp,
+        },
+    )
     _write_row_measurements(
         reconstruction_dir,
         valid_rows=valid_rows,
@@ -2358,9 +2726,13 @@ def _reconstruct_multiview_acquisition(sample: RawViewSample, output_root: Path)
             "depth_left": "depth_left.npy",
             "depth_right": "depth_right.npy",
             "depth_gradient_labels": "depth_gradient_labels.npz",
+            "reconstruction_maps": "reconstruction_maps.npz",
             "support_mask": "support_mask.png",
             "row_measurements": "row_measurements.json",
             "preview": "preview.png",
+            "center_unwarped": "center_unwarped.png",
+            "center_unwarped_mask": "center_unwarped_mask.png",
+            "center_unwarp_maps": "center_unwarp_maps.npz",
             "surface_front_3d_html": "surface_front_3d.html",
             "surface_front_3d_png": "surface_front_3d.png",
             "surface_all_branches_3d_html": "surface_all_branches_3d.html",
@@ -2391,7 +2763,12 @@ def _reconstruct_multiview_acquisition(sample: RawViewSample, output_root: Path)
             "support_pixels": int(np.count_nonzero(support_mask)),
         },
         "shape": list(depth_front.shape),
-        "version": 1,
+        "center_unwarping": {
+            "center_point": [int(unwarp["center_point"][0]), int(unwarp["center_point"][1])],
+            "output_shape": list(unwarp["output_shape"]),
+            "warnings": list(unwarp["warnings"]),
+        },
+        "version": 2,
     }
     (reconstruction_dir / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
@@ -2402,10 +2779,14 @@ def _reconstruct_multiview_acquisition(sample: RawViewSample, output_root: Path)
         depth_left_path=str((reconstruction_dir / "depth_left.npy").resolve()),
         depth_right_path=str((reconstruction_dir / "depth_right.npy").resolve()),
         depth_gradient_labels_path=str((reconstruction_dir / "depth_gradient_labels.npz").resolve()),
+        reconstruction_maps_path=str((reconstruction_dir / "reconstruction_maps.npz").resolve()),
         support_mask_path=str((reconstruction_dir / "support_mask.png").resolve()),
         row_measurements_path=str((reconstruction_dir / "row_measurements.json").resolve()),
         meta_path=str((reconstruction_dir / "meta.json").resolve()),
         preview_path=str((reconstruction_dir / "preview.png").resolve()),
+        center_unwarp_maps_path=str(center_unwarp_maps_path.resolve()),
+        center_unwarped_image_path=str(center_unwarped_image_path.resolve()),
+        center_unwarped_mask_path=str(center_unwarped_mask_path.resolve()),
         surface_front_3d_html_path=str(surface_front_3d_html_path.resolve()),
         surface_front_3d_png_path=str(surface_front_3d_png_path.resolve()),
         surface_all_branches_3d_html_path=str(surface_all_branches_3d_html_path.resolve()),
@@ -3112,6 +3493,7 @@ def _build_bundle_meta(
     featurenet_targets: dict[str, np.ndarray],
     minutiae: list[dict[str, Any]],
     minutiae_source: str,
+    minutiae_ground_truth_details: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     sample = prepared.sample
     meta = {
@@ -3167,6 +3549,7 @@ def _build_bundle_meta(
             "gradient_visualization": "cv2.Sobel on masked grayscale preprocessed raw image for preview/debug only",
             "enhancement": "fingerprint_enhancer.enhance_fingerprint",
             "minutiae": minutiae_source,
+            "minutiae_ground_truth_pipeline": "reconstruction_unwarp_reproject" if minutiae_ground_truth_details and minutiae_ground_truth_details.get("mode") == "reconstruction_backed" else "direct_per_sample_extraction",
             "featurenet_adapter": "dense orientation/ridge/gradient resize plus paper-style minutiae heatmap and precise subcell labels",
             "minutiae_targets": "binary score heatmap with continuous x/y offsets plus legacy 8-bin x/y labels, legacy 360-bin orientation labels, and optional cos/sin orientation vectors",
         },
@@ -3180,7 +3563,7 @@ def _build_bundle_meta(
             "minutiae": len(minutiae),
             "minutia_support_pixels": int(np.count_nonzero(featurenet_targets["minutia_valid_mask"])),
         },
-        "version": 1,
+        "version": 2,
     }
     if prepared.reconstruction is not None and sample.raw_view_index in {0, 1, 2}:
         role = {0: "front", 1: "left", 2: "right"}[sample.raw_view_index]
@@ -3192,8 +3575,12 @@ def _build_bundle_meta(
             "depth_left_path": prepared.reconstruction.depth_left_path,
             "depth_right_path": prepared.reconstruction.depth_right_path,
             "depth_gradient_labels_path": prepared.reconstruction.depth_gradient_labels_path,
+            "reconstruction_maps_path": prepared.reconstruction.reconstruction_maps_path,
             "support_mask_path": prepared.reconstruction.support_mask_path,
             "preview_path": prepared.reconstruction.preview_path,
+            "center_unwarp_maps_path": prepared.reconstruction.center_unwarp_maps_path,
+            "center_unwarped_image_path": prepared.reconstruction.center_unwarped_image_path,
+            "center_unwarped_mask_path": prepared.reconstruction.center_unwarped_mask_path,
             "surface_front_3d_html_path": prepared.reconstruction.surface_front_3d_html_path,
             "surface_front_3d_png_path": prepared.reconstruction.surface_front_3d_png_path,
             "surface_all_branches_3d_html_path": prepared.reconstruction.surface_all_branches_3d_html_path,
@@ -3201,6 +3588,8 @@ def _build_bundle_meta(
             "reprojection_report_path": prepared.reconstruction.reprojection_report_path,
             "reprojection_preview_path": prepared.reconstruction.reprojection_preview_path,
         }
+    if minutiae_ground_truth_details is not None:
+        meta["minutiae_ground_truth"] = minutiae_ground_truth_details
     return meta
 
 
@@ -3247,28 +3636,100 @@ def _generate_bundle_from_loaded(
     prepared.bundle_dir.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(str(minutiae_enhanced_path), prepared.enhanced_image)
 
+    minutiae_ground_truth_details: dict[str, Any] | None = None
     minutiae_source = f"fingerflow_{fingerflow_backend.backend}"
-    try:
-        if fingerflow_backend.backend == "wsl":
-            minutiae = _extract_fingerflow_minutiae_wsl(
-                prepared.image_path,
-                minutiae_enhanced_path,
-                prepared.bundle_dir,
+    minutiae: list[dict[str, Any]]
+    reconstruction = prepared.reconstruction
+    role = _view_role_for_sample(prepared.sample)
+
+    if reconstruction is not None and role is not None:
+        try:
+            canonical_minutiae, canonical_source, canonical_details = _load_or_extract_canonical_reconstruction_minutiae(
+                reconstruction,
                 fingerflow_model_dir,
-                backend=fingerflow_backend,
+                fingerflow_backend,
             )
+            unwarp_maps = _load_npz_arrays(Path(reconstruction.center_unwarp_maps_path))
+            reconstruction_maps = _load_npz_arrays(Path(reconstruction.reconstruction_maps_path))
+            minutiae = _remap_unwarped_minutiae_to_sample(
+                canonical_minutiae,
+                unwarp_maps,
+                reconstruction_maps,
+                prepared.sample,
+                prepared.preprocessed,
+            )
+            minutiae_source = f"{canonical_source}_reprojected_{role}"
+            minutiae_ground_truth_details = {
+                "mode": "reconstruction_backed",
+                "canonical_source": canonical_source,
+                "view_role": role,
+                "center_unwarped_image_path": reconstruction.center_unwarped_image_path,
+                "center_unwarped_mask_path": reconstruction.center_unwarped_mask_path,
+                "center_unwarp_maps_path": reconstruction.center_unwarp_maps_path,
+                "reconstruction_maps_path": reconstruction.reconstruction_maps_path,
+                **canonical_details,
+                "canonical_minutiae_count": len(canonical_minutiae),
+                "reprojected_minutiae_count": len(minutiae),
+            }
+        except Exception as exc:
+            minutiae_ground_truth_details = {
+                "mode": "direct_fallback_after_reconstruction_failure",
+                "view_role": role,
+                "reason": str(exc),
+            }
+            minutiae = []
+        if minutiae:
+            pass
         else:
-            minutiae = _extract_fingerflow_minutiae(
-                prepared.image_path,
-                minutiae_enhanced_path,
-                prepared.bundle_dir,
-                fingerflow_model_dir,
-            )
-    except Exception:
-        minutiae_source = "pyfing_fallback"
-        fallback_started_at = time.perf_counter()
-        minutiae = _extract_pyfing_minutiae(prepared.enhanced_image)
-        _record_stage_time("pyfing_fallback", time.perf_counter() - fallback_started_at)
+            minutiae_source = f"fingerflow_{fingerflow_backend.backend}"
+            try:
+                if fingerflow_backend.backend == "wsl":
+                    minutiae = _extract_fingerflow_minutiae_wsl(
+                        prepared.image_path,
+                        minutiae_enhanced_path,
+                        prepared.bundle_dir,
+                        fingerflow_model_dir,
+                        backend=fingerflow_backend,
+                    )
+                else:
+                    minutiae = _extract_fingerflow_minutiae(
+                        prepared.image_path,
+                        minutiae_enhanced_path,
+                        prepared.bundle_dir,
+                        fingerflow_model_dir,
+                    )
+            except Exception:
+                minutiae_source = "pyfing_fallback"
+                fallback_started_at = time.perf_counter()
+                minutiae = _extract_pyfing_minutiae(prepared.enhanced_image)
+                _record_stage_time("pyfing_fallback", time.perf_counter() - fallback_started_at)
+            if minutiae_ground_truth_details is None:
+                minutiae_ground_truth_details = {"mode": "direct_per_sample"}
+            minutiae_ground_truth_details["fallback_minutiae_count"] = len(minutiae)
+            minutiae_ground_truth_details["fallback_source"] = minutiae_source
+    else:
+        try:
+            if fingerflow_backend.backend == "wsl":
+                minutiae = _extract_fingerflow_minutiae_wsl(
+                    prepared.image_path,
+                    minutiae_enhanced_path,
+                    prepared.bundle_dir,
+                    fingerflow_model_dir,
+                    backend=fingerflow_backend,
+                )
+            else:
+                minutiae = _extract_fingerflow_minutiae(
+                    prepared.image_path,
+                    minutiae_enhanced_path,
+                    prepared.bundle_dir,
+                    fingerflow_model_dir,
+                )
+        except Exception:
+            minutiae_source = "pyfing_fallback"
+            fallback_started_at = time.perf_counter()
+            minutiae = _extract_pyfing_minutiae(prepared.enhanced_image)
+            _record_stage_time("pyfing_fallback", time.perf_counter() - fallback_started_at)
+        minutiae_ground_truth_details = {"mode": "direct_per_sample", "source": minutiae_source}
 
     postprocess_started_at = time.perf_counter()
     featurenet_targets = _build_featurenet_targets(
@@ -3280,7 +3741,13 @@ def _generate_bundle_from_loaded(
         minutiae=minutiae,
     )
 
-    meta = _build_bundle_meta(prepared, featurenet_targets, minutiae, minutiae_source)
+    meta = _build_bundle_meta(
+        prepared,
+        featurenet_targets,
+        minutiae,
+        minutiae_source,
+        minutiae_ground_truth_details=minutiae_ground_truth_details,
+    )
     write_payload = BundleWritePayload(
         bundle_dir=prepared.bundle_dir,
         preprocessed=prepared.preprocessed,
@@ -3302,6 +3769,7 @@ def _generate_bundle_from_loaded(
         "bundle_dir": str(prepared.bundle_dir.resolve()),
         "minutiae_count": len(minutiae),
         "raw_view_index": prepared.sample.raw_view_index,
+        "minutiae_source": minutiae_source,
         "mask_source": prepared.preprocessed.mask_source,
         "pose_rotation_degrees": prepared.preprocessed.pose_rotation_degrees,
         "ridge_scale_factor": prepared.preprocessed.ridge_scale_factor,
@@ -3933,8 +4401,12 @@ def _rewrite_merged_bundle_meta(
         reconstruction["depth_left_path"] = str((reconstruction_root / "depth_left.npy").resolve())
         reconstruction["depth_right_path"] = str((reconstruction_root / "depth_right.npy").resolve())
         reconstruction["depth_gradient_labels_path"] = str((reconstruction_root / "depth_gradient_labels.npz").resolve())
+        reconstruction["reconstruction_maps_path"] = str((reconstruction_root / "reconstruction_maps.npz").resolve())
         reconstruction["support_mask_path"] = str((reconstruction_root / "support_mask.png").resolve())
         reconstruction["preview_path"] = str((reconstruction_root / "preview.png").resolve())
+        reconstruction["center_unwarp_maps_path"] = str((reconstruction_root / "center_unwarp_maps.npz").resolve())
+        reconstruction["center_unwarped_image_path"] = str((reconstruction_root / "center_unwarped.png").resolve())
+        reconstruction["center_unwarped_mask_path"] = str((reconstruction_root / "center_unwarped_mask.png").resolve())
         reconstruction["surface_front_3d_html_path"] = str((reconstruction_root / "surface_front_3d.html").resolve())
         reconstruction["surface_front_3d_png_path"] = str((reconstruction_root / "surface_front_3d.png").resolve())
         reconstruction["surface_all_branches_3d_html_path"] = str((reconstruction_root / "surface_all_branches_3d.html").resolve())
@@ -3942,6 +4414,19 @@ def _rewrite_merged_bundle_meta(
         reconstruction["reprojection_report_path"] = str((reconstruction_root / "reprojection_report.json").resolve())
         reconstruction["reprojection_preview_path"] = str((reconstruction_root / "reprojection_preview.png").resolve())
         meta["multiview_reconstruction"] = reconstruction
+        if "minutiae_ground_truth" in meta and isinstance(meta["minutiae_ground_truth"], dict):
+            minutiae_gt = dict(meta["minutiae_ground_truth"])
+            for key, filename in (
+                ("center_unwarped_image_path", "center_unwarped.png"),
+                ("center_unwarped_mask_path", "center_unwarped_mask.png"),
+                ("center_unwarp_maps_path", "center_unwarp_maps.npz"),
+                ("reconstruction_maps_path", "reconstruction_maps.npz"),
+                ("canonical_unwarped_minutiae_path", "canonical_unwarped_minutiae.json"),
+                ("center_unwarped_enhanced_path", "center_unwarped_enhanced.png"),
+            ):
+                if key in minutiae_gt:
+                    minutiae_gt[key] = str((reconstruction_root / filename).resolve())
+            meta["minutiae_ground_truth"] = minutiae_gt
 
     meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
     return meta

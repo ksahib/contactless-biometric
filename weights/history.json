@@ -1,0 +1,2441 @@
+{
+  "device": "cuda",
+  "sample_count": 9399,
+  "train_sample_count": 7530,
+  "val_sample_count": 1869,
+  "epochs": 80,
+  "epochs_requested": 80,
+  "epochs_ran": 52,
+  "batch_size": 2,
+  "lr": 0.001,
+  "amp": true,
+  "channels_last": true,
+  "compile": false,
+  "grad_accum_steps": 3,
+  "pin_memory": true,
+  "persistent_workers": true,
+  "prefetch_factor": 2,
+  "adam_beta1": 0.9,
+  "adam_beta2": 0.999,
+  "weight_decay": 0.0,
+  "seed": 13,
+  "strict_gradient_targets": false,
+  "mu_score": 120.0,
+  "mu_x": 20.0,
+  "mu_y": 20.0,
+  "mu_ori": 15.0,
+  "m1_focal_gamma": 2.0,
+  "m1_pos_weight_max": 100.0,
+  "m1_hard_neg_enable": true,
+  "m1_hard_neg_ratio": 20.0,
+  "m1_hard_neg_min": 2000,
+  "m1_hard_neg_fraction": 0.05,
+  "validate_every": 1,
+  "early_stopping": {
+    "configured": true,
+    "enabled": true,
+    "metric": "val_total",
+    "mode": "min",
+    "patience": 8,
+    "min_delta": 0.0001,
+    "validation_checks": 52,
+    "best_value": 19.302652364108653,
+    "disabled_reason": null
+  },
+  "stop_reason": "early_stopping_plateau",
+  "wall_seconds": 17275.311,
+  "history": [
+    {
+      "epoch": 1,
+      "train": {
+        "total": 60.60649398155263,
+        "orientation": 5.127068450061449,
+        "ridge": 0.050979838191048,
+        "gradient": 0.7673966222649234,
+        "minutia": 54.66104907001632,
+        "m1": 0.2314308953396036,
+        "m2": 0.04147392317929749,
+        "m3": 0.04139548136863813,
+        "m4": 1.6821302368504751
+      },
+      "seconds": 566.134,
+      "validation_ran": true,
+      "early_stopping": {
+        "enabled": true,
+        "configured": true,
+        "metric": "val_total",
+        "mode": "min",
+        "patience": 8,
+        "min_delta": 0.0001,
+        "validate_every": 1,
+        "checks_run": 1,
+        "patience_counter": 0,
+        "disabled_reason": null
+      },
+      "val": {
+        "total": 52.526421205245235,
+        "orientation": 5.09200912771378,
+        "ridge": 0.023481183575794977,
+        "gradient": 0.28215868308104297,
+        "minutia": 47.12877227660807,
+        "m1": 0.22284566411838175,
+        "m2": 0.04064499449164154,
+        "m3": 0.040501498231753946,
+        "m4": 1.2509575172541614
+      },
+      "monitor": {
+        "name": "val_total",
+        "mode": "min",
+        "value": 52.526421205245235,
+        "best_value": 52.526421205245235,
+        "improved": true
+      }
+    },
+    {
+      "epoch": 2,
+      "train": {
+        "total": 43.78975418921644,
+        "orientation": 5.086426026191053,
+        "ridge": 0.023012696289931082,
+        "gradient": 0.27487014906696117,
+        "minutia": 38.405445337992106,
+        "m1": 0.20510279645680748,
+        "m2": 0.034854601687723266,
+        "m3": 0.03573975412949306,
+        "m4": 0.8254148409918327
+      },
+      "seconds": 294.955,
+      "validation_ran": true,
+      "early_stopping": {
+        "enabled": true,
+        "configured": true,
+        "metric": "val_total",
+        "mode": "min",
+        "patience": 8,
+        "min_delta": 0.0001,
+        "validate_every": 1,
+        "checks_run": 2,
+        "patience_counter": 0,
+        "disabled_reason": null
+      },
+      "val": {
+        "total": 35.98761974477513,
+        "orientation": 5.1235127311339355,
+        "ridge": 0.024199724027060252,
+        "gradient": 0.27220620093020526,
+        "minutia": 30.567701076568767,
+        "m1": 0.18017933631644528,
+        "m2": 0.027985938933284524,
+        "m3": 0.029381988840028246,
+        "m4": 0.5199214773621151
+      },
+      "monitor": {
+        "name": "val_total",
+        "mode": "min",
+        "value": 35.98761974477513,
+        "best_value": 35.98761974477513,
+        "improved": true
+      }
+    },
+    {
+      "epoch": 3,
+      "train": {
+        "total": 33.35501291039456,
+        "orientation": 5.0738588772605295,
+        "ridge": 0.023108977807876203,
+        "gradient": 0.27277653572331384,
+        "minutia": 27.98526849810029,
+        "m1": 0.17088461787418857,
+        "m2": 0.02574438452794851,
+        "m3": 0.026465674294566966,
+        "m4": 0.4289942104616765
+      },
+      "seconds": 292.996,
+      "validation_ran": true,
+      "early_stopping": {
+        "enabled": true,
+        "configured": true,
+        "metric": "val_total",
+        "mode": "min",
+        "patience": 8,
+        "min_delta": 0.0001,
+        "validate_every": 1,
+        "checks_run": 3,
+        "patience_counter": 0,
+        "disabled_reason": null
+      },
+      "val": {
+        "total": 35.716382486679976,
+        "orientation": 5.076803264005936,
+        "ridge": 0.022948196421770806,
+        "gradient": 0.2694089762826654,
+        "minutia": 30.347222070132986,
+        "m1": 0.17699632386472774,
+        "m2": 0.028439667508165466,
+        "m3": 0.02851402421387281,
+        "m4": 0.5312392922964964
+      },
+      "monitor": {
+        "name": "val_total",
+        "mode": "min",
+        "value": 35.716382486679976,
+        "best_value": 35.716382486679976,
+        "improved": true
+      }
+    },
+    {
+      "epoch": 4,
+      "train": {
+        "total": 30.107295116612004,
+        "orientation": 5.051737798637603,
+        "ridge": 0.023056902033171726,
+        "gradient": 0.27258749993278053,
+        "minutia": 24.759912920441444,
+        "m1": 0.15715548496441062,
+        "m2": 0.021813396827267066,
+        "m3": 0.021136098166007505,
+        "m4": 0.33615098806570565
+      },
+      "seconds": 294.46,
+      "validation_ran": true,
+      "early_stopping": {
+        "enabled": true,
+        "configured": true,
+        "metric": "val_total",
+        "mode": "min",
+        "patience": 8,
+        "min_delta": 0.0001,
+        "validate_every": 1,
+        "checks_run": 4,
+        "patience_counter": 0,
+        "disabled_reason": null
+      },
+      "val": {
+        "total": 28.812737730097645,
+        "orientation": 4.873711143840443,
+        "ridge": 0.02227405750536345,
+        "gradient": 0.26959976883017445,
+        "minutia": 23.647152781869,
+        "m1": 0.1522151605649428,
+        "m2": 0.020398105681938603,
+        "m3": 0.0198824597353285,
+        "m4": 0.3050481480650883
+      },
+      "monitor": {
+        "name": "val_total",
+        "mode": "min",
+        "value": 28.812737730097645,
+        "best_value": 28.812737730097645,
+        "improved": true
+      }
+    },
+    {
+      "epoch": 5,
+      "train": {
+        "total": 28.950329974859677,
+        "orientation": 4.829668419547923,
+        "ridge": 0.02266663755345867,
+        "gradient": 0.2726166152839325,
+        "minutia": 23.825378296131472,
+        "m1": 0.15306601028736053,
+        "m2": 0.020395342118117915,
+        "m3": 0.01965681214286274,
+        "m4": 0.31042759855949426
+      },
+      "seconds": 294.362,
+      "validation_ran": true,
+      "early_stopping": {
+        "enabled": true,
+        "configured": true,
+        "metric": "val_total",
+        "mode": "min",
+        "patience": 8,
+        "min_delta": 0.0001,
+        "validate_every": 1,
+        "checks_run": 5,
+        "patience_counter": 0,
+        "disabled_reason": null
+      },
+      "val": {
+        "total": 27.721503619841712,
+        "orientation": 4.723016946456012,
+        "ridge": 0.021977396601223373,
+        "gradient": 0.26946837757041747,
+        "minutia": 22.707040849471475,
+        "m1": 0.1475720515624087,
+        "m2": 0.018796074766924676,
+        "m3": 0.01858968043570372,
+        "m4": 0.2833786403531219
+      },
+      "monitor": {
+        "name": "val_total",
+        "mode": "min",
+        "value": 27.721503619841712,
+        "best_value": 27.721503619841712,
+        "improved": true
+      }
+    },
+    {
+      "epoch": 6,
+      "train": {
+        "total": 27.331974030807515,
+        "orientation": 4.550776653999034,
+        "ridge": 0.021456859309775422,
+        "gradient": 0.2724415484850467,
+        "minutia": 22.487298963174403,
+        "m1": 0.1484803951029996,
+        "m2": 0.018536693071711508,
+        "m3": 0.018129517954302975,
+        "m4": 0.26242182237599515
+      },
+      "seconds": 295.47,
+      "validation_ran": true,
+      "early_stopping": {
+        "enabled": true,
+        "configured": true,
+        "metric": "val_total",
+        "mode": "min",
+        "patience": 8,
+        "min_delta": 0.0001,
+        "validate_every": 1,
+        "checks_run": 6,
+        "patience_counter": 0,
+        "disabled_reason": null
+      },
+      "val": {
+        "total": 26.128062959150835,
+        "orientation": 4.072916459272252,
+        "ridge": 0.020421459448130373,
+        "gradient": 0.26945665148808995,
+        "minutia": 21.765268405873506,
+        "m1": 0.14540701096548753,
+        "m2": 0.018014779187898265,
+        "m3": 0.017958380428845074,
+        "m4": 0.23979759295695127
+      },
+      "monitor": {
+        "name": "val_total",
+        "mode": "min",
+        "value": 26.128062959150835,
+        "best_value": 26.128062959150835,
+        "improved": true
+      }
+    },
+    {
+      "epoch": 7,
+      "train": {
+        "total": 25.444821508947122,
+        "orientation": 3.872366272975724,
+        "ridge": 0.020848263855058835,
+        "gradient": 0.27470344348772274,
+        "minutia": 21.276903531782498,
+        "m1": 0.14374107452304874,
+        "m2": 0.016980234182416246,
+        "m3": 0.016713324836288315,
+        "m4": 0.22360689391741953
+      },
+      "seconds": 295.29,
+      "validation_ran": true,
+      "early_stopping": {
+        "enabled": true,
+        "configured": true,
+        "metric": "val_total",
+        "mode": "min",
+        "patience": 8,
+        "min_delta": 0.0001,
+        "validate_every": 1,
+        "checks_run": 7,
+        "patience_counter": 0,
+        "disabled_reason": null
+      },
+      "val": {
+        "total": 24.68135041629567,
+        "orientation": 3.7668686963657643,
+        "ridge": 0.020259452693881515,
+        "gradient": 0.26971262644797084,
+        "minutia": 20.624509622706448,
+        "m1": 0.14150030047179543,
+        "m2": 0.016874349854866612,
+        "m3": 0.01684883276329321,
+        "m4": 0.19800065764161276
+      },
+      "monitor": {
+        "name": "val_total",
+        "mode": "min",
+        "value": 24.68135041629567,
+        "best_value": 24.68135041629567,
+        "improved": true
+      }
+    },
+    {
+      "epoch": 8,
+      "train": {
+        "total": 24.908478293602528,
+        "orientation": 3.6750730781757817,
+        "ridge": 0.019774006086477086,
+        "gradient": 0.2722583536983803,
+        "minutia": 20.94137285696083,
+        "m1": 0.14289876545666857,
+        "m2": 0.01654804480153261,
+        "m3": 0.0162212710565384,
+        "m4": 0.209208979109082
+      },
+      "seconds": 295.073,
+      "validation_ran": true,
+      "early_stopping": {
+        "enabled": true,
+        "configured": true,
+        "metric": "val_total",
+        "mode": "min",
+        "patience": 8,
+        "min_delta": 0.0001,
+        "validate_every": 1,
+        "checks_run": 8,
+        "patience_counter": 0,
+        "disabled_reason": null
+      },
+      "val": {
+        "total": 24.128479795404935,
+        "orientation": 3.5754215051783595,
+        "ridge": 0.02080476937447002,
+        "gradient": 0.2694458253801188,
+        "minutia": 20.262807682363746,
+        "m1": 0.13955017930683605,
+        "m2": 0.016490777708928695,
+        "m3": 0.01668924313576464,
+        "m4": 0.19021238388921966
+      },
+      "monitor": {
+        "name": "val_total",
+        "mode": "min",
+        "value": 24.128479795404935,
+        "best_value": 24.128479795404935,
+        "improved": true
+      }
+    },
+    {
+      "epoch": 9,
+      "train": {
+        "total": 23.351903803699994,
+        "orientation": 3.459291524431145,
+        "ridge": 0.019000330800623452,
+        "gradient": 0.2721559595717377,
+        "minutia": 19.601455981671258,
+        "m1": 0.13683837686342548,
+        "m2": 0.015111447613226227,
+        "m3": 0.01469870498342066,
+        "m4": 0.17230984852779138
+      },
+      "seconds": 295.17,
+      "validation_ran": true,
+      "early_stopping": {
+        "enabled": true,
+        "configured": true,
+        "metric": "val_total",
+        "mode": "min",
+        "patience": 8,
+        "min_delta": 0.0001,
+        "validate_every": 1,
+        "checks_run": 9,
+        "patience_counter": 0,
+        "disabled_reason": null
+      },
+      "val": {
+        "total": 22.760535233033533,
+        "orientation": 3.4038201428989674,
+        "ridge": 0.018357967488706748,
+        "gradient": 0.2694470557219842,
+        "minutia": 19.068910025020333,
+        "m1": 0.13395258025291132,
+        "m2": 0.015361118246427672,
+        "m3": 0.015145493836147102,
+        "m4": 0.15896454198375584
+      },
+      "monitor": {
+        "name": "val_total",
+        "mode": "min",
+        "value": 22.760535233033533,
+        "best_value": 22.760535233033533,
+        "improved": true
+      }
+    },
+    {
+      "epoch": 10,
+      "train": {
+        "total": 22.937990554617063,
+        "orientation": 3.343251444207403,
+        "ridge": 0.018370202648518966,
+        "gradient": 0.2723011896192315,
+        "minutia": 19.304067726439214,
+        "m1": 0.13517596569273418,
+        "m2": 0.014635912287030444,
+        "m3": 0.014194931118232093,
+        "m4": 0.16708899750473202
+      },
+      "seconds": 292.788,
+      "validation_ran": true,
+      "early_stopping": {
+        "enabled": true,
+        "configured": true,
+        "metric": "val_total",
+        "mode": "min",
+        "patience": 8,
+        "min_delta": 0.0001,
+        "validate_every": 1,
+        "checks_run": 10,
+        "patience_counter": 0,
+        "disabled_reason": null
+      },
+      "val": {
+        "total": 22.576501437304493,
+        "orientation": 3.195622520650772,
+        "ridge": 0.018029031996181943,
+        "gradient": 0.26945257203623574,
+        "minutia": 19.09339730420852,
+        "m1": 0.1332550149630098,
+        "m2": 0.01502389694080952,
+        "m3": 0.015091251680019865,
+        "m4": 0.16669950441327844
+      },
+      "monitor": {
+        "name": "val_total",
+        "mode": "min",
+        "value": 22.576501437304493,
+        "best_value": 22.576501437304493,
+        "improved": true
+      }
+    },
+    {
+      "epoch": 11,
+      "train": {
+        "total": 22.545335909474893,
+        "orientation": 3.204261400721779,
+        "ridge": 0.017804760460903842,
+        "gradient": 0.2722926835832526,
+        "minutia": 19.050977074672502,
+        "m1": 0.13426512979406363,
+        "m2": 0.014195310422324466,
+        "m3": 0.013836264212035721,
+        "m4": 0.15856866790958807
+      },
+      "seconds": 294.984,
+      "validation_ran": true,
+      "early_stopping": {
+        "enabled": true,
+        "configured": true,
+        "metric": "val_total",
+        "mode": "min",
+        "patience": 8,
+        "min_delta": 0.0001,
+        "validate_every": 1,
+        "checks_run": 11,
+        "patience_counter": 0,
+        "disabled_reason": null
+      },
+      "val": {
+        "total": 21.728208649987206,
+        "orientation": 3.041321332951918,
+        "ridge": 0.017421050958415084,
+        "gradient": 0.26942768255497684,
+        "minutia": 18.400038559551547,
+        "m1": 0.1304094247161386,
+        "m2": 0.01484385757821607,
+        "m3": 0.014597573248360725,
+        "m4": 0.1441386009240274
+      },
+      "monitor": {
+        "name": "val_total",
+        "mode": "min",
+        "value": 21.728208649987206,
+        "best_value": 21.728208649987206,
+        "improved": true
+      }
+    },
+    {
+      "epoch": 12,
+      "train": {
+        "total": 21.872868351980667,
+        "orientation": 3.080865141183415,
+        "ridge": 0.01725420677764799,
+        "gradient": 0.2724833682317974,
+        "minutia": 18.502265641667137,
+        "m1": 0.1313399668362432,
+        "m2": 0.013613394501583173,
+        "m3": 0.013121713167439854,
+        "m4": 0.14711783207188625
+      },
+      "seconds": 295.92,
+      "validation_ran": true,
+      "early_stopping": {
+        "enabled": true,
+        "configured": true,
+        "metric": "val_total",
+        "mode": "min",
+        "patience": 8,
+        "min_delta": 0.0001,
+        "validate_every": 1,
+        "checks_run": 12,
+        "patience_counter": 1,
+        "disabled_reason": null
+      },
+      "val": {
+        "total": 24.229736374023762,
+        "orientation": 3.214416620693105,
+        "ridge": 0.017294417804774434,
+        "gradient": 0.26943563640436385,
+        "minutia": 20.72858967245581,
+        "m1": 0.14183328454108798,
+        "m2": 0.017176857076206788,
+        "m3": 0.017390908424388916,
+        "m4": 0.20114934797383804
+      },
+      "monitor": {
+        "name": "val_total",
+        "mode": "min",
+        "value": 24.229736374023762,
+        "best_value": 21.728208649987206,
+        "improved": false
+      }
+    },
+    {
+      "epoch": 13,
+      "train": {
+        "total": 22.38278019589732,
+        "orientation": 3.0706780631862,
+        "ridge": 0.019460185261005424,
+        "gradient": 0.27344958286480125,
+        "minutia": 19.01919235416934,
+        "m1": 0.13322246170257668,
+        "m2": 0.013884331642651305,
+        "m3": 0.01338174105603322,
+        "m4": 0.16581169907467447
+      },
+      "seconds": 294.766,
+      "validation_ran": true,
+      "early_stopping": {
+        "enabled": true,
+        "configured": true,
+        "metric": "val_total",
+        "mode": "min",
+        "patience": 8,
+        "min_delta": 0.0001,
+        "validate_every": 1,
+        "checks_run": 13,
+        "patience_counter": 2,
+        "disabled_reason": null
+      },
+      "val": {
+        "total": 22.803959803657737,
+        "orientation": 2.9963977163488216,
+        "ridge": 0.01815015022010408,
+        "gradient": 0.26945035232101533,
+        "minutia": 19.51996162638945,
+        "m1": 0.1352146410647242,
+        "m2": 0.015812953299578818,
+        "m3": 0.015513726039465896,
+        "m4": 0.1778447406969088
+      },
+      "monitor": {
+        "name": "val_total",
+        "mode": "min",
+        "value": 22.803959803657737,
+        "best_value": 21.728208649987206,
+        "improved": false
+      }
+    },
+    {
+      "epoch": 14,
+      "train": {
+        "total": 21.694601895863,
+        "orientation": 3.0095137002141987,
+        "ridge": 0.01788136870816726,
+        "gradient": 0.27213968434340136,
+        "minutia": 18.395067137962634,
+        "m1": 0.13009296987715313,
+        "m2": 0.013068007553679,
+        "m3": 0.012508713998021694,
+        "m4": 0.15149175609037735
+      },
+      "seconds": 293.746,
+      "validation_ran": true,
+      "early_stopping": {
+        "enabled": true,
+        "configured": true,
+        "metric": "val_total",
+        "mode": "min",
+        "patience": 8,
+        "min_delta": 0.0001,
+        "validate_every": 1,
+        "checks_run": 14,
+        "patience_counter": 0,
+        "disabled_reason": null
+      },
+      "val": {
+        "total": 21.013984738314214,
+        "orientation": 2.8702788980249414,
+        "ridge": 0.017563874745631917,
+        "gradient": 0.26943831897196285,
+        "minutia": 17.856703626153305,
+        "m1": 0.12710823970921536,
+        "m2": 0.014369289581987629,
+        "m3": 0.014126678911799735,
+        "m4": 0.1355863671331482
+      },
+      "monitor": {
+        "name": "val_total",
+        "mode": "min",
+        "value": 21.013984738314214,
+        "best_value": 21.013984738314214,
+        "improved": true
+      }
+    },
+    {
+      "epoch": 15,
+      "train": {
+        "total": 20.93554197972514,
+        "orientation": 2.9585312415879086,
+        "ridge": 0.01725135533433472,
+        "gradient": 0.27241334551438234,
+        "minutia": 17.68734604264319,
+        "m1": 0.12618408008301718,
+        "m2": 0.01232327859691662,
+        "m3": 0.011682949633217586,
+        "m4": 0.1376754577028606
+      },
+      "seconds": 293.865,
+      "validation_ran": true,
+      "early_stopping": {
+        "enabled": true,
+        "configured": true,
+        "metric": "val_total",
+        "mode": "min",
+        "patience": 8,
+        "min_delta": 0.0001,
+        "validate_every": 1,
+        "checks_run": 15,
+        "patience_counter": 1,
+        "disabled_reason": null
+      },
+      "val": {
+        "total": 21.08258115799032,
+        "orientation": 2.862168237614759,
+        "ridge": 0.017021700373307906,
+        "gradient": 0.2694772162141009,
+        "minutia": 17.93391401015501,
+        "m1": 0.12764073730232245,
+        "m2": 0.014423305567672705,
+        "m3": 0.014370614935688794,
+        "m4": 0.13607647586514288
+      },
+      "monitor": {
+        "name": "val_total",
+        "mode": "min",
+        "value": 21.08258115799032,
+        "best_value": 21.013984738314214,
+        "improved": false
+      }
+    },
+    {
+      "epoch": 16,
+      "train": {
+        "total": 21.723446404759787,
+        "orientation": 3.0513944193978073,
+        "ridge": 0.01702939206227205,
+        "gradient": 0.27238008595241175,
+        "minutia": 18.382642506983174,
+        "m1": 0.12970806631701162,
+        "m2": 0.013018201325666333,
+        "m3": 0.012460708334438433,
+        "m4": 0.15387309096743704
+      },
+      "seconds": 295.052,
+      "validation_ran": true,
+      "early_stopping": {
+        "enabled": true,
+        "configured": true,
+        "metric": "val_total",
+        "mode": "min",
+        "patience": 8,
+        "min_delta": 0.0001,
+        "validate_every": 1,
+        "checks_run": 16,
+        "patience_counter": 2,
+        "disabled_reason": null
+      },
+      "val": {
+        "total": 21.88142888584239,
+        "orientation": 2.9942659755441596,
+        "ridge": 0.017434943335897783,
+        "gradient": 0.26943835165889507,
+        "minutia": 18.600289641599606,
+        "m1": 0.13066160535429888,
+        "m2": 0.015001602240783327,
+        "m3": 0.014908847491690181,
+        "m4": 0.15484586863175911
+      },
+      "monitor": {
+        "name": "val_total",
+        "mode": "min",
+        "value": 21.88142888584239,
+        "best_value": 21.013984738314214,
+        "improved": false
+      }
+    },
+    {
+      "epoch": 17,
+      "train": {
+        "total": 20.93283001695813,
+        "orientation": 2.9251691008627336,
+        "ridge": 0.016542612084968,
+        "gradient": 0.27233209310576895,
+        "minutia": 17.71878621644708,
+        "m1": 0.12616004245293885,
+        "m2": 0.012048778007274486,
+        "m3": 0.011315351164841636,
+        "m4": 0.14081990393156935
+      },
+      "seconds": 294.824,
+      "validation_ran": true,
+      "early_stopping": {
+        "enabled": true,
+        "configured": true,
+        "metric": "val_total",
+        "mode": "min",
+        "patience": 8,
+        "min_delta": 0.0001,
+        "validate_every": 1,
+        "checks_run": 17,
+        "patience_counter": 3,
+        "disabled_reason": null
+      },
+      "val": {
+        "total": 21.073327109392952,
+        "orientation": 2.8737311291822136,
+        "ridge": 0.01635489630149329,
+        "gradient": 0.269543167414831,
+        "minutia": 17.9136979154087,
+        "m1": 0.12623615340593664,
+        "m2": 0.014135032346880532,
+        "m3": 0.01402285027960166,
+        "m4": 0.14681346181700414
+      },
+      "monitor": {
+        "name": "val_total",
+        "mode": "min",
+        "value": 21.073327109392952,
+        "best_value": 21.013984738314214,
+        "improved": false
+      }
+    },
+    {
+      "epoch": 18,
+      "train": {
+        "total": 20.308451414678203,
+        "orientation": 2.8562696597807276,
+        "ridge": 0.01618619196483022,
+        "gradient": 0.2724650974925929,
+        "minutia": 17.163530474734973,
+        "m1": 0.12324155114323969,
+        "m2": 0.011229747470535071,
+        "m3": 0.01052562626527689,
+        "m4": 0.12929579143407463
+      },
+      "seconds": 294.457,
+      "validation_ran": true,
+      "early_stopping": {
+        "enabled": true,
+        "configured": true,
+        "metric": "val_total",
+        "mode": "min",
+        "patience": 8,
+        "min_delta": 0.0001,
+        "validate_every": 1,
+        "checks_run": 18,
+        "patience_counter": 0,
+        "disabled_reason": null
+      },
+      "val": {
+        "total": 20.64153754902396,
+        "orientation": 2.7822725151949386,
+        "ridge": 0.01625073686501081,
+        "gradient": 0.26943553670204895,
+        "minutia": 17.573578801384585,
+        "m1": 0.12463074942084557,
+        "m2": 0.014211177658090457,
+        "m3": 0.014028554675692225,
+        "m4": 0.13687294641071382
+      },
+      "monitor": {
+        "name": "val_total",
+        "mode": "min",
+        "value": 20.64153754902396,
+        "best_value": 20.64153754902396,
+        "improved": true
+      }
+    },
+    {
+      "epoch": 19,
+      "train": {
+        "total": 19.80513184561356,
+        "orientation": 2.8099367377609212,
+        "ridge": 0.015863903128798026,
+        "gradient": 0.271971881450964,
+        "minutia": 16.707359317257744,
+        "m1": 0.12110906929114108,
+        "m2": 0.010683582070658348,
+        "m3": 0.009995063438400587,
+        "m4": 0.11737987443391644
+      },
+      "seconds": 293.66,
+      "validation_ran": true,
+      "early_stopping": {
+        "enabled": true,
+        "configured": true,
+        "metric": "val_total",
+        "mode": "min",
+        "patience": 8,
+        "min_delta": 0.0001,
+        "validate_every": 1,
+        "checks_run": 19,
+        "patience_counter": 0,
+        "disabled_reason": null
+      },
+      "val": {
+        "total": 20.569364779263257,
+        "orientation": 2.7908270448286903,
+        "ridge": 0.01587835896341877,
+        "gradient": 0.269421250074305,
+        "minutia": 17.493238121685497,
+        "m1": 0.12476208992900058,
+        "m2": 0.014236830777543433,
+        "m3": 0.014228785784546545,
+        "m4": 0.1301649975936541
+      },
+      "monitor": {
+        "name": "val_total",
+        "mode": "min",
+        "value": 20.569364779263257,
+        "best_value": 20.569364779263257,
+        "improved": true
+      }
+    },
+    {
+      "epoch": 20,
+      "train": {
+        "total": 19.71888412156428,
+        "orientation": 2.8009166483226844,
+        "ridge": 0.015641734777772885,
+        "gradient": 0.27215651928349477,
+        "minutia": 16.630169227493713,
+        "m1": 0.1205728756607687,
+        "m2": 0.010275903221709558,
+        "m3": 0.009624154368356107,
+        "m4": 0.11756153321493501
+      },
+      "seconds": 294.167,
+      "validation_ran": true,
+      "early_stopping": {
+        "enabled": true,
+        "configured": true,
+        "metric": "val_total",
+        "mode": "min",
+        "patience": 8,
+        "min_delta": 0.0001,
+        "validate_every": 1,
+        "checks_run": 20,
+        "patience_counter": 1,
+        "disabled_reason": null
+      },
+      "val": {
+        "total": 21.561679905366134,
+        "orientation": 2.9205824099760003,
+        "ridge": 0.01646531986142384,
+        "gradient": 0.26946461666873434,
+        "minutia": 18.35516755619151,
+        "m1": 0.12957832424398413,
+        "m2": 0.015328433596215305,
+        "m3": 0.01511702808516628,
+        "m4": 0.14645729668184437
+      },
+      "monitor": {
+        "name": "val_total",
+        "mode": "min",
+        "value": 21.561679905366134,
+        "best_value": 20.569364779263257,
+        "improved": false
+      }
+    },
+    {
+      "epoch": 21,
+      "train": {
+        "total": 19.60018185619339,
+        "orientation": 2.7996822973013242,
+        "ridge": 0.015527033403139824,
+        "gradient": 0.27177681156878136,
+        "minutia": 16.513195705413818,
+        "m1": 0.11984599588777756,
+        "m2": 0.010043834731388456,
+        "m3": 0.009349650872195978,
+        "m4": 0.11625376645868933
+      },
+      "seconds": 292.224,
+      "validation_ran": true,
+      "early_stopping": {
+        "enabled": true,
+        "configured": true,
+        "metric": "val_total",
+        "mode": "min",
+        "patience": 8,
+        "min_delta": 0.0001,
+        "validate_every": 1,
+        "checks_run": 21,
+        "patience_counter": 0,
+        "disabled_reason": null
+      },
+      "val": {
+        "total": 20.238873850980543,
+        "orientation": 2.8076895203819885,
+        "ridge": 0.015557124413908484,
+        "gradient": 0.2694639216530769,
+        "minutia": 17.14616327948749,
+        "m1": 0.12304052183016098,
+        "m2": 0.014151746881030061,
+        "m3": 0.014110738572410561,
+        "m4": 0.12107005996211248
+      },
+      "monitor": {
+        "name": "val_total",
+        "mode": "min",
+        "value": 20.238873850980543,
+        "best_value": 20.238873850980543,
+        "improved": true
+      }
+    },
+    {
+      "epoch": 22,
+      "train": {
+        "total": 19.152976372454113,
+        "orientation": 2.7653859888889873,
+        "ridge": 0.015200923481191772,
+        "gradient": 0.27227944572212526,
+        "minutia": 16.10011001551452,
+        "m1": 0.11780546669307775,
+        "m2": 0.009369185362332767,
+        "m3": 0.008680847335599392,
+        "m4": 0.1068302230673544
+      },
+      "seconds": 294.136,
+      "validation_ran": true,
+      "early_stopping": {
+        "enabled": true,
+        "configured": true,
+        "metric": "val_total",
+        "mode": "min",
+        "patience": 8,
+        "min_delta": 0.0001,
+        "validate_every": 1,
+        "checks_run": 22,
+        "patience_counter": 0,
+        "disabled_reason": null
+      },
+      "val": {
+        "total": 20.1014404817061,
+        "orientation": 2.7111022750324105,
+        "ridge": 0.015366213525680298,
+        "gradient": 0.2694239126568172,
+        "minutia": 17.105548094173166,
+        "m1": 0.12203771772789446,
+        "m2": 0.013828185096104196,
+        "m3": 0.013948242281150212,
+        "m4": 0.12703289836819437
+      },
+      "monitor": {
+        "name": "val_total",
+        "mode": "min",
+        "value": 20.1014404817061,
+        "best_value": 20.1014404817061,
+        "improved": true
+      }
+    },
+    {
+      "epoch": 23,
+      "train": {
+        "total": 19.018922372136615,
+        "orientation": 2.750106327467231,
+        "ridge": 0.0150995272450436,
+        "gradient": 0.27185085957070904,
+        "minutia": 15.981865650597479,
+        "m1": 0.11719101328368127,
+        "m2": 0.009116156454102827,
+        "m3": 0.008433141216888014,
+        "m4": 0.10453054009074689
+      },
+      "seconds": 294.732,
+      "validation_ran": true,
+      "early_stopping": {
+        "enabled": true,
+        "configured": true,
+        "metric": "val_total",
+        "mode": "min",
+        "patience": 8,
+        "min_delta": 0.0001,
+        "validate_every": 1,
+        "checks_run": 23,
+        "patience_counter": 1,
+        "disabled_reason": null
+      },
+      "val": {
+        "total": 20.197442652452438,
+        "orientation": 2.67257588521682,
+        "ridge": 0.015446119098102345,
+        "gradient": 0.26977058688108935,
+        "minutia": 17.239650091895445,
+        "m1": 0.12268596082766425,
+        "m2": 0.014318735988681169,
+        "m3": 0.014126620444663387,
+        "m4": 0.1298951755927746
+      },
+      "monitor": {
+        "name": "val_total",
+        "mode": "min",
+        "value": 20.197442652452438,
+        "best_value": 20.1014404817061,
+        "improved": false
+      }
+    },
+    {
+      "epoch": 24,
+      "train": {
+        "total": 20.22190262590588,
+        "orientation": 2.7902725409068276,
+        "ridge": 0.01719807427584294,
+        "gradient": 1.3545323777008818,
+        "minutia": 16.0598996477773,
+        "m1": 0.1172219277684828,
+        "m2": 0.008996620271225048,
+        "m3": 0.008326856173750553,
+        "m4": 0.10978658571208556
+      },
+      "seconds": 294.515,
+      "validation_ran": true,
+      "early_stopping": {
+        "enabled": true,
+        "configured": true,
+        "metric": "val_total",
+        "mode": "min",
+        "patience": 8,
+        "min_delta": 0.0001,
+        "validate_every": 1,
+        "checks_run": 24,
+        "patience_counter": 2,
+        "disabled_reason": null
+      },
+      "val": {
+        "total": 20.229187297311057,
+        "orientation": 2.711825196245775,
+        "ridge": 0.018193574496769012,
+        "gradient": 0.26943549212606194,
+        "minutia": 17.22973303412371,
+        "m1": 0.12313304204832423,
+        "m2": 0.014405369003587229,
+        "m3": 0.014527406887634393,
+        "m4": 0.1250074955697027
+      },
+      "monitor": {
+        "name": "val_total",
+        "mode": "min",
+        "value": 20.229187297311057,
+        "best_value": 20.1014404817061,
+        "improved": false
+      }
+    },
+    {
+      "epoch": 25,
+      "train": {
+        "total": 18.62447400137406,
+        "orientation": 2.6960740754962127,
+        "ridge": 0.017302865874403186,
+        "gradient": 0.27234203445206917,
+        "minutia": 15.638755033437317,
+        "m1": 0.11529852774879767,
+        "m2": 0.008427032435440877,
+        "m3": 0.007732385295693074,
+        "m4": 0.09864955611779276
+      },
+      "seconds": 291.368,
+      "validation_ran": true,
+      "early_stopping": {
+        "enabled": true,
+        "configured": true,
+        "metric": "val_total",
+        "mode": "min",
+        "patience": 8,
+        "min_delta": 0.0001,
+        "validate_every": 1,
+        "checks_run": 25,
+        "patience_counter": 0,
+        "disabled_reason": null
+      },
+      "val": {
+        "total": 19.710083960466843,
+        "orientation": 2.61562998715569,
+        "ridge": 0.017060328127547382,
+        "gradient": 0.26955757102067457,
+        "minutia": 16.807836079214983,
+        "m1": 0.12068134905660853,
+        "m2": 0.014098818223913484,
+        "m3": 0.01411165467333945,
+        "m4": 0.11745764599331121
+      },
+      "monitor": {
+        "name": "val_total",
+        "mode": "min",
+        "value": 19.710083960466843,
+        "best_value": 19.710083960466843,
+        "improved": true
+      }
+    },
+    {
+      "epoch": 26,
+      "train": {
+        "total": 18.44594238960094,
+        "orientation": 2.668191641545391,
+        "ridge": 0.016264898724517578,
+        "gradient": 0.2721298009889376,
+        "minutia": 15.489356057545736,
+        "m1": 0.11453494624114764,
+        "m2": 0.008181211894846819,
+        "m3": 0.00745445737667174,
+        "m4": 0.09549660772681336
+      },
+      "seconds": 291.603,
+      "validation_ran": true,
+      "early_stopping": {
+        "enabled": true,
+        "configured": true,
+        "metric": "val_total",
+        "mode": "min",
+        "patience": 8,
+        "min_delta": 0.0001,
+        "validate_every": 1,
+        "checks_run": 26,
+        "patience_counter": 1,
+        "disabled_reason": null
+      },
+      "val": {
+        "total": 19.77317411555326,
+        "orientation": 2.6182251004611743,
+        "ridge": 0.016317490841894544,
+        "gradient": 0.26962014623982383,
+        "minutia": 16.869011403660085,
+        "m1": 0.12138513170860031,
+        "m2": 0.014469139864120413,
+        "m3": 0.014398103763653155,
+        "m4": 0.11503004999881122
+      },
+      "monitor": {
+        "name": "val_total",
+        "mode": "min",
+        "value": 19.77317411555326,
+        "best_value": 19.710083960466843,
+        "improved": false
+      }
+    },
+    {
+      "epoch": 27,
+      "train": {
+        "total": 18.321680433721657,
+        "orientation": 2.667077073031371,
+        "ridge": 0.015824572996274724,
+        "gradient": 0.2721080574500133,
+        "minutia": 15.366670725291785,
+        "m1": 0.11383157317362141,
+        "m2": 0.007848440585249805,
+        "m3": 0.007196148691308075,
+        "m4": 0.0937326764783749
+      },
+      "seconds": 294.707,
+      "validation_ran": true,
+      "early_stopping": {
+        "enabled": true,
+        "configured": true,
+        "metric": "val_total",
+        "mode": "min",
+        "patience": 8,
+        "min_delta": 0.0001,
+        "validate_every": 1,
+        "checks_run": 27,
+        "patience_counter": 0,
+        "disabled_reason": null
+      },
+      "val": {
+        "total": 19.66877373680074,
+        "orientation": 2.6075450407629983,
+        "ridge": 0.015900053544079557,
+        "gradient": 0.2695156880958195,
+        "minutia": 16.775812980325465,
+        "m1": 0.12084061924547435,
+        "m2": 0.014033041092851025,
+        "m3": 0.014444180785673347,
+        "m4": 0.11369294910367957
+      },
+      "monitor": {
+        "name": "val_total",
+        "mode": "min",
+        "value": 19.66877373680074,
+        "best_value": 19.66877373680074,
+        "improved": true
+      }
+    },
+    {
+      "epoch": 28,
+      "train": {
+        "total": 18.08966070633644,
+        "orientation": 2.6418074120879966,
+        "ridge": 0.015591104592816289,
+        "gradient": 0.2720440901172747,
+        "minutia": 15.160218084064295,
+        "m1": 0.11271825215740904,
+        "m2": 0.007519212949360568,
+        "m3": 0.0068496493216984936,
+        "m4": 0.08977670520612077
+      },
+      "seconds": 295.015,
+      "validation_ran": true,
+      "early_stopping": {
+        "enabled": true,
+        "configured": true,
+        "metric": "val_total",
+        "mode": "min",
+        "patience": 8,
+        "min_delta": 0.0001,
+        "validate_every": 1,
+        "checks_run": 28,
+        "patience_counter": 1,
+        "disabled_reason": null
+      },
+      "val": {
+        "total": 20.405436378111816,
+        "orientation": 2.64007357786046,
+        "ridge": 0.015636661138764038,
+        "gradient": 0.2694315823801061,
+        "minutia": 17.480294557561212,
+        "m1": 0.12290370928890565,
+        "m2": 0.014662837088705702,
+        "m3": 0.014671902342594882,
+        "m4": 0.14301031207152826
+      },
+      "monitor": {
+        "name": "val_total",
+        "mode": "min",
+        "value": 20.405436378111816,
+        "best_value": 19.66877373680074,
+        "improved": false
+      }
+    },
+    {
+      "epoch": 29,
+      "train": {
+        "total": 18.272903536863694,
+        "orientation": 2.674720470712163,
+        "ridge": 0.01544711647226239,
+        "gradient": 0.27213679212300107,
+        "minutia": 15.31059914996741,
+        "m1": 0.11332603758411262,
+        "m2": 0.0074822548447871905,
+        "m3": 0.0068448620835371106,
+        "m4": 0.09499548670383118
+      },
+      "seconds": 292.192,
+      "validation_ran": true,
+      "early_stopping": {
+        "enabled": true,
+        "configured": true,
+        "metric": "val_total",
+        "mode": "min",
+        "patience": 8,
+        "min_delta": 0.0001,
+        "validate_every": 1,
+        "checks_run": 29,
+        "patience_counter": 0,
+        "disabled_reason": null
+      },
+      "val": {
+        "total": 19.618544239921366,
+        "orientation": 2.610133979027284,
+        "ridge": 0.015624685601435881,
+        "gradient": 0.2695259224284779,
+        "minutia": 16.72325966013944,
+        "m1": 0.12076620296998457,
+        "m2": 0.01431300832322216,
+        "m3": 0.014368697497396067,
+        "m4": 0.11051208427372602
+      },
+      "monitor": {
+        "name": "val_total",
+        "mode": "min",
+        "value": 19.618544239921366,
+        "best_value": 19.618544239921366,
+        "improved": true
+      }
+    },
+    {
+      "epoch": 30,
+      "train": {
+        "total": 17.956232689481332,
+        "orientation": 2.6419103602172527,
+        "ridge": 0.015269683847874206,
+        "gradient": 0.2720078005021312,
+        "minutia": 15.02704485263799,
+        "m1": 0.11205757307915257,
+        "m2": 0.007156203015290626,
+        "m3": 0.006516711011833226,
+        "m4": 0.08711185420295632
+      },
+      "seconds": 293.293,
+      "validation_ran": true,
+      "early_stopping": {
+        "enabled": true,
+        "configured": true,
+        "metric": "val_total",
+        "mode": "min",
+        "patience": 8,
+        "min_delta": 0.0001,
+        "validate_every": 1,
+        "checks_run": 30,
+        "patience_counter": 0,
+        "disabled_reason": null
+      },
+      "val": {
+        "total": 19.466405959307828,
+        "orientation": 2.555998780893132,
+        "ridge": 0.015401480429591661,
+        "gradient": 0.2694235770619489,
+        "minutia": 16.625582134022434,
+        "m1": 0.12017728769603897,
+        "m2": 0.014414846364727472,
+        "m3": 0.01452028972898575,
+        "m4": 0.10837366058476229
+      },
+      "monitor": {
+        "name": "val_total",
+        "mode": "min",
+        "value": 19.466405959307828,
+        "best_value": 19.466405959307828,
+        "improved": true
+      }
+    },
+    {
+      "epoch": 31,
+      "train": {
+        "total": 17.717573468840296,
+        "orientation": 2.6330547651604985,
+        "ridge": 0.015122910373773708,
+        "gradient": 0.27232427282795646,
+        "minutia": 14.797071526440016,
+        "m1": 0.11062381730215799,
+        "m2": 0.006784938825888047,
+        "m3": 0.006092266007951135,
+        "m4": 0.08431129094162537
+      },
+      "seconds": 295.53,
+      "validation_ran": true,
+      "early_stopping": {
+        "enabled": true,
+        "configured": true,
+        "metric": "val_total",
+        "mode": "min",
+        "patience": 8,
+        "min_delta": 0.0001,
+        "validate_every": 1,
+        "checks_run": 31,
+        "patience_counter": 1,
+        "disabled_reason": null
+      },
+      "val": {
+        "total": 19.887063788347703,
+        "orientation": 2.6142174678690293,
+        "ridge": 0.015397762208380164,
+        "gradient": 0.2695273140136571,
+        "minutia": 16.98792125222517,
+        "m1": 0.12210327117121156,
+        "m2": 0.014679896575772268,
+        "m3": 0.01494209206498721,
+        "m4": 0.11620592803913443
+      },
+      "monitor": {
+        "name": "val_total",
+        "mode": "min",
+        "value": 19.887063788347703,
+        "best_value": 19.466405959307828,
+        "improved": false
+      }
+    },
+    {
+      "epoch": 32,
+      "train": {
+        "total": 18.00238852114633,
+        "orientation": 2.6422899076504853,
+        "ridge": 0.015094611828634702,
+        "gradient": 0.2723174789472722,
+        "minutia": 15.072686516747849,
+        "m1": 0.1121454170317566,
+        "m2": 0.007017742778121396,
+        "m3": 0.006349329657513762,
+        "m4": 0.0898596687311032
+      },
+      "seconds": 293.048,
+      "validation_ran": true,
+      "early_stopping": {
+        "enabled": true,
+        "configured": true,
+        "metric": "val_total",
+        "mode": "min",
+        "patience": 8,
+        "min_delta": 0.0001,
+        "validate_every": 1,
+        "checks_run": 32,
+        "patience_counter": 2,
+        "disabled_reason": null
+      },
+      "val": {
+        "total": 20.418570064605877,
+        "orientation": 2.7083489050839673,
+        "ridge": 0.01543316053834191,
+        "gradient": 0.26945945911388347,
+        "minutia": 17.425328536722112,
+        "m1": 0.12340300025786946,
+        "m2": 0.014917138240295138,
+        "m3": 0.014655772018878856,
+        "m4": 0.13503402258035413
+      },
+      "monitor": {
+        "name": "val_total",
+        "mode": "min",
+        "value": 20.418570064605877,
+        "best_value": 19.466405959307828,
+        "improved": false
+      }
+    },
+    {
+      "epoch": 33,
+      "train": {
+        "total": 17.71034319650921,
+        "orientation": 2.606766274947411,
+        "ridge": 0.014932292852931685,
+        "gradient": 0.2721842033078629,
+        "minutia": 14.81646042224737,
+        "m1": 0.1106649396824805,
+        "m2": 0.006525408194937148,
+        "m3": 0.005905327349585811,
+        "m4": 0.08587019688859186
+      },
+      "seconds": 294.761,
+      "validation_ran": true,
+      "early_stopping": {
+        "enabled": true,
+        "configured": true,
+        "metric": "val_total",
+        "mode": "min",
+        "patience": 8,
+        "min_delta": 0.0001,
+        "validate_every": 1,
+        "checks_run": 33,
+        "patience_counter": 3,
+        "disabled_reason": null
+      },
+      "val": {
+        "total": 19.754681852412098,
+        "orientation": 2.724916662761872,
+        "ridge": 0.014994596761656317,
+        "gradient": 0.2695662634895447,
+        "minutia": 16.745204315593536,
+        "m1": 0.12107122340862127,
+        "m2": 0.014465591221310716,
+        "m3": 0.01456575430381824,
+        "m4": 0.10906870251093159
+      },
+      "monitor": {
+        "name": "val_total",
+        "mode": "min",
+        "value": 19.754681852412098,
+        "best_value": 19.466405959307828,
+        "improved": false
+      }
+    },
+    {
+      "epoch": 34,
+      "train": {
+        "total": 17.27327943703093,
+        "orientation": 2.5790234255125797,
+        "ridge": 0.01478184994092461,
+        "gradient": 0.27238537848470695,
+        "minutia": 14.407088788983673,
+        "m1": 0.10855025048274917,
+        "m2": 0.006058489268795299,
+        "m3": 0.005373725472951919,
+        "m4": 0.07682762953494818
+      },
+      "seconds": 295.093,
+      "validation_ran": true,
+      "early_stopping": {
+        "enabled": true,
+        "configured": true,
+        "metric": "val_total",
+        "mode": "min",
+        "patience": 8,
+        "min_delta": 0.0001,
+        "validate_every": 1,
+        "checks_run": 34,
+        "patience_counter": 0,
+        "disabled_reason": null
+      },
+      "val": {
+        "total": 19.44144094334567,
+        "orientation": 2.505452234477283,
+        "ridge": 0.015376659721773576,
+        "gradient": 0.26942323838325744,
+        "minutia": 16.65118880960393,
+        "m1": 0.12079204142810826,
+        "m2": 0.014488540400556702,
+        "m3": 0.014709480033121645,
+        "m4": 0.1048122311340904
+      },
+      "monitor": {
+        "name": "val_total",
+        "mode": "min",
+        "value": 19.44144094334567,
+        "best_value": 19.44144094334567,
+        "improved": true
+      }
+    },
+    {
+      "epoch": 35,
+      "train": {
+        "total": 17.233841056621092,
+        "orientation": 2.5719698691906365,
+        "ridge": 0.014751940780624768,
+        "gradient": 0.2721492249691787,
+        "minutia": 14.374970019544422,
+        "m1": 0.10814777025940567,
+        "m2": 0.0059778867867326295,
+        "m3": 0.005334138027751004,
+        "m4": 0.0780664706845727
+      },
+      "seconds": 295.059,
+      "validation_ran": true,
+      "early_stopping": {
+        "enabled": true,
+        "configured": true,
+        "metric": "val_total",
+        "mode": "min",
+        "patience": 8,
+        "min_delta": 0.0001,
+        "validate_every": 1,
+        "checks_run": 35,
+        "patience_counter": 1,
+        "disabled_reason": null
+      },
+      "val": {
+        "total": 19.585935269320075,
+        "orientation": 2.5518013604822007,
+        "ridge": 0.015019155419207512,
+        "gradient": 0.26949953522911685,
+        "minutia": 16.749615257181585,
+        "m1": 0.12111492464966316,
+        "m2": 0.014577397943180513,
+        "m3": 0.0146203218008028,
+        "m4": 0.10879132294551754
+      },
+      "monitor": {
+        "name": "val_total",
+        "mode": "min",
+        "value": 19.585935269320075,
+        "best_value": 19.44144094334567,
+        "improved": false
+      }
+    },
+    {
+      "epoch": 36,
+      "train": {
+        "total": 17.191304662028156,
+        "orientation": 2.570629093276552,
+        "ridge": 0.01480576048814166,
+        "gradient": 0.2723806795390795,
+        "minutia": 14.33348913053434,
+        "m1": 0.10808099039927976,
+        "m2": 0.005818393541274872,
+        "m3": 0.005203030295707137,
+        "m4": 0.07622278658215545
+      },
+      "seconds": 295.837,
+      "validation_ran": true,
+      "early_stopping": {
+        "enabled": true,
+        "configured": true,
+        "metric": "val_total",
+        "mode": "min",
+        "patience": 8,
+        "min_delta": 0.0001,
+        "validate_every": 1,
+        "checks_run": 36,
+        "patience_counter": 2,
+        "disabled_reason": null
+      },
+      "val": {
+        "total": 19.761301480257575,
+        "orientation": 2.622784028716266,
+        "ridge": 0.01800661740954069,
+        "gradient": 0.26942455590886866,
+        "minutia": 16.851086278905207,
+        "m1": 0.12187300794583592,
+        "m2": 0.014823472937120791,
+        "m3": 0.014956449634111661,
+        "m4": 0.10871512411625428
+      },
+      "monitor": {
+        "name": "val_total",
+        "mode": "min",
+        "value": 19.761301480257575,
+        "best_value": 19.44144094334567,
+        "improved": false
+      }
+    },
+    {
+      "epoch": 37,
+      "train": {
+        "total": 17.088422820862547,
+        "orientation": 2.5619065547211077,
+        "ridge": 0.015628339059077016,
+        "gradient": 0.271840995037619,
+        "minutia": 14.239046937124346,
+        "m1": 0.10749154342796065,
+        "m2": 0.005666862280605234,
+        "m3": 0.005035579213897288,
+        "m4": 0.07506752521712408
+      },
+      "seconds": 295.178,
+      "validation_ran": true,
+      "early_stopping": {
+        "enabled": true,
+        "configured": true,
+        "metric": "val_total",
+        "mode": "min",
+        "patience": 8,
+        "min_delta": 0.0001,
+        "validate_every": 1,
+        "checks_run": 37,
+        "patience_counter": 0,
+        "disabled_reason": null
+      },
+      "val": {
+        "total": 19.335835170235864,
+        "orientation": 2.5157079349864615,
+        "ridge": 0.015552958529342941,
+        "gradient": 0.2694232427659519,
+        "minutia": 16.535151056299874,
+        "m1": 0.12019564481103484,
+        "m2": 0.01466228875485971,
+        "m3": 0.014621497304950727,
+        "m4": 0.10173319836052504
+      },
+      "monitor": {
+        "name": "val_total",
+        "mode": "min",
+        "value": 19.335835170235864,
+        "best_value": 19.335835170235864,
+        "improved": true
+      }
+    },
+    {
+      "epoch": 38,
+      "train": {
+        "total": 16.91684356464016,
+        "orientation": 2.5411497607490774,
+        "ridge": 0.01498236570057087,
+        "gradient": 0.27213586648780197,
+        "minutia": 14.08857556402604,
+        "m1": 0.10670857843491502,
+        "m2": 0.005369334458837293,
+        "m3": 0.004794562956167368,
+        "m4": 0.07201787909971498
+      },
+      "seconds": 294.43,
+      "validation_ran": true,
+      "early_stopping": {
+        "enabled": true,
+        "configured": true,
+        "metric": "val_total",
+        "mode": "min",
+        "patience": 8,
+        "min_delta": 0.0001,
+        "validate_every": 1,
+        "checks_run": 38,
+        "patience_counter": 1,
+        "disabled_reason": null
+      },
+      "val": {
+        "total": 19.88763877440264,
+        "orientation": 2.609696186162571,
+        "ridge": 0.01510894446867832,
+        "gradient": 0.2695318018449819,
+        "minutia": 16.993301834779626,
+        "m1": 0.12257922987807243,
+        "m2": 0.014803277943183714,
+        "m3": 0.01469193355225146,
+        "m4": 0.1129260031533811
+      },
+      "monitor": {
+        "name": "val_total",
+        "mode": "min",
+        "value": 19.88763877440264,
+        "best_value": 19.335835170235864,
+        "improved": false
+      }
+    },
+    {
+      "epoch": 39,
+      "train": {
+        "total": 16.72460085449624,
+        "orientation": 2.5241447942032122,
+        "ridge": 0.014767495841332086,
+        "gradient": 0.2721196678470805,
+        "minutia": 13.913568890838826,
+        "m1": 0.10566962827071251,
+        "m2": 0.005168321941005855,
+        "m3": 0.00454717910366818,
+        "m4": 0.06926023152924006
+      },
+      "seconds": 293.717,
+      "validation_ran": true,
+      "early_stopping": {
+        "enabled": true,
+        "configured": true,
+        "metric": "val_total",
+        "mode": "min",
+        "patience": 8,
+        "min_delta": 0.0001,
+        "validate_every": 1,
+        "checks_run": 39,
+        "patience_counter": 2,
+        "disabled_reason": null
+      },
+      "val": {
+        "total": 19.62493749506333,
+        "orientation": 2.5455041518185864,
+        "ridge": 0.01483692323320849,
+        "gradient": 0.26944632661693235,
+        "minutia": 16.7951501157832,
+        "m1": 0.12142509423634586,
+        "m2": 0.015127241271572875,
+        "m3": 0.014797113995680356,
+        "m4": 0.10837678225850438
+      },
+      "monitor": {
+        "name": "val_total",
+        "mode": "min",
+        "value": 19.62493749506333,
+        "best_value": 19.335835170235864,
+        "improved": false
+      }
+    },
+    {
+      "epoch": 40,
+      "train": {
+        "total": 16.670966355829126,
+        "orientation": 2.5292343216588296,
+        "ridge": 0.014703015098286419,
+        "gradient": 0.27221951203873435,
+        "minutia": 13.854809502428113,
+        "m1": 0.10513924300017585,
+        "m2": 0.00502902477334042,
+        "m3": 0.0044365247133946115,
+        "m4": 0.06991928966133391
+      },
+      "seconds": 293.969,
+      "validation_ran": true,
+      "early_stopping": {
+        "enabled": true,
+        "configured": true,
+        "metric": "val_total",
+        "mode": "min",
+        "patience": 8,
+        "min_delta": 0.0001,
+        "validate_every": 1,
+        "checks_run": 40,
+        "patience_counter": 3,
+        "disabled_reason": null
+      },
+      "val": {
+        "total": 19.478617414178697,
+        "orientation": 2.4929133259676357,
+        "ridge": 0.015020997731642609,
+        "gradient": 0.2694255443578735,
+        "minutia": 16.701257540962914,
+        "m1": 0.12094193120452172,
+        "m2": 0.015015493234231032,
+        "m3": 0.015015101423337658,
+        "m4": 0.10584092740477487
+      },
+      "monitor": {
+        "name": "val_total",
+        "mode": "min",
+        "value": 19.478617414178697,
+        "best_value": 19.335835170235864,
+        "improved": false
+      }
+    },
+    {
+      "epoch": 41,
+      "train": {
+        "total": 16.324400052099747,
+        "orientation": 2.4914392707832307,
+        "ridge": 0.014542578920167915,
+        "gradient": 0.27215671955470544,
+        "minutia": 13.546261465596963,
+        "m1": 0.10349801925083951,
+        "m2": 0.004708310732695894,
+        "m3": 0.0041155521234572875,
+        "m4": 0.06333479345918375
+      },
+      "seconds": 294.371,
+      "validation_ran": true,
+      "early_stopping": {
+        "enabled": true,
+        "configured": true,
+        "metric": "val_total",
+        "mode": "min",
+        "patience": 8,
+        "min_delta": 0.0001,
+        "validate_every": 1,
+        "checks_run": 41,
+        "patience_counter": 4,
+        "disabled_reason": null
+      },
+      "val": {
+        "total": 19.51385806690563,
+        "orientation": 2.4875315750346463,
+        "ridge": 0.014824543604477842,
+        "gradient": 0.2694729077943506,
+        "minutia": 16.74202905287717,
+        "m1": 0.12143354546975962,
+        "m2": 0.015085304949811118,
+        "m3": 0.014722267243473287,
+        "m4": 0.1049234774680858
+      },
+      "monitor": {
+        "name": "val_total",
+        "mode": "min",
+        "value": 19.51385806690563,
+        "best_value": 19.335835170235864,
+        "improved": false
+      }
+    },
+    {
+      "epoch": 42,
+      "train": {
+        "total": 16.439730213869456,
+        "orientation": 2.506022321307168,
+        "ridge": 0.01452321298247275,
+        "gradient": 0.2720812586872068,
+        "minutia": 13.64710343381165,
+        "m1": 0.10392413376218294,
+        "m2": 0.004749208207629933,
+        "m3": 0.004228421715385024,
+        "m4": 0.06644365179747007
+      },
+      "seconds": 294.065,
+      "validation_ran": true,
+      "early_stopping": {
+        "enabled": true,
+        "configured": true,
+        "metric": "val_total",
+        "mode": "min",
+        "patience": 8,
+        "min_delta": 0.0001,
+        "validate_every": 1,
+        "checks_run": 42,
+        "patience_counter": 5,
+        "disabled_reason": null
+      },
+      "val": {
+        "total": 19.525451075711988,
+        "orientation": 2.508337479096683,
+        "ridge": 0.014647606498297841,
+        "gradient": 0.26942938912839176,
+        "minutia": 16.73303659102496,
+        "m1": 0.12166259077223227,
+        "m2": 0.015121862741017884,
+        "m3": 0.014859915972453229,
+        "m4": 0.10225934357684913
+      },
+      "monitor": {
+        "name": "val_total",
+        "mode": "min",
+        "value": 19.525451075711988,
+        "best_value": 19.335835170235864,
+        "improved": false
+      }
+    },
+    {
+      "epoch": 43,
+      "train": {
+        "total": 16.352379937190932,
+        "orientation": 2.5000621450533114,
+        "ridge": 0.014474562847687509,
+        "gradient": 0.27228114404486786,
+        "minutia": 13.565562075226113,
+        "m1": 0.10345188475066763,
+        "m2": 0.0046436606563601745,
+        "m3": 0.004085759171606308,
+        "m4": 0.06511650065282931
+      },
+      "seconds": 295.255,
+      "validation_ran": true,
+      "early_stopping": {
+        "enabled": true,
+        "configured": true,
+        "metric": "val_total",
+        "mode": "min",
+        "patience": 8,
+        "min_delta": 0.0001,
+        "validate_every": 1,
+        "checks_run": 43,
+        "patience_counter": 6,
+        "disabled_reason": null
+      },
+      "val": {
+        "total": 19.36331476017753,
+        "orientation": 2.43447910489883,
+        "ridge": 0.01470195917402678,
+        "gradient": 0.26965678014697875,
+        "minutia": 16.644476914023333,
+        "m1": 0.12147597232285667,
+        "m2": 0.015031501254873639,
+        "m3": 0.014842192413295336,
+        "m4": 0.09799242340785297
+      },
+      "monitor": {
+        "name": "val_total",
+        "mode": "min",
+        "value": 19.36331476017753,
+        "best_value": 19.335835170235864,
+        "improved": false
+      }
+    },
+    {
+      "epoch": 44,
+      "train": {
+        "total": 16.248372064010397,
+        "orientation": 2.4884955678169787,
+        "ridge": 0.01446823711973302,
+        "gradient": 0.27202990596908655,
+        "minutia": 13.473378349838661,
+        "m1": 0.10301116328206592,
+        "m2": 0.0045008637824876215,
+        "m3": 0.003955665888737239,
+        "m4": 0.06286054506513276
+      },
+      "seconds": 295.291,
+      "validation_ran": true,
+      "early_stopping": {
+        "enabled": true,
+        "configured": true,
+        "metric": "val_total",
+        "mode": "min",
+        "patience": 8,
+        "min_delta": 0.0001,
+        "validate_every": 1,
+        "checks_run": 44,
+        "patience_counter": 0,
+        "disabled_reason": null
+      },
+      "val": {
+        "total": 19.302652364108653,
+        "orientation": 2.434593376501359,
+        "ridge": 0.01482156508647025,
+        "gradient": 0.2695334985294444,
+        "minutia": 16.583703933552624,
+        "m1": 0.12099422861866772,
+        "m2": 0.015016623484319385,
+        "m3": 0.014929176396366588,
+        "m4": 0.09769870038218996
+      },
+      "monitor": {
+        "name": "val_total",
+        "mode": "min",
+        "value": 19.302652364108653,
+        "best_value": 19.302652364108653,
+        "improved": true
+      }
+    },
+    {
+      "epoch": 45,
+      "train": {
+        "total": 15.951545372110598,
+        "orientation": 2.466235954859659,
+        "ridge": 0.014312298292143253,
+        "gradient": 0.27215392116610587,
+        "minutia": 13.1988431922943,
+        "m1": 0.1013073455616535,
+        "m2": 0.0041911950683997945,
+        "m3": 0.0036649720679138693,
+        "m4": 0.05898922562975174
+      },
+      "seconds": 294.583,
+      "validation_ran": true,
+      "early_stopping": {
+        "enabled": true,
+        "configured": true,
+        "metric": "val_total",
+        "mode": "min",
+        "patience": 8,
+        "min_delta": 0.0001,
+        "validate_every": 1,
+        "checks_run": 45,
+        "patience_counter": 1,
+        "disabled_reason": null
+      },
+      "val": {
+        "total": 19.442451961537735,
+        "orientation": 2.4545647573981055,
+        "ridge": 0.014508655552757297,
+        "gradient": 0.26949547294148785,
+        "minutia": 16.703883069594276,
+        "m1": 0.12139437722968545,
+        "m2": 0.014913106813807697,
+        "m3": 0.015149018196339275,
+        "m4": 0.10235435260151
+      },
+      "monitor": {
+        "name": "val_total",
+        "mode": "min",
+        "value": 19.442451961537735,
+        "best_value": 19.302652364108653,
+        "improved": false
+      }
+    },
+    {
+      "epoch": 46,
+      "train": {
+        "total": 16.114016196642265,
+        "orientation": 2.492436762793289,
+        "ridge": 0.01435559334240824,
+        "gradient": 0.27203738452349685,
+        "minutia": 13.335186455005985,
+        "m1": 0.10193414267296018,
+        "m2": 0.004248581003523859,
+        "m3": 0.0037815779089188056,
+        "m4": 0.06283241105723537
+      },
+      "seconds": 294.565,
+      "validation_ran": true,
+      "early_stopping": {
+        "enabled": true,
+        "configured": true,
+        "metric": "val_total",
+        "mode": "min",
+        "patience": 8,
+        "min_delta": 0.0001,
+        "validate_every": 1,
+        "checks_run": 46,
+        "patience_counter": 2,
+        "disabled_reason": null
+      },
+      "val": {
+        "total": 19.442986202749978,
+        "orientation": 2.421417476786649,
+        "ridge": 0.014850301862280955,
+        "gradient": 0.26950603270116336,
+        "minutia": 16.737212393245596,
+        "m1": 0.1219759046115021,
+        "m2": 0.015140656087507698,
+        "m3": 0.014821523771108312,
+        "m4": 0.10005734727324489
+      },
+      "monitor": {
+        "name": "val_total",
+        "mode": "min",
+        "value": 19.442986202749978,
+        "best_value": 19.302652364108653,
+        "improved": false
+      }
+    },
+    {
+      "epoch": 47,
+      "train": {
+        "total": 15.777153032741065,
+        "orientation": 2.4555590229363715,
+        "ridge": 0.014293486953949231,
+        "gradient": 0.27247016015716125,
+        "minutia": 13.034830356815739,
+        "m1": 0.10018863491664529,
+        "m2": 0.004006439973235348,
+        "m3": 0.0034921087789043766,
+        "m4": 0.057481546416151455
+      },
+      "seconds": 292.794,
+      "validation_ran": true,
+      "early_stopping": {
+        "enabled": true,
+        "configured": true,
+        "metric": "val_total",
+        "mode": "min",
+        "patience": 8,
+        "min_delta": 0.0001,
+        "validate_every": 1,
+        "checks_run": 47,
+        "patience_counter": 3,
+        "disabled_reason": null
+      },
+      "val": {
+        "total": 19.607536741246513,
+        "orientation": 2.4052914623270696,
+        "ridge": 0.014542080629318156,
+        "gradient": 0.2695267738505481,
+        "minutia": 16.918176416407295,
+        "m1": 0.12380007107786954,
+        "m2": 0.015431836152319762,
+        "m3": 0.015093654332393631,
+        "m4": 0.0967772060830923
+      },
+      "monitor": {
+        "name": "val_total",
+        "mode": "min",
+        "value": 19.607536741246513,
+        "best_value": 19.302652364108653,
+        "improved": false
+      }
+    },
+    {
+      "epoch": 48,
+      "train": {
+        "total": 15.755231099553,
+        "orientation": 2.4637214728718893,
+        "ridge": 0.01423216476754482,
+        "gradient": 0.2724093522406511,
+        "minutia": 13.004868116416779,
+        "m1": 0.09983956196096788,
+        "m2": 0.003948502554227369,
+        "m3": 0.0034396419248755175,
+        "m4": 0.05842385203336399
+      },
+      "seconds": 295.55,
+      "validation_ran": true,
+      "early_stopping": {
+        "enabled": true,
+        "configured": true,
+        "metric": "val_total",
+        "mode": "min",
+        "patience": 8,
+        "min_delta": 0.0001,
+        "validate_every": 1,
+        "checks_run": 48,
+        "patience_counter": 4,
+        "disabled_reason": null
+      },
+      "val": {
+        "total": 19.64129404894171,
+        "orientation": 2.416929646099315,
+        "ridge": 0.01436432855014495,
+        "gradient": 0.26946116316127267,
+        "minutia": 16.940538909218528,
+        "m1": 0.12370631772088495,
+        "m2": 0.015314237609067385,
+        "m3": 0.015279212406273673,
+        "m4": 0.09892745235098158
+      },
+      "monitor": {
+        "name": "val_total",
+        "mode": "min",
+        "value": 19.64129404894171,
+        "best_value": 19.302652364108653,
+        "improved": false
+      }
+    },
+    {
+      "epoch": 49,
+      "train": {
+        "total": 15.575975204685612,
+        "orientation": 2.4280729617730556,
+        "ridge": 0.014162957744739682,
+        "gradient": 0.2721435795761991,
+        "minutia": 12.861595703976088,
+        "m1": 0.09909211377381962,
+        "m2": 0.0037849715142789114,
+        "m3": 0.003307095337547807,
+        "m4": 0.05524671394699519
+      },
+      "seconds": 294.064,
+      "validation_ran": true,
+      "early_stopping": {
+        "enabled": true,
+        "configured": true,
+        "metric": "val_total",
+        "mode": "min",
+        "patience": 8,
+        "min_delta": 0.0001,
+        "validate_every": 1,
+        "checks_run": 49,
+        "patience_counter": 5,
+        "disabled_reason": null
+      },
+      "val": {
+        "total": 19.724562083973606,
+        "orientation": 2.4393345139243388,
+        "ridge": 0.014385251946906675,
+        "gradient": 0.26942151943470705,
+        "minutia": 17.00142082530547,
+        "m1": 0.12376193919761933,
+        "m2": 0.015491521747952158,
+        "m3": 0.015170445076543538,
+        "m4": 0.10244992132283708
+      },
+      "monitor": {
+        "name": "val_total",
+        "mode": "min",
+        "value": 19.724562083973606,
+        "best_value": 19.302652364108653,
+        "improved": false
+      }
+    },
+    {
+      "epoch": 50,
+      "train": {
+        "total": 15.557880533833902,
+        "orientation": 2.4422416977040164,
+        "ridge": 0.01416417891493594,
+        "gradient": 0.27221679341389365,
+        "minutia": 12.829257866680859,
+        "m1": 0.09879586011428598,
+        "m2": 0.0037476008525272834,
+        "m3": 0.0032918623356076866,
+        "m4": 0.05553102419262685
+      },
+      "seconds": 294.312,
+      "validation_ran": true,
+      "early_stopping": {
+        "enabled": true,
+        "configured": true,
+        "metric": "val_total",
+        "mode": "min",
+        "patience": 8,
+        "min_delta": 0.0001,
+        "validate_every": 1,
+        "checks_run": 50,
+        "patience_counter": 6,
+        "disabled_reason": null
+      },
+      "val": {
+        "total": 19.60939328810748,
+        "orientation": 2.435596678728726,
+        "ridge": 0.014326773069918475,
+        "gradient": 0.2695748813888606,
+        "minutia": 16.889894941401355,
+        "m1": 0.12302230341947652,
+        "m2": 0.015741834694888185,
+        "m3": 0.015086410439418838,
+        "m4": 0.10071024148660229
+      },
+      "monitor": {
+        "name": "val_total",
+        "mode": "min",
+        "value": 19.60939328810748,
+        "best_value": 19.302652364108653,
+        "improved": false
+      }
+    },
+    {
+      "epoch": 51,
+      "train": {
+        "total": 15.340383340068072,
+        "orientation": 2.42650184317889,
+        "ridge": 0.01407814258029301,
+        "gradient": 0.2718724339112026,
+        "minutia": 12.62793091594144,
+        "m1": 0.09749926749522864,
+        "m2": 0.0035445417352651517,
+        "m3": 0.0030874556893356647,
+        "m4": 0.0530252577651015
+      },
+      "seconds": 295.047,
+      "validation_ran": true,
+      "early_stopping": {
+        "enabled": true,
+        "configured": true,
+        "metric": "val_total",
+        "mode": "min",
+        "patience": 8,
+        "min_delta": 0.0001,
+        "validate_every": 1,
+        "checks_run": 51,
+        "patience_counter": 7,
+        "disabled_reason": null
+      },
+      "val": {
+        "total": 19.64582631524234,
+        "orientation": 2.453161666610024,
+        "ridge": 0.014450919429925992,
+        "gradient": 0.269453063981737,
+        "minutia": 16.90876070216378,
+        "m1": 0.12388416021106077,
+        "m2": 0.015579687612738839,
+        "m3": 0.015153239579761729,
+        "m4": 0.095200199161203
+      },
+      "monitor": {
+        "name": "val_total",
+        "mode": "min",
+        "value": 19.64582631524234,
+        "best_value": 19.302652364108653,
+        "improved": false
+      }
+    },
+    {
+      "epoch": 52,
+      "train": {
+        "total": 15.250879639426708,
+        "orientation": 2.4293090704427773,
+        "ridge": 0.014074657499978188,
+        "gradient": 0.27217675223056065,
+        "minutia": 12.535319156317438,
+        "m1": 0.09693546901700664,
+        "m2": 0.0034391209176725464,
+        "m3": 0.002983907238576576,
+        "m4": 0.051640154211503635
+      },
+      "seconds": 294.454,
+      "validation_ran": true,
+      "early_stopping": {
+        "enabled": true,
+        "configured": true,
+        "metric": "val_total",
+        "mode": "min",
+        "patience": 8,
+        "min_delta": 0.0001,
+        "validate_every": 1,
+        "checks_run": 52,
+        "patience_counter": 8,
+        "disabled_reason": null
+      },
+      "val": {
+        "total": 19.529628074360403,
+        "orientation": 2.410081928171576,
+        "ridge": 0.014315733715971524,
+        "gradient": 0.2694376804691585,
+        "minutia": 16.835792743458466,
+        "m1": 0.12351471302423248,
+        "m2": 0.015502472857342046,
+        "m3": 0.015058543368237701,
+        "m4": 0.0935204547501224
+      },
+      "monitor": {
+        "name": "val_total",
+        "mode": "min",
+        "value": 19.529628074360403,
+        "best_value": 19.302652364108653,
+        "improved": false
+      }
+    }
+  ]
+}
