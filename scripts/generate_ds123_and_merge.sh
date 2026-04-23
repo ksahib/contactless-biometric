@@ -20,15 +20,16 @@ else
   exit 1
 fi
 
-DATASET_ROOT="${DATASET_ROOT:-dataset}"
+DATASET_ROOT="${DATASET_ROOT:-archive}"
 GROUND_TRUTH_ROOT="${GROUND_TRUTH_ROOT:-ground_truth}"
-MERGED_ROOT="${MERGED_ROOT:-${GROUND_TRUTH_ROOT}/DS123_merged}"
+MERGED_ROOT="${MERGED_ROOT:-${GROUND_TRUTH_ROOT}/DS123_merged_v2}"
 
-DS1_ROOT="${DS1_ROOT:-${GROUND_TRUTH_ROOT}/DS1}"
-DS2_ROOT="${DS2_ROOT:-${GROUND_TRUTH_ROOT}/DS2}"
-DS3_ROOT="${DS3_ROOT:-${GROUND_TRUTH_ROOT}/DS3}"
+DS1_ROOT="${DS1_ROOT:-${GROUND_TRUTH_ROOT}/DS1_v2}"
+DS2_ROOT="${DS2_ROOT:-${GROUND_TRUTH_ROOT}/DS2_v2}"
+DS3_ROOT="${DS3_ROOT:-${GROUND_TRUTH_ROOT}/DS3_v2}"
 
-GENERATOR_FLAGS="${GENERATOR_FLAGS:-}"
+DEFAULT_GENERATOR_FLAGS="--execution-target kaggle --gpu-only --cpu-workers 10 --prefetch-samples 10 --fingerflow-backend local"
+GENERATOR_FLAGS="${GENERATOR_FLAGS:-${DEFAULT_GENERATOR_FLAGS}}"
 
 for dataset_name in DS1 DS2 DS3; do
   if [ ! -d "${DATASET_ROOT}/${dataset_name}" ]; then
@@ -55,9 +56,7 @@ echo "Using Python: ${PYTHON_BIN}"
 echo "Base dataset root: ${DATASET_ROOT}"
 echo "Base ground truth root: ${GROUND_TRUTH_ROOT}"
 echo "Merged output root: ${MERGED_ROOT}"
-if [ -n "${GENERATOR_FLAGS}" ]; then
-  echo "Extra generator flags: ${GENERATOR_FLAGS}"
-fi
+echo "Generator flags: ${GENERATOR_FLAGS}"
 
 run_generate "DS1" "${DS1_ROOT}"
 run_generate "DS2" "${DS2_ROOT}"
