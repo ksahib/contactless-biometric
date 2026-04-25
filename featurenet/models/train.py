@@ -61,6 +61,7 @@ FLOAT_TARGET_KEYS = {
 }
 LONG_TARGET_KEYS = {"minutia_x", "minutia_y", "minutia_orientation"}
 LOSS_KEYS = ("total", "orientation", "ridge", "gradient", "minutia", "m1", "m2", "m3", "m4")
+TARGET_FINITE_KEYS = frozenset(FLOAT_TARGET_KEYS | LONG_TARGET_KEYS)
 EARLY_STOPPING_METRICS = (
     "val_total",
     "best_score_f1",
@@ -287,6 +288,38 @@ def _loss_dict_to_scalars(losses: Mapping[str, torch.Tensor]) -> dict[str, float
     return {key: float(value.detach().item()) for key, value in losses.items() if key in LOSS_KEYS}
 
 
+def _np_target_non_finite_issues(targets: Mapping[str, Any]) -> list[str]:
+    issues: list[str] = []
+    for key in sorted(TARGET_FINITE_KEYS & set(targets.keys())):
+        array = np.asarray(targets[key])
+        if not np.issubdtype(array.dtype, np.number):
+            continue
+        finite = np.isfinite(array)
+        if bool(finite.all()):
+            continue
+        total = int(array.size)
+        finite_count = int(finite.sum())
+        issues.append(f"{key}: non_finite={total - finite_count}/{total}")
+    return issues
+
+
+def _minutia_support_count(targets: Mapping[str, Any]) -> int:
+    valid_mask = targets.get("minutia_valid_mask")
+    if valid_mask is None:
+        return 0
+    return int(np.count_nonzero(np.asarray(valid_mask) > 0.5))
+
+
+def _meta_minutiae_count(meta: Mapping[str, Any]) -> int:
+    counts = meta.get("counts")
+    if isinstance(counts, Mapping) and counts.get("minutiae") is not None:
+        try:
+            return int(counts["minutiae"])
+        except (TypeError, ValueError):
+            return 0
+    return 0
+
+
 def _float_outputs(outputs: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     return {
         key: value.float() if torch.is_floating_point(value) else value
@@ -298,6 +331,20 @@ def _loss_context(device: torch.device):
     if device.type == "cuda":
         return torch.autocast(device_type="cuda", enabled=False)
     return nullcontext()
+
+
+def _tensor_non_finite_issues(tensors: Mapping[str, torch.Tensor]) -> list[str]:
+    issues: list[str] = []
+    for key, value in tensors.items():
+        if key.startswith("_") or not torch.is_tensor(value) or not torch.is_floating_point(value):
+            continue
+        finite = torch.isfinite(value.detach())
+        if bool(finite.all().item()):
+            continue
+        total = int(value.numel())
+        finite_count = int(finite.sum().item())
+        issues.append(f"{key}: non_finite={total - finite_count}/{total}")
+    return issues
 
 
 def _sample_ids_for_batch(dataloader: DataLoader, targets: Mapping[str, torch.Tensor]) -> list[str]:
@@ -320,6 +367,8 @@ def _non_finite_loss_message(
     losses: Mapping[str, torch.Tensor],
     batch_index: int,
     sample_ids: list[str],
+    target_issues: list[str] | None = None,
+    output_issues: list[str] | None = None,
 ) -> str:
     parts = []
     for key in LOSS_KEYS:
@@ -337,7 +386,77 @@ def _non_finite_loss_message(
         sample_text += ", ..."
     if sample_text:
         sample_text = f"; samples=[{sample_text}]"
-    return f"encountered non-finite total loss during training at batch {batch_index}: {', '.join(parts)}{sample_text}"
+    issue_parts = []
+    if target_issues:
+        issue_parts.append(f"target_issues=[{'; '.join(target_issues)}]")
+    if output_issues:
+        issue_parts.append(f"output_issues=[{'; '.join(output_issues)}]")
+    issue_text = f"; {'; '.join(issue_parts)}" if issue_parts else ""
+    return (
+        f"encountered non-finite total loss during training at batch {batch_index}: "
+        f"{', '.join(parts)}{sample_text}{issue_text}"
+    )
+
+
+@torch.no_grad()
+def _diagnose_non_finite_step(
+    model: FeatureExtractor,
+    inputs: torch.Tensor,
+    targets: Mapping[str, torch.Tensor],
+    amp: bool,
+) -> tuple[list[str], list[str]]:
+    image = inputs[:, :1]
+    mask = inputs[:, 1:2]
+    with _autocast_context(inputs.device, amp):
+        outputs = model(image, mask=mask)
+    output_issues = _tensor_non_finite_issues(outputs)
+    if amp and output_issues:
+        with _loss_context(inputs.device):
+            fp32_outputs = model(image, mask=mask)
+        fp32_output_issues = _tensor_non_finite_issues(fp32_outputs)
+        if fp32_output_issues:
+            output_issues = [f"amp {issue}" for issue in output_issues]
+            output_issues.extend(f"fp32 {issue}" for issue in fp32_output_issues)
+        else:
+            output_issues = [f"amp {issue}; fp32 retry finite" for issue in output_issues]
+    return _tensor_non_finite_issues(targets), output_issues
+
+
+def _optimizer_step(
+    model: FeatureExtractor,
+    optimizer: optim.Optimizer,
+    scaler: torch.cuda.amp.GradScaler | None,
+    amp: bool,
+    device: torch.device,
+    max_grad_norm: float | None,
+) -> tuple[bool, float | None]:
+    grad_norm: float | None = None
+    use_scaler = scaler is not None and amp and device.type == "cuda"
+    should_clip = max_grad_norm is not None and max_grad_norm > 0.0
+
+    if use_scaler and should_clip:
+        scaler.unscale_(optimizer)
+
+    if should_clip:
+        grad_norm_tensor = torch.nn.utils.clip_grad_norm_(
+            model.parameters(),
+            max_norm=float(max_grad_norm),
+            error_if_nonfinite=False,
+        )
+        grad_norm = float(grad_norm_tensor.detach().cpu().item())
+        if not torch.isfinite(grad_norm_tensor):
+            optimizer.zero_grad(set_to_none=True)
+            if use_scaler:
+                scaler.update()
+            return False, grad_norm
+
+    if use_scaler:
+        scaler.step(optimizer)
+        scaler.update()
+    else:
+        optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    return True, grad_norm
 
 
 def _run_model_step(
@@ -352,6 +471,18 @@ def _run_model_step(
     device = inputs.device
     with _autocast_context(device, amp):
         outputs = model(image, mask=mask)
+    if amp:
+        output_issues = _tensor_non_finite_issues(outputs)
+        if output_issues:
+            with _loss_context(device):
+                fp32_outputs = model(image, mask=mask)
+            if not _tensor_non_finite_issues(fp32_outputs):
+                print(
+                    "[train] recovered non-finite AMP model outputs with a float32 retry: "
+                    + "; ".join(output_issues),
+                    flush=True,
+                )
+                outputs = fp32_outputs
     if "gradient" not in targets:
         raise KeyError("missing explicit reconstruction-derived gradient target for gradient supervision")
     with _loss_context(device):
@@ -368,11 +499,19 @@ def train_one_epoch(
     amp: bool = False,
     channels_last: bool = False,
     grad_accum_steps: int = 1,
+    max_grad_norm: float | None = None,
+    skip_non_finite_target_batches: bool = True,
 ) -> dict[str, float]:
     model.train()
     resolved_device = torch.device(device)
     running = {key: 0.0 for key in LOSS_KEYS}
     num_batches = 0
+    accum_batches = 0
+    skipped_batches = 0
+    optimizer_steps = 0
+    skipped_optimizer_steps = 0
+    grad_norm_sum = 0.0
+    grad_norm_count = 0
     grad_accum_steps = max(1, int(grad_accum_steps))
     optimizer.zero_grad(set_to_none=True)
 
@@ -384,39 +523,78 @@ def train_one_epoch(
         total_loss = losses["total"]
         if not torch.isfinite(total_loss):
             sample_ids = _sample_ids_for_batch(dataloader, targets)
-            raise RuntimeError(_non_finite_loss_message(losses, batch_index, sample_ids))
+            target_issues, output_issues = _diagnose_non_finite_step(model, inputs, targets, amp=amp)
+            if skip_non_finite_target_batches and target_issues and not output_issues:
+                skipped_batches += 1
+                optimizer.zero_grad(set_to_none=True)
+                accum_batches = 0
+                print(
+                    "[train_one_epoch] skipped non-finite target batch: "
+                    + _non_finite_loss_message(losses, batch_index, sample_ids, target_issues, output_issues),
+                    flush=True,
+                )
+                continue
+            raise RuntimeError(
+                _non_finite_loss_message(losses, batch_index, sample_ids, target_issues, output_issues)
+            )
 
         scaled_loss = total_loss / grad_accum_steps
         if scaler is not None and amp and resolved_device.type == "cuda":
             scaler.scale(scaled_loss).backward()
         else:
             scaled_loss.backward()
+        accum_batches += 1
 
-        if batch_index % grad_accum_steps == 0:
-            if scaler is not None and amp and resolved_device.type == "cuda":
-                scaler.step(optimizer)
-                scaler.update()
+        if accum_batches >= grad_accum_steps:
+            stepped, grad_norm = _optimizer_step(
+                model=model,
+                optimizer=optimizer,
+                scaler=scaler,
+                amp=amp,
+                device=resolved_device,
+                max_grad_norm=max_grad_norm,
+            )
+            if stepped:
+                optimizer_steps += 1
             else:
-                optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
+                skipped_optimizer_steps += 1
+            if grad_norm is not None and math.isfinite(grad_norm):
+                grad_norm_sum += grad_norm
+                grad_norm_count += 1
+            accum_batches = 0
 
         scalar_losses = _loss_dict_to_scalars(losses)
         for key in LOSS_KEYS:
             running[key] += scalar_losses[key]
         num_batches += 1
 
-    if num_batches % grad_accum_steps != 0:
-        if scaler is not None and amp and resolved_device.type == "cuda":
-            scaler.step(optimizer)
-            scaler.update()
+    if accum_batches > 0:
+        stepped, grad_norm = _optimizer_step(
+            model=model,
+            optimizer=optimizer,
+            scaler=scaler,
+            amp=amp,
+            device=resolved_device,
+            max_grad_norm=max_grad_norm,
+        )
+        if stepped:
+            optimizer_steps += 1
         else:
-            optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
+            skipped_optimizer_steps += 1
+        if grad_norm is not None and math.isfinite(grad_norm):
+            grad_norm_sum += grad_norm
+            grad_norm_count += 1
 
     if num_batches == 0:
         raise ValueError("training dataloader is empty")
 
-    return {key: value / num_batches for key, value in running.items()}
+    metrics = {key: value / num_batches for key, value in running.items()}
+    metrics["skipped_batches"] = float(skipped_batches)
+    metrics["optimizer_steps"] = float(optimizer_steps)
+    metrics["skipped_optimizer_steps"] = float(skipped_optimizer_steps)
+    if grad_norm_count > 0:
+        metrics["grad_norm"] = grad_norm_sum / grad_norm_count
+    return metrics
 
 
 @torch.no_grad()
@@ -614,6 +792,8 @@ def load_bundle_samples(
     ground_truth_root: str | Path,
     limit: int | None = None,
     strict_gradient_targets: bool = False,
+    strict_finite_targets: bool = False,
+    skip_empty_minutia_support_with_minutiae: bool = True,
 ) -> list[dict[str, Any]]:
     root = Path(ground_truth_root)
     samples_root = root / "samples"
@@ -626,6 +806,8 @@ def load_bundle_samples(
 
     samples: list[dict[str, Any]] = []
     missing_gradient_paths: list[Path] = []
+    non_finite_target_paths: list[tuple[str, Path, list[str]]] = []
+    empty_minutia_support_paths: list[tuple[str, Path, int]] = []
     for sample_dir in sample_dirs:
         meta_path = sample_dir / "meta.json"
         masked_image_path = sample_dir / "masked_image.png"
@@ -642,6 +824,19 @@ def load_bundle_samples(
             if strict_gradient_targets:
                 raise ValueError(f"missing reconstruction-derived gradient target in {targets_path}")
             missing_gradient_paths.append(targets_path)
+            continue
+        non_finite_issues = _np_target_non_finite_issues(targets)
+        if non_finite_issues:
+            if strict_finite_targets:
+                raise ValueError(
+                    f"non-finite target values in {targets_path}: {'; '.join(non_finite_issues)}"
+                )
+            non_finite_target_paths.append((str(meta.get("sample_id", sample_dir.name)), targets_path, non_finite_issues))
+            continue
+        minutiae_count = _meta_minutiae_count(meta)
+        minutia_support_count = _minutia_support_count(targets)
+        if skip_empty_minutia_support_with_minutiae and minutiae_count > 0 and minutia_support_count == 0:
+            empty_minutia_support_paths.append((str(meta.get("sample_id", sample_dir.name)), targets_path, minutiae_count))
             continue
         shapes = meta.get("shapes", {})
         input_shape_hw = _coerce_hw_shape(shapes.get("input_image")) if isinstance(shapes, dict) else None
@@ -678,6 +873,34 @@ def load_bundle_samples(
             "[load_bundle_samples] skipped "
             f"{len(missing_gradient_paths)} samples missing reconstruction-derived gradient target "
             f"(strict mode off). Examples: {preview}{suffix}",
+            flush=True,
+        )
+
+    if non_finite_target_paths:
+        preview_items = [
+            f"{sample_id} ({path}: {'; '.join(issues)})"
+            for sample_id, path, issues in non_finite_target_paths[:3]
+        ]
+        suffix = " ..." if len(non_finite_target_paths) > 3 else ""
+        preview = ", ".join(preview_items)
+        print(
+            "[load_bundle_samples] skipped "
+            f"{len(non_finite_target_paths)} samples with non-finite target values. "
+            f"Examples: {preview}{suffix}",
+            flush=True,
+        )
+
+    if empty_minutia_support_paths:
+        preview_items = [
+            f"{sample_id} ({path}: minutiae={minutiae_count}, support=0)"
+            for sample_id, path, minutiae_count in empty_minutia_support_paths[:3]
+        ]
+        suffix = " ..." if len(empty_minutia_support_paths) > 3 else ""
+        preview = ", ".join(preview_items)
+        print(
+            "[load_bundle_samples] skipped "
+            f"{len(empty_minutia_support_paths)} samples with minutiae but zero active minutia target cells. "
+            f"Examples: {preview}{suffix}",
             flush=True,
         )
 
@@ -768,6 +991,15 @@ def _checkpoint_payload(
     }
 
 
+def _load_resume_checkpoint(path: Path, device: torch.device) -> dict[str, Any]:
+    checkpoint = torch.load(path, map_location=device, weights_only=False)
+    if not isinstance(checkpoint, dict):
+        raise TypeError(f"checkpoint payload must be a dict, got {type(checkpoint).__name__}")
+    if "model_state_dict" not in checkpoint:
+        raise KeyError(f"missing model_state_dict in checkpoint: {path}")
+    return checkpoint
+
+
 def _save_json(path: Path, payload: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -838,6 +1070,8 @@ def train_model(args: argparse.Namespace) -> dict[str, Any]:
         args.ground_truth_root,
         limit=args.limit,
         strict_gradient_targets=args.strict_gradient_targets,
+        strict_finite_targets=args.strict_finite_targets,
+        skip_empty_minutia_support_with_minutiae=args.skip_empty_minutia_support_with_minutiae,
     )
     train_samples, val_samples = split_samples(samples, val_fraction=args.val_fraction, seed=args.seed)
     resolved_device = _resolve_device(args.device)
@@ -868,7 +1102,6 @@ def train_model(args: argparse.Namespace) -> dict[str, Any]:
         )
 
     model = _maybe_channels_last(FeatureExtractor().to(resolved_device), args.channels_last)
-    model = _maybe_compile_model(model, args.compile and resolved_device.type == "cuda")
     criterion = FeatureNetLoss(
         mu_score=args.mu_score,
         mu_x=args.mu_x,
@@ -889,6 +1122,28 @@ def train_model(args: argparse.Namespace) -> dict[str, Any]:
     )
     scaler = _make_grad_scaler(use_amp)
 
+    resume_epoch = 0
+    resume_metrics: Mapping[str, Any] = {}
+    if args.resume_checkpoint is not None:
+        resume_checkpoint = _load_resume_checkpoint(args.resume_checkpoint, resolved_device)
+        try:
+            model.load_state_dict(resume_checkpoint["model_state_dict"])
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "resume checkpoint is incompatible with the current FeatureExtractor architecture"
+            ) from exc
+        if "optimizer_state_dict" in resume_checkpoint:
+            optimizer.load_state_dict(resume_checkpoint["optimizer_state_dict"])
+        resume_epoch = int(resume_checkpoint.get("epoch", 0))
+        resume_metrics = resume_checkpoint.get("metrics", {})
+        if resume_epoch >= args.epochs:
+            raise ValueError(
+                f"resume checkpoint is already at epoch {resume_epoch}; "
+                f"increase --epochs above {resume_epoch} to continue"
+            )
+
+    model = _maybe_compile_model(model, args.compile and resolved_device.type == "cuda")
+
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -905,8 +1160,17 @@ def train_model(args: argparse.Namespace) -> dict[str, Any]:
     if val_loader is None and effective_early_stopping:
         effective_early_stopping = False
         early_stopping_disabled_reason = "no_validation_data"
+    if resume_metrics:
+        monitor = resume_metrics.get("monitor")
+        if isinstance(monitor, Mapping) and monitor.get("name") == monitor_name:
+            best_monitor_value = float(monitor.get("best_value", best_monitor_value))
+            monitor_mode = str(monitor.get("mode", monitor_mode))
+        early_stopping_state = resume_metrics.get("early_stopping")
+        if isinstance(early_stopping_state, Mapping):
+            validation_checks = int(early_stopping_state.get("checks_run", validation_checks))
+            patience_counter = int(early_stopping_state.get("patience_counter", patience_counter))
 
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(resume_epoch + 1, args.epochs + 1):
         epoch_started_at = time.time()
         train_metrics = train_one_epoch(
             model,
@@ -918,6 +1182,8 @@ def train_model(args: argparse.Namespace) -> dict[str, Any]:
             amp=use_amp,
             channels_last=args.channels_last,
             grad_accum_steps=args.grad_accum_steps,
+            max_grad_norm=args.max_grad_norm,
+            skip_non_finite_target_batches=args.skip_non_finite_target_batches,
         )
         record: dict[str, Any] = {
             "epoch": epoch,
@@ -1024,12 +1290,17 @@ def train_model(args: argparse.Namespace) -> dict[str, Any]:
         "epochs": args.epochs,
         "epochs_requested": args.epochs,
         "epochs_ran": len(history),
+        "start_epoch": resume_epoch + 1,
+        "resume_checkpoint": None if args.resume_checkpoint is None else str(args.resume_checkpoint),
         "batch_size": args.batch_size,
         "lr": args.lr,
         "amp": use_amp,
         "channels_last": bool(args.channels_last),
         "compile": bool(args.compile and resolved_device.type == "cuda"),
         "grad_accum_steps": args.grad_accum_steps,
+        "max_grad_norm": args.max_grad_norm,
+        "skip_non_finite_target_batches": bool(args.skip_non_finite_target_batches),
+        "skip_empty_minutia_support_with_minutiae": bool(args.skip_empty_minutia_support_with_minutiae),
         "pin_memory": use_pin_memory,
         "persistent_workers": args.persistent_workers,
         "prefetch_factor": args.prefetch_factor,
@@ -1038,6 +1309,7 @@ def train_model(args: argparse.Namespace) -> dict[str, Any]:
         "weight_decay": 0.0,
         "seed": args.seed,
         "strict_gradient_targets": bool(args.strict_gradient_targets),
+        "strict_finite_targets": bool(args.strict_finite_targets),
         "mu_score": args.mu_score,
         "mu_x": args.mu_x,
         "mu_y": args.mu_y,
@@ -1072,6 +1344,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train FeatureNet against generated DS1 ground-truth bundles.")
     parser.add_argument("--ground-truth-root", type=Path, required=True, help="Path to a generated ground_truth/DS1 folder.")
     parser.add_argument("--output-dir", type=Path, required=True, help="Directory for checkpoints and training history.")
+    parser.add_argument("--resume-checkpoint", type=Path, default=None, help="Resume model and optimizer state from a training checkpoint.")
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -1084,6 +1357,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prefetch-factor", type=int, default=2)
     parser.add_argument("--pin-memory", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--grad-accum-steps", type=int, default=1)
+    parser.add_argument(
+        "--max-grad-norm",
+        type=float,
+        default=5.0,
+        help="Clip gradient norm before optimizer steps; set to 0 to disable.",
+    )
+    parser.add_argument(
+        "--skip-non-finite-target-batches",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Skip a training batch when non-finite loss is caused by non-finite target values.",
+    )
+    parser.add_argument(
+        "--skip-empty-minutia-support-with-minutiae",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Skip bundles whose metadata has minutiae but whose rasterized minutia target support is empty.",
+    )
     parser.add_argument("--cudnn-benchmark", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--val-fraction", type=float, default=0.2)
     parser.add_argument("--validate-every", type=int, default=1)
@@ -1106,15 +1397,26 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Fail fast if any selected sample is missing reconstruction-derived gradient targets.",
     )
+    parser.add_argument(
+        "--strict-finite-targets",
+        action="store_true",
+        help="Fail fast if any selected sample has NaN or Inf target values instead of skipping it.",
+    )
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--limit", type=int, default=None)
     args = parser.parse_args()
+    if args.resume_checkpoint is not None and not args.resume_checkpoint.exists():
+        parser.error(f"--resume-checkpoint does not exist: {args.resume_checkpoint}")
     if args.validate_every < 1:
         parser.error("--validate-every must be at least 1")
     if args.early_stopping_patience < 1:
         parser.error("--early-stopping-patience must be at least 1")
     if args.early_stopping_min_delta < 0.0:
         parser.error("--early-stopping-min-delta must be non-negative")
+    if args.grad_accum_steps < 1:
+        parser.error("--grad-accum-steps must be at least 1")
+    if args.max_grad_norm < 0.0:
+        parser.error("--max-grad-norm must be non-negative")
     if args.mu_score <= 0.0 or args.mu_x <= 0.0 or args.mu_y <= 0.0 or args.mu_ori <= 0.0:
         parser.error("--mu-score, --mu-x, --mu-y, and --mu-ori must be positive")
     if args.m1_focal_gamma < 0.0:

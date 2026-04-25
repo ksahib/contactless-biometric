@@ -10,3 +10,4 @@ dataset/
 tmp/
 s01_f01_a02/
 weights/*.pt
+problem_samples/

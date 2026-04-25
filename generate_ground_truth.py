@@ -2252,6 +2252,21 @@ def _project_front_source_to_training_frame(
     return float(pose_point[0] * scale), float(pose_point[1] * scale)
 
 
+def _point_has_mask_support(mask: np.ndarray, x: float, y: float, radius: int = 2) -> bool:
+    if mask.ndim != 2:
+        raise ValueError(f"expected 2D mask, got shape {mask.shape}")
+    height, width = mask.shape
+    if x < 0.0 or y < 0.0 or x >= float(width) or y >= float(height):
+        return False
+    cx = int(round(x))
+    cy = int(round(y))
+    y0 = max(0, cy - radius)
+    y1 = min(height, cy + radius + 1)
+    x0 = max(0, cx - radius)
+    x1 = min(width, cx + radius + 1)
+    return bool(np.any(mask[y0:y1, x0:x1] > 0))
+
+
 def _remap_unwarped_minutiae_to_sample(
     canonical_minutiae: list[dict[str, Any]],
     unwarp_maps: dict[str, np.ndarray],
@@ -2281,6 +2296,8 @@ def _remap_unwarped_minutiae_to_sample(
             continue
         x_dst, y_dst = destination
         if x_dst < 0.0 or y_dst < 0.0 or x_dst >= float(width) or y_dst >= float(height):
+            continue
+        if not _point_has_mask_support(preprocessed.final_mask, x_dst, y_dst):
             continue
 
         theta = float(minutia["theta"])
