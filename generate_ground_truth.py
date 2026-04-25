@@ -71,6 +71,7 @@ DEFAULT_FINGERFLOW_MODEL_DIR = REPO_ROOT / ".fingerflow_models"
 VARIANT_SUFFIXES = ("HT1", "HT2", "HT4", "HT6", "R414")
 DEFAULT_DPI = 500
 MINUTIA_SCORE_THRESHOLD = 0.15
+MIN_RASTERIZED_MINUTIAE_FOR_RECONSTRUCTION = 1
 REMBG_MODEL = os.environ.get("FINGER_REMBG_MODEL", "u2netp")
 FINGERFLOW_MODEL_SOURCES = {
     "coarse": {
@@ -439,6 +440,34 @@ def _resize_float(array: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
 def _resize_mask(mask: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
     resized = cv2.resize(mask.astype(np.uint8), (shape[1], shape[0]), interpolation=cv2.INTER_NEAREST)
     return np.where(resized > 0, 1.0, 0.0).astype(np.float32)
+
+
+def _downsample_mask_for_points(mask: np.ndarray, target_shape: tuple[int, int]) -> np.ndarray:
+    """Downsample a binary mask with max-pooling over each target cell footprint."""
+    if mask.ndim != 2:
+        raise ValueError(f"expected 2D mask, got shape {mask.shape}")
+
+    source_h, source_w = mask.shape
+    target_h, target_w = target_shape
+    target_h = max(1, int(target_h))
+    target_w = max(1, int(target_w))
+    mask_bool = mask > 0
+    out = np.zeros((target_h, target_w), dtype=np.float32)
+
+    for cy in range(target_h):
+        y0 = int(math.floor(cy * source_h / target_h))
+        y1 = int(math.ceil((cy + 1) * source_h / target_h))
+        y0 = max(0, min(source_h, y0))
+        y1 = max(y0 + 1, min(source_h, y1))
+        for cx in range(target_w):
+            x0 = int(math.floor(cx * source_w / target_w))
+            x1 = int(math.ceil((cx + 1) * source_w / target_w))
+            x0 = max(0, min(source_w, x0))
+            x1 = max(x0 + 1, min(source_w, x1))
+            if np.any(mask_bool[y0:y1, x0:x1]):
+                out[cy, cx] = 1.0
+
+    return out.astype(np.float32)
 
 
 def _compute_output_shape(height: int, width: int) -> tuple[int, int]:
@@ -1434,6 +1463,8 @@ def _write_reprojection_diagnostics(
     left_geometry: ReconstructionViewGeometry,
     right_geometry: ReconstructionViewGeometry,
     x_relative: np.ndarray,
+    x_left_rot: np.ndarray,
+    x_right_rot: np.ndarray,
     depth_front: np.ndarray,
     stitched_left: np.ndarray,
     stitched_right: np.ndarray,
@@ -1483,13 +1514,13 @@ def _write_reprojection_diagnostics(
         "left": {
             "geometry": left_geometry,
             "centers": _interpolate_row_centers(left_geometry, front_centers),
-            "projected_x": x_relative.astype(np.float32),
+            "projected_x": x_left_rot.astype(np.float32),
             "description": "left branch compared against the left pose-normalized silhouette using the branch's shared row support shifted to the left-view row centers",
         },
         "right": {
             "geometry": right_geometry,
             "centers": _interpolate_row_centers(right_geometry, front_centers),
-            "projected_x": x_relative.astype(np.float32),
+            "projected_x": x_right_rot.astype(np.float32),
             "description": "right branch compared against the right pose-normalized silhouette using the branch's shared row support shifted to the right-view row centers",
         },
     }
@@ -1504,18 +1535,30 @@ def _write_reprojection_diagnostics(
         projected_x = view_definitions[role]["projected_x"]
         projected_mask = np.zeros(geometry.image_shape, dtype=np.uint8)
 
-        for y in range(geometry.image_shape[0]):
-            row_mask = support_mask[y] > 0
+        for y_front in range(front_geometry.image_shape[0]):
+            row_mask = support_mask[y_front] > 0
             if not np.any(row_mask):
                 continue
-            row_projected_x = projected_x[y, row_mask].astype(np.float32)
+
+            if role == "front":
+                y_target = float(y_front)
+            else:
+                y_target = _map_row_between_views(front_geometry.valid_rows, geometry.valid_rows, float(y_front))
+                if y_target is None:
+                    continue
+
+            target_y = int(round(y_target))
+            if target_y < 0 or target_y >= geometry.image_shape[0]:
+                continue
+
+            row_projected_x = projected_x[y_front, row_mask].astype(np.float32)
             if row_projected_x.size == 0:
                 continue
-            center = float(centers[y])
+            center = float(centers[target_y])
             x0 = max(0, int(math.floor(float(np.min(row_projected_x) + center))))
             x1 = min(geometry.image_shape[1] - 1, int(math.ceil(float(np.max(row_projected_x) + center))))
             if x1 >= x0:
-                projected_mask[y, x0 : x1 + 1] = 255
+                projected_mask[target_y, x0 : x1 + 1] = 255
 
         projected_masks[role] = projected_mask
         observed_mask = observed_masks[role]
@@ -2200,6 +2243,59 @@ def _sample_2d_bilinear(array: np.ndarray, x: float, y: float, valid_mask: np.nd
     return sum(weight * value for weight, value in samples) / weight_sum
 
 
+def _valid_row_bounds(valid_rows: np.ndarray) -> tuple[float, float] | None:
+    rows = np.flatnonzero(valid_rows.astype(bool))
+    if rows.size < 2:
+        return None
+    return float(rows[0]), float(rows[-1])
+
+
+def _map_row_between_views(
+    source_valid_rows: np.ndarray,
+    target_valid_rows: np.ndarray,
+    y_source: float,
+) -> float | None:
+    """Map a row by normalized tip-to-base position between pose-normalized views."""
+    if not math.isfinite(float(y_source)):
+        return None
+    source_bounds = _valid_row_bounds(source_valid_rows)
+    target_bounds = _valid_row_bounds(target_valid_rows)
+    if source_bounds is None or target_bounds is None:
+        return None
+    source_start, source_end = source_bounds
+    target_start, target_end = target_bounds
+    denom = max(source_end - source_start, 1e-6)
+    t = (float(y_source) - source_start) / denom
+    t = float(np.clip(t, 0.0, 1.0))
+    return float(target_start + t * (target_end - target_start))
+
+
+def _role_valid_rows(reconstruction_maps: dict[str, np.ndarray], role: str) -> np.ndarray | None:
+    value = reconstruction_maps.get(f"{role}_valid_rows")
+    if value is not None:
+        return value.astype(bool)
+    if role == "front" and "support_mask" in reconstruction_maps:
+        return np.any(reconstruction_maps["support_mask"] > 0, axis=1)
+    return None
+
+
+def _map_front_row_to_role(
+    reconstruction_maps: dict[str, np.ndarray],
+    role: str,
+    y_front: float,
+) -> float | None:
+    if not math.isfinite(float(y_front)):
+        return None
+    if role == "front":
+        return float(y_front)
+    front_rows = _role_valid_rows(reconstruction_maps, "front")
+    target_rows = _role_valid_rows(reconstruction_maps, role)
+    if front_rows is None or target_rows is None:
+        return float(y_front)
+    mapped = _map_row_between_views(front_rows, target_rows, y_front)
+    return float(y_front) if mapped is None else mapped
+
+
 def _map_unwarped_to_front_source(unwarp_maps: dict[str, np.ndarray], x: float, y: float) -> tuple[float, float] | None:
     valid_mask = unwarp_maps["source_valid_mask"]
     source_x = _sample_2d_bilinear(unwarp_maps["source_x_map"], x, y, valid_mask=valid_mask)
@@ -2207,6 +2303,98 @@ def _map_unwarped_to_front_source(unwarp_maps: dict[str, np.ndarray], x: float, 
     if source_x is None or source_y is None:
         return None
     return float(source_x), float(source_y)
+
+
+def _canonical_minutiae_with_front_sources(
+    canonical_minutiae: list[dict[str, Any]],
+    unwarp_maps: dict[str, np.ndarray],
+) -> tuple[list[tuple[dict[str, Any], float, float]], dict[str, int]]:
+    """Filter canonical minutiae and attach inverse-unwarped front source points."""
+    unwarped_mask = unwarp_maps.get("unwarped_mask")
+    source_valid_mask = unwarp_maps.get("source_valid_mask")
+    if unwarped_mask is None:
+        unwarped_mask = source_valid_mask
+    if unwarped_mask is None:
+        raise KeyError("center unwarp maps must contain unwarped_mask or source_valid_mask")
+
+    height, width = unwarped_mask.shape
+    kept: list[tuple[dict[str, Any], float, float]] = []
+    counters = {
+        "canonical_total": len(canonical_minutiae),
+        "dropped_nonfinite_canonical_xy": 0,
+        "dropped_outside_unwarped_bounds": 0,
+        "dropped_outside_unwarped_mask": 0,
+        "dropped_no_inverse_source": 0,
+        "inverse_mapped_count": 0,
+    }
+
+    for minutia in canonical_minutiae:
+        x = float(minutia.get("x", float("nan")))
+        y = float(minutia.get("y", float("nan")))
+        if not (math.isfinite(x) and math.isfinite(y)):
+            counters["dropped_nonfinite_canonical_xy"] += 1
+            continue
+        if x < 0.0 or y < 0.0 or x >= float(width) or y >= float(height):
+            counters["dropped_outside_unwarped_bounds"] += 1
+            continue
+        if not _point_has_mask_support(unwarped_mask, x, y, radius=1):
+            counters["dropped_outside_unwarped_mask"] += 1
+            continue
+        source_point = _map_unwarped_to_front_source(unwarp_maps, x, y)
+        if source_point is None:
+            counters["dropped_no_inverse_source"] += 1
+            continue
+        kept.append((minutia, float(source_point[0]), float(source_point[1])))
+
+    counters["inverse_mapped_count"] = len(kept)
+    return kept, counters
+
+
+def _sample_side_rotated_x(
+    reconstruction_maps: dict[str, np.ndarray],
+    role: str,
+    x_front: float,
+    y_front: float,
+    support_mask: np.ndarray,
+) -> float | None:
+    key = "x_left_rot" if role == "left" else "x_right_rot"
+    if key in reconstruction_maps:
+        return _sample_2d_bilinear(reconstruction_maps[key], x_front, y_front, valid_mask=support_mask)
+
+    x_relative = _sample_2d_bilinear(reconstruction_maps["x_relative"], x_front, y_front, valid_mask=support_mask)
+    if x_relative is None:
+        return None
+    stitched_key = "stitched_left" if role == "left" else "stitched_right"
+    if stitched_key in reconstruction_maps:
+        branch_depth = _sample_2d_bilinear(reconstruction_maps[stitched_key], x_front, y_front, valid_mask=support_mask)
+        if branch_depth is None:
+            return None
+        angle = -45.0 if role == "left" else 45.0
+        theta = math.radians(angle)
+        return float((x_relative * math.cos(theta)) + (branch_depth * math.sin(theta)))
+
+    depth_front = _sample_2d_bilinear(reconstruction_maps["depth_front"], x_front, y_front, valid_mask=support_mask)
+    if depth_front is None:
+        return None
+    angle = -45.0 if role == "left" else 45.0
+    theta = math.radians(angle)
+    return float((x_relative * math.cos(theta)) + (depth_front * math.sin(theta)))
+
+
+def _training_frame_scale_from_preprocessed(
+    preprocessed: PreprocessedContactlessImage,
+) -> tuple[float, float]:
+    pose_h, pose_w = preprocessed.pose_normalized_gray.shape[:2]
+    train_h, train_w = preprocessed.preprocessed_gray.shape[:2]
+    scale_x = float(train_w) / float(max(pose_w, 1))
+    scale_y = float(train_h) / float(max(pose_h, 1))
+
+    fallback = float(preprocessed.ridge_scale_factor)
+    if not math.isfinite(scale_x) or scale_x <= 0.0:
+        scale_x = fallback if math.isfinite(fallback) and fallback > 0.0 else 1.0
+    if not math.isfinite(scale_y) or scale_y <= 0.0:
+        scale_y = fallback if math.isfinite(fallback) and fallback > 0.0 else 1.0
+    return scale_x, scale_y
 
 
 def _project_front_source_to_pose_frame(
@@ -2219,23 +2407,30 @@ def _project_front_source_to_pose_frame(
     x_relative = _sample_2d_bilinear(reconstruction_maps["x_relative"], x_front, y_front, valid_mask=support_mask)
     if x_relative is None:
         return None
+    y_pose = _map_front_row_to_role(reconstruction_maps, role, y_front)
+    if y_pose is None:
+        return None
+
     if role == "front":
-        center = _sample_1d_linear(reconstruction_maps["front_centers"], y_front)
+        center = _sample_1d_linear(reconstruction_maps["front_centers"], y_pose)
         if center is None:
             return None
-        return float(center + x_relative), float(y_front)
+        return float(center + x_relative), float(y_pose)
 
-    depth_front = _sample_2d_bilinear(reconstruction_maps["depth_front"], x_front, y_front, valid_mask=support_mask)
-    if depth_front is None:
+    if role == "left":
+        centers_key = "left_centers"
+    elif role == "right":
+        centers_key = "right_centers"
+    else:
         return None
-    angle = -45.0 if role == "left" else 45.0
-    theta = math.radians(angle)
-    x_rot = (x_relative * math.cos(theta)) + (depth_front * math.sin(theta))
-    centers_key = "left_centers" if role == "left" else "right_centers"
-    center = _sample_1d_linear(reconstruction_maps[centers_key], y_front)
+
+    x_rot = _sample_side_rotated_x(reconstruction_maps, role, x_front, y_front, support_mask)
+    if x_rot is None:
+        return None
+    center = _sample_1d_linear(reconstruction_maps[centers_key], y_pose)
     if center is None:
         return None
-    return float(center + x_rot), float(y_front)
+    return float(center + x_rot), float(y_pose)
 
 
 def _project_front_source_to_training_frame(
@@ -2243,13 +2438,15 @@ def _project_front_source_to_training_frame(
     role: str,
     x_front: float,
     y_front: float,
-    scale_factor: float,
+    scale_x: float,
+    scale_y: float,
 ) -> tuple[float, float] | None:
     pose_point = _project_front_source_to_pose_frame(reconstruction_maps, role, x_front, y_front)
     if pose_point is None:
         return None
-    scale = float(scale_factor) if math.isfinite(float(scale_factor)) and float(scale_factor) > 0.0 else 1.0
-    return float(pose_point[0] * scale), float(pose_point[1] * scale)
+    sx = float(scale_x) if math.isfinite(float(scale_x)) and float(scale_x) > 0.0 else 1.0
+    sy = float(scale_y) if math.isfinite(float(scale_y)) and float(scale_y) > 0.0 else 1.0
+    return float(pose_point[0] * sx), float(pose_point[1] * sy)
 
 
 def _point_has_mask_support(mask: np.ndarray, x: float, y: float, radius: int = 2) -> bool:
@@ -2273,31 +2470,44 @@ def _remap_unwarped_minutiae_to_sample(
     reconstruction_maps: dict[str, np.ndarray],
     sample: RawViewSample,
     preprocessed: PreprocessedContactlessImage,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     role = _view_role_for_sample(sample)
     if role is None:
-        return []
+        return [], {"view_role": None, "reason": "unsupported_raw_view_index"}
 
     remapped: list[dict[str, Any]] = []
     height, width = preprocessed.preprocessed_gray.shape
+    scale_x, scale_y = _training_frame_scale_from_preprocessed(preprocessed)
+    source_minutiae, filter_counters = _canonical_minutiae_with_front_sources(canonical_minutiae, unwarp_maps)
+    remap_details: dict[str, Any] = {
+        "view_role": role,
+        "scale_x": scale_x,
+        "scale_y": scale_y,
+        **filter_counters,
+        "dropped_projection_failed": 0,
+        "dropped_out_of_training_bounds": 0,
+        "dropped_no_final_mask_support": 0,
+        "reprojected_minutiae_count": 0,
+    }
     delta = 4.0
-    for minutia in canonical_minutiae:
-        source_point = _map_unwarped_to_front_source(unwarp_maps, float(minutia["x"]), float(minutia["y"]))
-        if source_point is None:
-            continue
+    for minutia, source_x, source_y in source_minutiae:
         destination = _project_front_source_to_training_frame(
             reconstruction_maps,
             role,
-            source_point[0],
-            source_point[1],
-            preprocessed.ridge_scale_factor,
+            source_x,
+            source_y,
+            scale_x,
+            scale_y,
         )
         if destination is None:
+            remap_details["dropped_projection_failed"] += 1
             continue
         x_dst, y_dst = destination
         if x_dst < 0.0 or y_dst < 0.0 or x_dst >= float(width) or y_dst >= float(height):
+            remap_details["dropped_out_of_training_bounds"] += 1
             continue
         if not _point_has_mask_support(preprocessed.final_mask, x_dst, y_dst):
+            remap_details["dropped_no_final_mask_support"] += 1
             continue
 
         theta = float(minutia["theta"])
@@ -2315,7 +2525,8 @@ def _remap_unwarped_minutiae_to_sample(
                 role,
                 candidate[0],
                 candidate[1],
-                preprocessed.ridge_scale_factor,
+                scale_x,
+                scale_y,
             )
             if projected is not None:
                 projected_points.append(projected)
@@ -2343,7 +2554,8 @@ def _remap_unwarped_minutiae_to_sample(
                 "source": str(minutia.get("source", "reconstruction_unwarp")),
             }
         )
-    return remapped
+    remap_details["reprojected_minutiae_count"] = len(remapped)
+    return remapped, remap_details
 
 
 def _write_minutiae_json(path: Path, minutiae: list[dict[str, Any]]) -> None:
@@ -2551,15 +2763,19 @@ def _reconstruct_multiview_acquisition(sample: RawViewSample, output_root: Path)
     stitched_right[support_mask <= 0] = 0.0
     stitched_left[support_mask <= 0] = 0.0
 
-    _, depth_right = _rotate_depth_branch(x_relative_masked, stitched_right, 45.0)
-    _, depth_left = _rotate_depth_branch(x_relative_masked, stitched_left, -45.0)
+    x_right_rot, depth_right = _rotate_depth_branch(x_relative_masked, stitched_right, 45.0)
+    x_left_rot, depth_left = _rotate_depth_branch(x_relative_masked, stitched_left, -45.0)
     depth_front = z_up.astype(np.float32)
     depth_front[support_mask <= 0] = 0.0
     depth_left[support_mask <= 0] = 0.0
     depth_right[support_mask <= 0] = 0.0
+    x_right_rot[support_mask <= 0] = 0.0
+    x_left_rot[support_mask <= 0] = 0.0
     depth_front = np.nan_to_num(depth_front, nan=0.0, posinf=0.0, neginf=0.0)
     depth_left = np.nan_to_num(depth_left, nan=0.0, posinf=0.0, neginf=0.0)
     depth_right = np.nan_to_num(depth_right, nan=0.0, posinf=0.0, neginf=0.0)
+    x_right_rot = np.nan_to_num(x_right_rot, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+    x_left_rot = np.nan_to_num(x_left_rot, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
     depth_gradient_labels = _build_depth_gradient_labels(
         depth_front=depth_front,
         depth_left=depth_left,
@@ -2617,11 +2833,16 @@ def _reconstruct_multiview_acquisition(sample: RawViewSample, output_root: Path)
             "depth_front": depth_front.astype(np.float32),
             "depth_left": depth_left.astype(np.float32),
             "depth_right": depth_right.astype(np.float32),
+            "x_left_rot": x_left_rot.astype(np.float32),
+            "x_right_rot": x_right_rot.astype(np.float32),
             "stitched_left": stitched_left.astype(np.float32),
             "stitched_right": stitched_right.astype(np.float32),
             "front_centers": front_centers.astype(np.float32),
             "left_centers": left_centers.astype(np.float32),
             "right_centers": right_centers.astype(np.float32),
+            "front_valid_rows": front_geometry.valid_rows.astype(np.uint8),
+            "left_valid_rows": left_geometry.valid_rows.astype(np.uint8),
+            "right_valid_rows": right_geometry.valid_rows.astype(np.uint8),
             "x_crit": x_crit.astype(np.float32),
         },
     )
@@ -2707,6 +2928,8 @@ def _reconstruct_multiview_acquisition(sample: RawViewSample, output_root: Path)
         left_geometry=left_geometry,
         right_geometry=right_geometry,
         x_relative=x_relative_masked,
+        x_left_rot=x_left_rot,
+        x_right_rot=x_right_rot,
         depth_front=depth_front,
         stitched_left=stitched_left,
         stitched_right=stitched_right,
@@ -2737,6 +2960,10 @@ def _reconstruct_multiview_acquisition(sample: RawViewSample, output_root: Path)
             "critical_point": "x_crit = a * cos(theta)",
             "side_rotation_degrees": {"left": -45.0, "right": 45.0},
             "side_stitching": "piecewise stitch before rotation: Z_R uses z_down for x<x_crit else z_up; Z_L uses z_up for x<=-x_crit else z_down",
+            "rotated_side_x_maps": {
+                "left": "x_left_rot in reconstruction_maps.npz",
+                "right": "x_right_rot in reconstruction_maps.npz",
+            },
         },
         "outputs": {
             "depth_front": "depth_front.npy",
@@ -3280,6 +3507,38 @@ def _enhance_for_minutiae(gray_image: np.ndarray) -> np.ndarray:
     return _to_uint8_image(enhanced)
 
 
+def _extract_direct_sample_minutiae(
+    prepared: PreparedBundleArtifacts,
+    minutiae_enhanced_path: Path,
+    fingerflow_model_dir: Path,
+    fingerflow_backend: FingerflowBackendConfig,
+) -> tuple[list[dict[str, Any]], str]:
+    """Extract fallback minutiae directly from this sample's enhanced 2D image."""
+    minutiae_source = f"fingerflow_{fingerflow_backend.backend}"
+    try:
+        if fingerflow_backend.backend == "wsl":
+            minutiae = _extract_fingerflow_minutiae_wsl(
+                prepared.image_path,
+                minutiae_enhanced_path,
+                prepared.bundle_dir,
+                fingerflow_model_dir,
+                backend=fingerflow_backend,
+            )
+        else:
+            minutiae = _extract_fingerflow_minutiae(
+                prepared.image_path,
+                minutiae_enhanced_path,
+                prepared.bundle_dir,
+                fingerflow_model_dir,
+            )
+        return minutiae, minutiae_source
+    except Exception:
+        fallback_started_at = time.perf_counter()
+        minutiae = _extract_pyfing_minutiae(prepared.enhanced_image)
+        _record_stage_time("pyfing_fallback", time.perf_counter() - fallback_started_at)
+        return minutiae, "pyfing_fallback"
+
+
 def _rasterize_minutiae(
     minutiae: list[dict[str, Any]],
     source_shape: tuple[int, int],
@@ -3368,17 +3627,18 @@ def _build_featurenet_targets(
     minutiae: list[dict[str, Any]],
 ) -> dict[str, np.ndarray]:
     output_shape = _compute_output_shape(*gray_image.shape)
-    mask_small = _resize_mask(mask, output_shape)
+    mask_small_dense = _resize_mask(mask, output_shape)
+    mask_small_points = _downsample_mask_for_points(mask, output_shape)
 
     orientation_small = _resize_orientation_for_model(orientation, mask.astype(np.float32) / 255.0, output_shape)
-    orientation_one_hot = _build_orientation_one_hot(orientation_small, mask_small)
+    orientation_one_hot = _build_orientation_one_hot(orientation_small, mask_small_dense)
 
-    ridge_small = _resize_float(ridge_period, output_shape) * mask_small
+    ridge_small = _resize_float(ridge_period, output_shape) * mask_small_dense
     ridge_max = float(ridge_small.max(initial=0.0))
     if ridge_max > 0.0:
         ridge_small = ridge_small / ridge_max
 
-    minutia_targets = _rasterize_minutiae(minutiae, gray_image.shape, output_shape, mask_small)
+    minutia_targets = _rasterize_minutiae(minutiae, gray_image.shape, output_shape, mask_small_points)
     targets = {
         "orientation": orientation_one_hot.astype(np.float32),
         "ridge_period": ridge_small[np.newaxis, ...].astype(np.float32),
@@ -3390,13 +3650,29 @@ def _build_featurenet_targets(
         "minutia_y_offset": minutia_targets["minutia_y_offset"],
         "minutia_orientation": minutia_targets["minutia_orientation"],
         "minutia_orientation_vec": minutia_targets["minutia_orientation_vec"],
-        "output_mask": mask_small[np.newaxis, ...].astype(np.float32),
+        "output_mask": mask_small_dense[np.newaxis, ...].astype(np.float32),
     }
     if gradient is not None:
-        grad_x_small = _resize_float(gradient[:, :, 0], output_shape) * mask_small
-        grad_y_small = _resize_float(gradient[:, :, 1], output_shape) * mask_small
+        grad_x_small = _resize_float(gradient[:, :, 0], output_shape) * mask_small_dense
+        grad_y_small = _resize_float(gradient[:, :, 1], output_shape) * mask_small_dense
         targets["gradient"] = np.stack([grad_x_small, grad_y_small], axis=0).astype(np.float32)
     return targets
+
+
+def _build_targets_and_count_rasterized_minutiae(
+    prepared: PreparedBundleArtifacts,
+    minutiae: list[dict[str, Any]],
+) -> tuple[dict[str, np.ndarray], int]:
+    targets = _build_featurenet_targets(
+        gray_image=prepared.gray_image,
+        mask=prepared.mask,
+        orientation=prepared.orientation,
+        ridge_period=prepared.ridge_period,
+        gradient=prepared.reconstruction_gradient,
+        minutiae=minutiae,
+    )
+    valid_count = int(np.count_nonzero(targets["minutia_valid_mask"]))
+    return targets, valid_count
 
 
 def _save_npz(path: Path, arrays: dict[str, np.ndarray]) -> None:
@@ -3513,6 +3789,10 @@ def _build_bundle_meta(
     minutiae_ground_truth_details: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     sample = prepared.sample
+    actual_scale_x, actual_scale_y = _training_frame_scale_from_preprocessed(prepared.preprocessed)
+    output_shape = featurenet_targets["output_mask"].shape[-2:]
+    point_mask = _downsample_mask_for_points(prepared.mask, output_shape)
+    rasterized_minutiae_count = int(np.count_nonzero(featurenet_targets["minutia_valid_mask"]))
     meta = {
         "sample_id": sample.sample_id,
         "subject_id": sample.subject_id,
@@ -3547,6 +3827,8 @@ def _build_bundle_meta(
                 "method": "central_region_spacing_rescaled_to_10_pixels",
                 "target_spacing_pixels": 10.0,
                 "scale_factor": prepared.preprocessed.ridge_scale_factor,
+                "actual_scale_x": actual_scale_x,
+                "actual_scale_y": actual_scale_y,
             },
             "saved_artifacts": [
                 "raw_input.png",
@@ -3578,7 +3860,11 @@ def _build_bundle_meta(
             "raw_views": len(sample.raw_view_paths),
             "variants": len(sample.variant_paths),
             "minutiae": len(minutiae),
-            "minutia_support_pixels": int(np.count_nonzero(featurenet_targets["minutia_valid_mask"])),
+            "minutia_support_pixels": rasterized_minutiae_count,
+            "rasterized_minutiae_count": rasterized_minutiae_count,
+            "output_mask_pixels": int(np.count_nonzero(featurenet_targets["output_mask"])),
+            "point_mask_pixels": int(np.count_nonzero(point_mask)),
+            "dense_output_mask_pixels": int(np.count_nonzero(featurenet_targets["output_mask"])),
         },
         "version": 2,
     }
@@ -3656,9 +3942,12 @@ def _generate_bundle_from_loaded(
     minutiae_ground_truth_details: dict[str, Any] | None = None
     minutiae_source = f"fingerflow_{fingerflow_backend.backend}"
     minutiae: list[dict[str, Any]]
+    featurenet_targets: dict[str, np.ndarray]
+    rasterized_count = 0
     reconstruction = prepared.reconstruction
     role = _view_role_for_sample(prepared.sample)
 
+    postprocess_started_at = time.perf_counter()
     if reconstruction is not None and role is not None:
         try:
             canonical_minutiae, canonical_source, canonical_details = _load_or_extract_canonical_reconstruction_minutiae(
@@ -3668,95 +3957,113 @@ def _generate_bundle_from_loaded(
             )
             unwarp_maps = _load_npz_arrays(Path(reconstruction.center_unwarp_maps_path))
             reconstruction_maps = _load_npz_arrays(Path(reconstruction.reconstruction_maps_path))
-            minutiae = _remap_unwarped_minutiae_to_sample(
+            reprojected_minutiae, remap_details = _remap_unwarped_minutiae_to_sample(
                 canonical_minutiae,
                 unwarp_maps,
                 reconstruction_maps,
                 prepared.sample,
                 prepared.preprocessed,
             )
-            minutiae_source = f"{canonical_source}_reprojected_{role}"
-            minutiae_ground_truth_details = {
-                "mode": "reconstruction_backed",
-                "canonical_source": canonical_source,
-                "view_role": role,
-                "center_unwarped_image_path": reconstruction.center_unwarped_image_path,
-                "center_unwarped_mask_path": reconstruction.center_unwarped_mask_path,
-                "center_unwarp_maps_path": reconstruction.center_unwarp_maps_path,
-                "reconstruction_maps_path": reconstruction.reconstruction_maps_path,
-                **canonical_details,
-                "canonical_minutiae_count": len(canonical_minutiae),
-                "reprojected_minutiae_count": len(minutiae),
-            }
+            reconstruction_targets, reconstruction_rasterized_count = _build_targets_and_count_rasterized_minutiae(
+                prepared,
+                reprojected_minutiae,
+            )
+            if reconstruction_rasterized_count >= MIN_RASTERIZED_MINUTIAE_FOR_RECONSTRUCTION:
+                minutiae = reprojected_minutiae
+                minutiae_source = f"{canonical_source}_reprojected_{role}"
+                featurenet_targets = reconstruction_targets
+                rasterized_count = reconstruction_rasterized_count
+                minutiae_ground_truth_details = {
+                    "mode": "reconstruction_backed",
+                    "canonical_source": canonical_source,
+                    "view_role": role,
+                    "canonical_minutiae_count": len(canonical_minutiae),
+                    "reprojected_minutiae_count": len(minutiae),
+                    "rasterized_minutiae_count": rasterized_count,
+                    "center_unwarped_image_path": reconstruction.center_unwarped_image_path,
+                    "center_unwarped_mask_path": reconstruction.center_unwarped_mask_path,
+                    "center_unwarp_maps_path": reconstruction.center_unwarp_maps_path,
+                    "reconstruction_maps_path": reconstruction.reconstruction_maps_path,
+                    **canonical_details,
+                    **remap_details,
+                }
+            else:
+                fallback_minutiae, fallback_source = _extract_direct_sample_minutiae(
+                    prepared,
+                    minutiae_enhanced_path,
+                    fingerflow_model_dir,
+                    fingerflow_backend,
+                )
+                fallback_targets, fallback_rasterized_count = _build_targets_and_count_rasterized_minutiae(
+                    prepared,
+                    fallback_minutiae,
+                )
+                fallback_reason = (
+                    "empty_reprojection"
+                    if not reprojected_minutiae
+                    else "zero_rasterized_minutiae_after_reprojection"
+                )
+                minutiae = fallback_minutiae
+                minutiae_source = fallback_source
+                featurenet_targets = fallback_targets
+                rasterized_count = fallback_rasterized_count
+                minutiae_ground_truth_details = {
+                    "mode": (
+                        "direct_fallback_after_empty_reprojection"
+                        if not reprojected_minutiae
+                        else "direct_fallback_after_zero_rasterized_reprojection"
+                    ),
+                    "view_role": role,
+                    "fallback_reason": fallback_reason,
+                    "canonical_source": canonical_source,
+                    "canonical_minutiae_count": len(canonical_minutiae),
+                    "reprojected_minutiae_count_before_fallback": len(reprojected_minutiae),
+                    "rasterized_minutiae_count_before_fallback": reconstruction_rasterized_count,
+                    "fallback_source": fallback_source,
+                    "fallback_minutiae_count": len(fallback_minutiae),
+                    "fallback_rasterized_minutiae_count": fallback_rasterized_count,
+                    "center_unwarped_image_path": reconstruction.center_unwarped_image_path,
+                    "center_unwarped_mask_path": reconstruction.center_unwarped_mask_path,
+                    "center_unwarp_maps_path": reconstruction.center_unwarp_maps_path,
+                    "reconstruction_maps_path": reconstruction.reconstruction_maps_path,
+                    **canonical_details,
+                    **remap_details,
+                }
         except Exception as exc:
+            fallback_minutiae, fallback_source = _extract_direct_sample_minutiae(
+                prepared,
+                minutiae_enhanced_path,
+                fingerflow_model_dir,
+                fingerflow_backend,
+            )
+            featurenet_targets, rasterized_count = _build_targets_and_count_rasterized_minutiae(
+                prepared,
+                fallback_minutiae,
+            )
+            minutiae = fallback_minutiae
+            minutiae_source = fallback_source
             minutiae_ground_truth_details = {
                 "mode": "direct_fallback_after_reconstruction_failure",
                 "view_role": role,
+                "fallback_reason": "reconstruction_exception",
                 "reason": str(exc),
+                "fallback_source": fallback_source,
+                "fallback_minutiae_count": len(fallback_minutiae),
+                "fallback_rasterized_minutiae_count": rasterized_count,
             }
-            minutiae = []
-        if minutiae:
-            pass
-        else:
-            minutiae_source = f"fingerflow_{fingerflow_backend.backend}"
-            try:
-                if fingerflow_backend.backend == "wsl":
-                    minutiae = _extract_fingerflow_minutiae_wsl(
-                        prepared.image_path,
-                        minutiae_enhanced_path,
-                        prepared.bundle_dir,
-                        fingerflow_model_dir,
-                        backend=fingerflow_backend,
-                    )
-                else:
-                    minutiae = _extract_fingerflow_minutiae(
-                        prepared.image_path,
-                        minutiae_enhanced_path,
-                        prepared.bundle_dir,
-                        fingerflow_model_dir,
-                    )
-            except Exception:
-                minutiae_source = "pyfing_fallback"
-                fallback_started_at = time.perf_counter()
-                minutiae = _extract_pyfing_minutiae(prepared.enhanced_image)
-                _record_stage_time("pyfing_fallback", time.perf_counter() - fallback_started_at)
-            if minutiae_ground_truth_details is None:
-                minutiae_ground_truth_details = {"mode": "direct_per_sample"}
-            minutiae_ground_truth_details["fallback_minutiae_count"] = len(minutiae)
-            minutiae_ground_truth_details["fallback_source"] = minutiae_source
     else:
-        try:
-            if fingerflow_backend.backend == "wsl":
-                minutiae = _extract_fingerflow_minutiae_wsl(
-                    prepared.image_path,
-                    minutiae_enhanced_path,
-                    prepared.bundle_dir,
-                    fingerflow_model_dir,
-                    backend=fingerflow_backend,
-                )
-            else:
-                minutiae = _extract_fingerflow_minutiae(
-                    prepared.image_path,
-                    minutiae_enhanced_path,
-                    prepared.bundle_dir,
-                    fingerflow_model_dir,
-                )
-        except Exception:
-            minutiae_source = "pyfing_fallback"
-            fallback_started_at = time.perf_counter()
-            minutiae = _extract_pyfing_minutiae(prepared.enhanced_image)
-            _record_stage_time("pyfing_fallback", time.perf_counter() - fallback_started_at)
-        minutiae_ground_truth_details = {"mode": "direct_per_sample", "source": minutiae_source}
-
-    postprocess_started_at = time.perf_counter()
-    featurenet_targets = _build_featurenet_targets(
-        gray_image=prepared.gray_image,
-        mask=prepared.mask,
-        orientation=prepared.orientation,
-        ridge_period=prepared.ridge_period,
-        gradient=prepared.reconstruction_gradient,
-        minutiae=minutiae,
-    )
+        minutiae, minutiae_source = _extract_direct_sample_minutiae(
+            prepared,
+            minutiae_enhanced_path,
+            fingerflow_model_dir,
+            fingerflow_backend,
+        )
+        featurenet_targets, rasterized_count = _build_targets_and_count_rasterized_minutiae(prepared, minutiae)
+        minutiae_ground_truth_details = {
+            "mode": "direct_per_sample",
+            "source": minutiae_source,
+            "rasterized_minutiae_count": rasterized_count,
+        }
 
     meta = _build_bundle_meta(
         prepared,
@@ -3784,9 +4091,22 @@ def _generate_bundle_from_loaded(
 
     return {
         "bundle_dir": str(prepared.bundle_dir.resolve()),
-        "minutiae_count": len(minutiae),
+        "sample_id": prepared.sample.sample_id,
         "raw_view_index": prepared.sample.raw_view_index,
+        "view_role": role,
+        "minutiae_count": len(minutiae),
+        "rasterized_minutiae_count": rasterized_count,
         "minutiae_source": minutiae_source,
+        "minutiae_gt_mode": minutiae_ground_truth_details.get("mode") if minutiae_ground_truth_details else None,
+        "reconstruction_available": reconstruction is not None,
+        "used_reconstruction_backed_final_labels": (
+            minutiae_ground_truth_details is not None
+            and minutiae_ground_truth_details.get("mode") == "reconstruction_backed"
+        ),
+        "used_direct_fallback": (
+            minutiae_ground_truth_details is not None
+            and str(minutiae_ground_truth_details.get("mode", "")).startswith("direct_fallback")
+        ),
         "mask_source": prepared.preprocessed.mask_source,
         "pose_rotation_degrees": prepared.preprocessed.pose_rotation_degrees,
         "ridge_scale_factor": prepared.preprocessed.ridge_scale_factor,
@@ -4124,6 +4444,71 @@ def _run_smoke_test(output_root: Path, sample_count: int) -> dict[str, Any] | No
         "last_total_loss": report["last_total_loss"],
         "loss_delta": report["loss_delta"],
     }
+
+
+def _summarize_minutiae_generation_results(generation_results: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate final minutiae supervision quality by view role and mode."""
+    summary: dict[str, Any] = {
+        "total_samples": 0,
+        "zero_rasterized_minutiae_samples": 0,
+        "by_view_role": {},
+        "by_raw_view_index": {},
+        "by_mode": {},
+    }
+
+    def ensure_bucket(container: dict[str, Any], key: str) -> dict[str, Any]:
+        if key not in container:
+            container[key] = {
+                "sample_count": 0,
+                "zero_rasterized_minutiae_samples": 0,
+                "minutiae_count_sum": 0,
+                "rasterized_minutiae_count_sum": 0,
+                "rasterized_minutiae_count_min": None,
+                "rasterized_minutiae_count_max": None,
+                "used_reconstruction_backed_final_labels": 0,
+                "used_direct_fallback": 0,
+            }
+        return container[key]
+
+    def update_bucket(bucket: dict[str, Any], result: dict[str, Any], rasterized: int) -> None:
+        bucket["sample_count"] += 1
+        bucket["minutiae_count_sum"] += int(result.get("minutiae_count", 0) or 0)
+        bucket["rasterized_minutiae_count_sum"] += rasterized
+        if rasterized == 0:
+            bucket["zero_rasterized_minutiae_samples"] += 1
+        current_min = bucket["rasterized_minutiae_count_min"]
+        current_max = bucket["rasterized_minutiae_count_max"]
+        bucket["rasterized_minutiae_count_min"] = rasterized if current_min is None else min(current_min, rasterized)
+        bucket["rasterized_minutiae_count_max"] = rasterized if current_max is None else max(current_max, rasterized)
+        if result.get("used_reconstruction_backed_final_labels"):
+            bucket["used_reconstruction_backed_final_labels"] += 1
+        if result.get("used_direct_fallback"):
+            bucket["used_direct_fallback"] += 1
+
+    for result in generation_results.values():
+        summary["total_samples"] += 1
+        rasterized = int(result.get("rasterized_minutiae_count", 0) or 0)
+        if rasterized == 0:
+            summary["zero_rasterized_minutiae_samples"] += 1
+
+        role = str(result.get("view_role") or "none")
+        raw_view = str(result.get("raw_view_index"))
+        mode = str(result.get("minutiae_gt_mode") or "unknown")
+
+        update_bucket(ensure_bucket(summary["by_view_role"], role), result, rasterized)
+        update_bucket(ensure_bucket(summary["by_raw_view_index"], raw_view), result, rasterized)
+        update_bucket(ensure_bucket(summary["by_mode"], mode), result, rasterized)
+
+    for container_name in ("by_view_role", "by_raw_view_index", "by_mode"):
+        for bucket in summary[container_name].values():
+            count = max(int(bucket["sample_count"]), 1)
+            bucket["mean_minutiae_count"] = float(bucket["minutiae_count_sum"] / count)
+            bucket["mean_rasterized_minutiae_count"] = float(bucket["rasterized_minutiae_count_sum"] / count)
+            bucket["zero_rasterized_minutiae_fraction"] = float(bucket["zero_rasterized_minutiae_samples"] / count)
+
+    total = max(int(summary["total_samples"]), 1)
+    summary["zero_rasterized_minutiae_fraction"] = float(summary["zero_rasterized_minutiae_samples"] / total)
+    return summary
 
 
 def _write_summary(output_root: Path, summary: dict[str, Any]) -> None:
@@ -4789,6 +5174,8 @@ def main() -> int:
         load_executor.shutdown(wait=True)
         write_executor.shutdown(wait=True)
 
+    minutiae_audit = _summarize_minutiae_generation_results(generation_results)
+    (output_root / "minutiae_audit.json").write_text(json.dumps(minutiae_audit, indent=2), encoding="utf-8")
     smoke = _run_smoke_test(output_root, args.smoke_samples)
     summary = {
         "dataset_root": str(dataset_root),
@@ -4805,6 +5192,7 @@ def main() -> int:
         "selected_fingerflow_device": _SELECTED_FINGERFLOW_DEVICE,
         "pipeline_stage_seconds": {key: round(value, 3) for key, value in _PIPELINE_STAGE_TOTALS.items()},
         "fingerflow_backend": asdict(fingerflow_backend),
+        "minutiae_audit": minutiae_audit,
         "reconstruction": {
             "eligible_acquisition_count": len(reconstruction_candidates),
             "generated_acquisition_count": len(reconstruction_results),

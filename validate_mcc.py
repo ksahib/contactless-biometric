@@ -3,9 +3,25 @@ from __future__ import annotations
 import argparse
 import math
 import hashlib
+import importlib.util
 import json
+import sys
+import sysconfig
 import tempfile
 from pathlib import Path
+
+
+def ensure_stdlib_copy_module() -> None:
+    stdlib_copy = Path(sysconfig.get_paths()["stdlib"]) / "copy.py"
+    spec = importlib.util.spec_from_file_location("copy", stdlib_copy)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not resolve stdlib copy module from {stdlib_copy}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["copy"] = module
+    spec.loader.exec_module(module)
+
+
+ensure_stdlib_copy_module()
 
 import cv2
 import numpy as np
@@ -24,6 +40,8 @@ SUPPORTED_METHODS = DEFAULT_METHODS + (
     "LSA-R-CANONICAL",
     "LSA-CANONICAL-OVERLAP",
     "LSA-R-CANONICAL-OVERLAP",
+    "LSA-CENTROID",
+    "LSA-R-CENTROID",
 )
 DEFAULT_COMPARE_RUN_DIRS = (
     Path("match_outputs/match_1773388243"),
@@ -884,6 +902,7 @@ def _method_diagnostics(
 ) -> dict:
     overlap_details = None
     pose_details = None
+    centroid_details = None
     canonical_pose_details = None
     descriptor_method = method.replace("-LEGACY", "")
     diagnostic_descriptors_a = descriptors_a
@@ -897,6 +916,12 @@ def _method_diagnostics(
             csv_b,
             mask_a,
             mask_b,
+            method=method,
+        )
+    elif method in {"LSA-CENTROID", "LSA-R-CENTROID"} and csv_a is not None and csv_b is not None:
+        score, sim_matrix, centroid_details = mcc.match_minutiae_csv_centroid_details(
+            csv_a,
+            csv_b,
             method=method,
         )
     elif method in {
@@ -949,7 +974,15 @@ def _method_diagnostics(
     relaxed_scores: list[float] = []
     selected_scores: list[float] = []
 
-    if pose_details is not None:
+    if centroid_details is not None:
+        selected_pairs = [
+            (int(pair["row"]), int(pair["col"]), float(pair["score"]))
+            for pair in centroid_details["selected_pairs"]
+        ]
+        selected_scores = [float(score_value) for score_value in centroid_details["selected_pair_scores"]]
+        relaxed_scores = [float(score_value) for score_value in centroid_details["relaxed_top_scores"]]
+        relaxation_details = centroid_details["relaxation_details"]
+    elif pose_details is not None:
         selected_pairs = [
             (int(pair["row"]), int(pair["col"]), float(pair["score"]))
             for pair in pose_details["selected_pairs"]
@@ -959,7 +992,7 @@ def _method_diagnostics(
         relaxation_details = pose_details["relaxation_details"]
     elif method == "LSS":
         selected_pairs = mcc._select_lss_pairs(sim_matrix, n_pairs)
-    elif method in {"LSA", "LSA-LEGACY", "LSA-OVERLAP", "LSA-CANONICAL", "LSA-CANONICAL-OVERLAP"}:
+    elif method in {"LSA", "LSA-LEGACY", "LSA-OVERLAP", "LSA-CANONICAL", "LSA-CANONICAL-OVERLAP", "LSA-CENTROID"}:
         selected_pairs = mcc._select_lsa_pairs(sim_matrix, n_pairs)
     elif method == "LSS-R":
         selected_pairs = mcc._select_lss_pairs(
@@ -986,7 +1019,7 @@ def _method_diagnostics(
         top_indices = np.argsort(efficiency)[::-1][: min(n_pairs, len(selected_pairs))]
         relaxed_scores = [float(relaxed[index]) for index in top_indices]
 
-    if method not in {"LSS-R", "LSA-R", "LSA-R-LEGACY", "LSA-R-OVERLAP", "LSA-R-CANONICAL", "LSA-R-CANONICAL-OVERLAP"}:
+    if method not in {"LSS-R", "LSA-R", "LSA-R-LEGACY", "LSA-R-OVERLAP", "LSA-R-CANONICAL", "LSA-R-CANONICAL-OVERLAP", "LSA-R-CENTROID"}:
         relaxation_details = None
 
     selected_scores = [float(pair[2]) for pair in selected_pairs[:top_k]]
@@ -994,7 +1027,7 @@ def _method_diagnostics(
         {"row": int(row), "col": int(col), "score": float(score)}
         for row, col, score in selected_pairs[:top_k]
     ]
-    if overlap_details is None and pose_details is None:
+    if overlap_details is None and pose_details is None and centroid_details is None:
         gating_stats = _pair_gating_stats(diagnostic_descriptors_a, diagnostic_descriptors_b, sim_matrix)
     else:
         gating_stats = {
@@ -1069,8 +1102,24 @@ def _method_diagnostics(
             "legacy_method": pose_details["legacy_method"],
             "legacy_score": float(pose_details["legacy_score"]),
         }
-        if canonical_pose_details is not None:
-            report["pose_comparison"] = {
+    if centroid_details is not None:
+        report["centroid_pose_details"] = {
+            "transform": centroid_details["transform"],
+            "pose_normalization": centroid_details["pose_normalization"],
+            "fallback_reason": centroid_details["fallback_reason"],
+            "raw_minutiae_count": {
+                "left": int(centroid_details["left_raw_minutiae_count"]),
+                "right": int(centroid_details["right_raw_minutiae_count"]),
+            },
+            "descriptor_count_after": {
+                "left": int(centroid_details["left_descriptor_count_after"]),
+                "right": int(centroid_details["right_descriptor_count_after"]),
+            },
+            "final_selected_pair_count": int(centroid_details["selected_pair_count"]),
+            "warnings": list(centroid_details["warnings"]),
+        }
+    if canonical_pose_details is not None:
+        report["pose_comparison"] = {
                 "active_strategy": "relative",
                 "relative": {
                     "final_score": float(score),
@@ -1108,7 +1157,7 @@ def _method_diagnostics(
                     "canonical_minus_relative": float(canonical_score - score),
                 },
             }
-    if method in {"LSS-R", "LSA-R", "LSA-R-LEGACY", "LSA-R-OVERLAP", "LSA-R-CANONICAL", "LSA-R-CANONICAL-OVERLAP"}:
+    if method in {"LSS-R", "LSA-R", "LSA-R-LEGACY", "LSA-R-OVERLAP", "LSA-R-CANONICAL", "LSA-R-CANONICAL-OVERLAP", "LSA-R-CENTROID"}:
         strongest_local = report["top_local_pairs"][0]["score"] if report["top_local_pairs"] else 0.0
         report["relaxation_collapse_ratio"] = (
             float(score / strongest_local) if strongest_local > 0 else 0.0

@@ -16,6 +16,7 @@ from .infer import (
     print_output_stats,
     run_inference,
     save_minutiae_csv,
+    save_pose_sidecars,
     _resolve_device,
 )
 
@@ -253,12 +254,15 @@ def _run_single_image_inference(
     minutiae_csv = image_output_dir / "minutiae.csv"
     mask_png = image_output_dir / "mask.png"
     save_minutiae_csv(minutiae_rows, minutiae_csv)
+    orientation_npy, ridge_period_npy = save_pose_sidecars(outputs, image_output_dir)
     _save_mask_png(mask_tensor, mask_png)
 
     return {
         "minutiae_rows": minutiae_rows,
         "minutiae_csv": minutiae_csv,
         "mask_png": mask_png,
+        "orientation_npy": orientation_npy,
+        "ridge_period_npy": ridge_period_npy,
         "preprocess_dir": preprocess_dir,
         "crop_dir": crop_dir,
         "crop_bbox": crop_result["crop_bbox"],
@@ -377,6 +381,8 @@ def main() -> None:
             "run_dir": str(output_dir),
             "a_minutiae_csv": str(result_a["minutiae_csv"]),
             "a_mask_png": str(result_a["mask_png"]),
+            "a_orientation_npy": str(result_a["orientation_npy"]),
+            "a_ridge_period_npy": str(result_a["ridge_period_npy"]),
             "a_crop_dir": str(result_a["crop_dir"]),
             "a_crop_coarse_mask_png": str(result_a["coarse_mask_path"]),
             "a_crop_cropped_png": str(result_a["cropped_path"]),
@@ -386,6 +392,8 @@ def main() -> None:
             "a_preprocess_dir": str(result_a["preprocess_dir"]),
             "b_minutiae_csv": str(result_b["minutiae_csv"]),
             "b_mask_png": str(result_b["mask_png"]),
+            "b_orientation_npy": str(result_b["orientation_npy"]),
+            "b_ridge_period_npy": str(result_b["ridge_period_npy"]),
             "b_crop_dir": str(result_b["crop_dir"]),
             "b_crop_coarse_mask_png": str(result_b["coarse_mask_path"]),
             "b_crop_cropped_png": str(result_b["cropped_path"]),

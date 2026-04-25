@@ -162,6 +162,46 @@ def serialize_outputs(outputs: dict[str, torch.Tensor], output_npz: Path) -> Non
     np.savez_compressed(output_npz, **arrays)
 
 
+def decode_orientation_field_radians(outputs: dict[str, torch.Tensor]) -> np.ndarray:
+    logits = outputs["orientation"].detach().float()
+    if logits.dim() != 4 or logits.shape[0] != 1:
+        raise ValueError(f"expected orientation logits with shape [1,180,H,W], got {tuple(logits.shape)}")
+    probabilities = torch.softmax(logits[0], dim=0)
+    bins = torch.arange(
+        probabilities.shape[0],
+        device=probabilities.device,
+        dtype=probabilities.dtype,
+    ) * (torch.pi / float(probabilities.shape[0]))
+    cos2 = (probabilities * torch.cos(2.0 * bins).view(-1, 1, 1)).sum(dim=0)
+    sin2 = (probabilities * torch.sin(2.0 * bins).view(-1, 1, 1)).sum(dim=0)
+    orientation = 0.5 * torch.atan2(sin2, cos2)
+    orientation = torch.remainder(orientation, torch.pi)
+    return orientation.cpu().numpy().astype(np.float32)
+
+
+def decode_ridge_period_array(outputs: dict[str, torch.Tensor]) -> np.ndarray:
+    ridge_period = outputs["ridge_period"].detach().float()
+    if ridge_period.dim() == 4 and ridge_period.shape[0] == 1 and ridge_period.shape[1] == 1:
+        ridge_period = ridge_period[0, 0]
+    elif ridge_period.dim() == 3 and ridge_period.shape[0] == 1:
+        ridge_period = ridge_period[0]
+    elif ridge_period.dim() != 2:
+        raise ValueError(f"expected ridge_period with shape [1,1,H,W], got {tuple(ridge_period.shape)}")
+    return ridge_period.cpu().numpy().astype(np.float32)
+
+
+def save_pose_sidecars(
+    outputs: dict[str, torch.Tensor],
+    output_dir: Path,
+) -> tuple[Path, Path]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    orientation_path = output_dir / "orientation.npy"
+    ridge_period_path = output_dir / "ridge_period.npy"
+    np.save(orientation_path, decode_orientation_field_radians(outputs))
+    np.save(ridge_period_path, decode_ridge_period_array(outputs))
+    return orientation_path, ridge_period_path
+
+
 def _orientation_vectors_to_radians(vectors: torch.Tensor) -> torch.Tensor:
     if vectors.dim() != 4 or vectors.shape[1] != 2:
         raise ValueError(f"expected minutia_orientation with shape [B,2,H,W], got {tuple(vectors.shape)}")
@@ -327,8 +367,11 @@ def main() -> None:
         apply_nms=not bool(args.disable_minutia_nms),
     )
     save_minutiae_csv(minutiae_rows, output_minutiae_csv)
+    orientation_path, ridge_period_path = save_pose_sidecars(outputs, output_minutiae_csv.parent)
     print(f"Saved raw logits NPZ: {output_npz}")
     print(f"Saved decoded minutiae CSV: {output_minutiae_csv} (rows={len(minutiae_rows)})")
+    print(f"Saved orientation sidecar: {orientation_path}")
+    print(f"Saved ridge-period sidecar: {ridge_period_path}")
 
 
 if __name__ == "__main__":

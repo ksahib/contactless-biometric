@@ -2,20 +2,37 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
+import importlib.util
 import json
 import os
 import sys
+import sysconfig
 import time
 import traceback
 from importlib import metadata as importlib_metadata
 from pathlib import Path
 from urllib import error as urlerror
 from urllib import request as urlrequest
+
+
+def ensure_stdlib_copy_module() -> None:
+    stdlib_copy = Path(sysconfig.get_paths()["stdlib"]) / "copy.py"
+    spec = importlib.util.spec_from_file_location("copy", stdlib_copy)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not resolve stdlib copy module from {stdlib_copy}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["copy"] = module
+    spec.loader.exec_module(module)
+
+
+ensure_stdlib_copy_module()
+
 import pandas as pd
 import cv2
 import numpy as np
 import math
 from descriptor import MCCCell, MCCCylinder, MCCOverlapContext
+import pose_normalization as pose_norm
 
 try:
     from rembg import new_session, remove
@@ -576,6 +593,8 @@ def parse_args() -> argparse.Namespace:
                 "LSA-R-CANONICAL",
                 "LSA-CANONICAL-OVERLAP",
                 "LSA-R-CANONICAL-OVERLAP",
+                "LSA-CENTROID",
+                "LSA-R-CENTROID",
             ),
             help="MCC consolidation method.",
         )
@@ -1898,8 +1917,260 @@ def _base_method_for_canonical(method: str) -> str:
     raise ValueError(f"unsupported canonical MCC method: {method}")
 
 
+def _base_method_for_centroid(method: str) -> str:
+    normalized = method.upper()
+    if normalized == "LSA-CENTROID":
+        return "LSA"
+    if normalized == "LSA-R-CENTROID":
+        return "LSA-R"
+    raise ValueError(f"unsupported centroid MCC method: {method}")
+
+
 def _canonical_method_uses_overlap(method: str) -> bool:
     return method.upper().endswith("-OVERLAP")
+
+
+def _load_minutiae_frame_for_centroid(path: Path | pd.DataFrame) -> pd.DataFrame:
+    frame = path.copy() if isinstance(path, pd.DataFrame) else pd.read_csv(path)
+    if "angle" not in frame.columns and "theta" in frame.columns:
+        frame = frame.copy()
+        frame["angle"] = frame["theta"]
+    return frame.dropna(subset=["x", "y", "angle"]).reset_index(drop=True)
+
+
+def _centroid_sidecar_path(
+    minutiae_source: Path | pd.DataFrame,
+    explicit_path: Path | np.ndarray | None,
+    filename: str,
+) -> Path | np.ndarray | None:
+    if explicit_path is not None:
+        return explicit_path
+    if isinstance(minutiae_source, pd.DataFrame):
+        return None
+    candidate = Path(minutiae_source).parent / filename
+    return candidate if candidate.exists() else None
+
+
+def _load_centroid_sidecar_array(
+    source: Path | np.ndarray | None,
+    label: str,
+    warnings: list[str],
+) -> np.ndarray | None:
+    if source is None:
+        warnings.append(f"{label}_missing")
+        return None
+    try:
+        return pose_norm.load_optional_array(source)
+    except Exception as exc:
+        warnings.append(f"{label}_load_failed:{exc}")
+        return None
+
+
+def _frame_from_minutiae(minutiae: list[pose_norm.Minutia]) -> pd.DataFrame:
+    frame = pd.DataFrame([pose_norm.minutia_to_record(minutia) for minutia in minutiae])
+    if "angle" not in frame.columns:
+        frame["angle"] = np.nan
+    return frame.reset_index(drop=True)
+
+
+def _select_report_pairs(
+    descriptors_a: list[MCCCylinder],
+    descriptors_b: list[MCCCylinder],
+    sim_matrix: np.ndarray,
+    base_method: str,
+) -> tuple[list[tuple[int, int, float]], list[float], dict | None]:
+    n_pairs = _compute_n_pairs(len(descriptors_a), len(descriptors_b))
+    if n_pairs == 0:
+        return [], [], None
+    if base_method == "LSA":
+        pairs = _select_lsa_pairs(sim_matrix, n_pairs)
+        return pairs, [], None
+
+    rel_pairs = _select_lsa_pairs(
+        sim_matrix,
+        min(len(descriptors_a), len(descriptors_b)),
+    )
+    relaxed, efficiency, relaxation_details = _relax_pairs_with_details(
+        descriptors_a,
+        descriptors_b,
+        rel_pairs,
+    )
+    top_indices = np.argsort(efficiency)[::-1][: min(n_pairs, len(rel_pairs))]
+    selected_pairs = [rel_pairs[index] for index in top_indices]
+    relaxed_top_scores = [float(relaxed[index]) for index in top_indices]
+    return selected_pairs, relaxed_top_scores, relaxation_details
+
+
+def match_minutiae_csv_centroid_details(
+    path_a: Path | pd.DataFrame,
+    path_b: Path | pd.DataFrame,
+    method: str = "LSA-R-CENTROID",
+    orientation_path_a: Path | np.ndarray | None = None,
+    orientation_path_b: Path | np.ndarray | None = None,
+    ridge_period_path_a: Path | np.ndarray | None = None,
+    ridge_period_path_b: Path | np.ndarray | None = None,
+    config: pose_norm.PoseNormalizationConfig | None = None,
+) -> tuple[float, np.ndarray, dict]:
+    base_method = _base_method_for_centroid(method)
+    cfg = config or pose_norm.PoseNormalizationConfig()
+    warnings: list[str] = []
+
+    raw_frame_a = _load_minutiae_frame_for_centroid(path_a)
+    raw_frame_b = _load_minutiae_frame_for_centroid(path_b)
+    details = {
+        "fallback_to_legacy": False,
+        "fallback_reason": None,
+        "method": method.upper(),
+        "base_method": base_method,
+        "left_raw_minutiae_count": int(len(raw_frame_a)),
+        "right_raw_minutiae_count": int(len(raw_frame_b)),
+        "left_descriptor_count_after": 0,
+        "right_descriptor_count_after": 0,
+        "selected_pair_count": 0,
+        "selected_pairs": [],
+        "selected_pair_scores": [],
+        "relaxed_top_scores": [],
+        "relaxation_details": None,
+        "transform": None,
+        "pose_normalization": None,
+        "warnings": warnings,
+    }
+
+    if len(raw_frame_a) < int(cfg.min_minutiae) or len(raw_frame_b) < int(cfg.min_minutiae):
+        details["fallback_reason"] = "too_few_minutiae_for_centroid"
+        details["warnings"].append("too_few_minutiae_for_centroid")
+        return 0.0, np.zeros((0, 0), dtype=np.float32), details
+    if len(raw_frame_a) < int(cfg.reliable_minutiae):
+        warnings.append("left_centroid_low_confidence")
+    if len(raw_frame_b) < int(cfg.reliable_minutiae):
+        warnings.append("right_centroid_low_confidence")
+
+    minutiae_a = pose_norm.coerce_minutiae(raw_frame_a.to_dict(orient="records"))
+    minutiae_b = pose_norm.coerce_minutiae(raw_frame_b.to_dict(orient="records"))
+    centroid_a = pose_norm.compute_minutiae_centroid(
+        minutiae_a,
+        use_quality_weights=cfg.use_quality_weighted_centroid,
+    )
+    centroid_b = pose_norm.compute_minutiae_centroid(
+        minutiae_b,
+        use_quality_weights=cfg.use_quality_weighted_centroid,
+    )
+
+    rotation = 0.0
+    rotation_source = "none"
+    theta_a = None
+    theta_b = None
+    resolved_orientation_a = _centroid_sidecar_path(path_a, orientation_path_a, "orientation.npy")
+    resolved_orientation_b = _centroid_sidecar_path(path_b, orientation_path_b, "orientation.npy")
+    orientation_a = _load_centroid_sidecar_array(resolved_orientation_a, "left_orientation", warnings)
+    orientation_b = _load_centroid_sidecar_array(resolved_orientation_b, "right_orientation", warnings)
+    if orientation_a is not None and orientation_b is not None:
+        try:
+            theta_a = pose_norm.estimate_global_orientation_from_field(orientation_a)
+            theta_b = pose_norm.estimate_global_orientation_from_field(orientation_b)
+            rotation = pose_norm.wrap_angle_pi(float(theta_a) - float(theta_b))
+            rotation_source = "ridge_orientation"
+        except Exception as exc:
+            warnings.append(f"rotation_estimate_failed:{exc}")
+
+    scale = 1.0
+    scale_source = "none"
+    spacing_a = None
+    spacing_b = None
+    resolved_ridge_a = _centroid_sidecar_path(path_a, ridge_period_path_a, "ridge_period.npy")
+    resolved_ridge_b = _centroid_sidecar_path(path_b, ridge_period_path_b, "ridge_period.npy")
+    ridge_a = _load_centroid_sidecar_array(resolved_ridge_a, "left_ridge_period", warnings)
+    ridge_b = _load_centroid_sidecar_array(resolved_ridge_b, "right_ridge_period", warnings)
+    if ridge_a is not None and ridge_b is not None:
+        try:
+            spacing_a = pose_norm.estimate_median_ridge_spacing(
+                ridge_a,
+                min_valid_spacing=cfg.min_valid_ridge_spacing,
+                max_valid_spacing=cfg.max_valid_ridge_spacing,
+            )
+            spacing_b = pose_norm.estimate_median_ridge_spacing(
+                ridge_b,
+                min_valid_spacing=cfg.min_valid_ridge_spacing,
+                max_valid_spacing=cfg.max_valid_ridge_spacing,
+            )
+            scale = pose_norm.estimate_scale_from_ridge_spacing(
+                query_spacing=spacing_b,
+                template_spacing=spacing_a,
+                min_valid_scale=cfg.min_valid_scale,
+                max_valid_scale=cfg.max_valid_scale,
+            )
+            scale_source = "ridge_spacing"
+        except Exception as exc:
+            warnings.append(f"scale_estimate_failed:{exc}")
+
+    transform = pose_norm.SimilarityTransform(
+        query_centroid=centroid_b,
+        template_centroid=centroid_a,
+        rotation=rotation,
+        scale=scale,
+        rotation_source=rotation_source,
+        scale_source=scale_source,
+    )
+    normalized_a, _ = pose_norm.translate_minutiae_to_centroid(minutiae_a, centroid_a)
+    normalized_b = pose_norm.apply_similarity_transform_to_minutiae(minutiae_b, transform)
+    normalized_frame_a = _frame_from_minutiae(normalized_a)
+    normalized_frame_b = _frame_from_minutiae(normalized_b)
+
+    descriptors_a = build_descriptors(normalized_frame_a, validity_mask_path=None, validity_mode="auto")
+    descriptors_b = build_descriptors(normalized_frame_b, validity_mask_path=None, validity_mode="auto")
+    details["left_descriptor_count_after"] = int(len(descriptors_a))
+    details["right_descriptor_count_after"] = int(len(descriptors_b))
+    if len(descriptors_a) == 0 or len(descriptors_b) == 0:
+        details["fallback_reason"] = "no_descriptors_after_centroid_normalization"
+        details["warnings"].append("no_descriptors_after_centroid_normalization")
+        return 0.0, np.zeros((len(descriptors_a), len(descriptors_b)), dtype=np.float32), details
+
+    score, sim_matrix = match_descriptors(
+        descriptors_a,
+        descriptors_b,
+        method=base_method,
+        overlap_mode="off",
+    )
+    selected_pairs, relaxed_top_scores, relaxation_details = _select_report_pairs(
+        descriptors_a,
+        descriptors_b,
+        sim_matrix,
+        base_method,
+    )
+    diagnostics = pose_norm.PoseNormalizationDiagnostics(
+        query_centroid=centroid_b,
+        template_centroid=centroid_a,
+        rotation=rotation,
+        rotation_source=rotation_source,
+        scale=scale,
+        scale_source=scale_source,
+        centroid_weighted=cfg.use_quality_weighted_centroid,
+        warnings=warnings,
+        query_orientation=theta_b,
+        template_orientation=theta_a,
+        query_ridge_spacing=spacing_b,
+        template_ridge_spacing=spacing_a,
+    )
+    details["transform"] = {
+        "query_centroid": [float(centroid_b[0]), float(centroid_b[1])],
+        "template_centroid": [float(centroid_a[0]), float(centroid_a[1])],
+        "rotation": float(rotation),
+        "rotation_degrees": float(math.degrees(rotation)),
+        "scale": float(scale),
+        "rotation_source": rotation_source,
+        "scale_source": scale_source,
+    }
+    details["pose_normalization"] = diagnostics.to_dict()
+    details["selected_pair_count"] = int(len(selected_pairs))
+    details["selected_pairs"] = [
+        {"row": int(row), "col": int(col), "score": float(pair_score)}
+        for row, col, pair_score in selected_pairs
+    ]
+    details["selected_pair_scores"] = [float(pair_score) for _, _, pair_score in selected_pairs]
+    details["relaxed_top_scores"] = relaxed_top_scores
+    details["relaxation_details"] = relaxation_details
+    details["final_score"] = float(score)
+    return score, sim_matrix, details
 
 
 def match_minutiae_csv_legacy(
@@ -2821,9 +3092,11 @@ def match_descriptors(
         "LSA-R-CANONICAL",
         "LSA-CANONICAL-OVERLAP",
         "LSA-R-CANONICAL-OVERLAP",
+        "LSA-CENTROID",
+        "LSA-R-CENTROID",
     }:
         raise ValueError(
-            f"{normalized_method} requires minutiae CSV inputs and masks, not prebuilt descriptors"
+            f"{normalized_method} requires minutiae CSV inputs, not prebuilt descriptors"
         )
     if normalized_method == "LSS":
         pairs = _select_lss_pairs(sim_matrix, n_pairs)
@@ -2862,9 +3135,24 @@ def match_minutiae_csv(
     method: str = "LSA-R",
     mask_path_a: Path | None = None,
     mask_path_b: Path | None = None,
+    orientation_path_a: Path | np.ndarray | None = None,
+    orientation_path_b: Path | np.ndarray | None = None,
+    ridge_period_path_a: Path | np.ndarray | None = None,
+    ridge_period_path_b: Path | np.ndarray | None = None,
     overlap_mode: str = "auto",
 ) -> tuple[float, np.ndarray]:
     normalized_method = method.upper()
+    if normalized_method in {"LSA-CENTROID", "LSA-R-CENTROID"}:
+        score, sim_matrix, _ = match_minutiae_csv_centroid_details(
+            path_a,
+            path_b,
+            method=method,
+            orientation_path_a=orientation_path_a,
+            orientation_path_b=orientation_path_b,
+            ridge_period_path_a=ridge_period_path_a,
+            ridge_period_path_b=ridge_period_path_b,
+        )
+        return score, sim_matrix
     if normalized_method in {"LSA-OVERLAP", "LSA-R-OVERLAP"}:
         score, sim_matrix, _ = match_minutiae_csv_overlap_details(
             path_a,
@@ -3010,6 +3298,8 @@ def _match_fingerprint_images_with_workspace(
         "LSA-R-CANONICAL",
         "LSA-CANONICAL-OVERLAP",
         "LSA-R-CANONICAL-OVERLAP",
+        "LSA-CENTROID",
+        "LSA-R-CENTROID",
     }:
         score, sim_matrix = match_minutiae_csv(
             csv_a,

@@ -169,11 +169,12 @@ class FeatureNetLoss(nn.Module):
         return score_mask
 
     def _resolve_minutia_mask(self, targets, score_mask):
-        minutia_mask = targets.get("minutia_valid_mask", score_mask)
+        if "minutia_valid_mask" not in targets:
+            return score_mask.float()
+        minutia_mask = targets["minutia_valid_mask"]
         if minutia_mask.dim() == 3:
             minutia_mask = minutia_mask.unsqueeze(1)
-        minutia_mask = minutia_mask.float() * score_mask.float()
-        return minutia_mask
+        return minutia_mask.float()
 
     def _select_hard_negative_mask(self, focal_map, target_score, valid_mask):
         if not self.m1_hard_neg_enable:
@@ -288,6 +289,7 @@ class FeatureNetLoss(nn.Module):
             mask = mask.unsqueeze(1)
         score_mask = self._resolve_score_mask(mask)
         minutia_mask = self._resolve_minutia_mask(targets, score_mask)
+        minutia_score_mask = torch.maximum(score_mask.float(), minutia_mask.float())
 
         # ---------------------------
         # 1. Orientation loss
@@ -324,7 +326,7 @@ class FeatureNetLoss(nn.Module):
         L_m1 = self._compute_m1_score_loss(
             outputs["minutia_score"],
             targets["minutia_score"],
-            score_mask,
+            minutia_score_mask,
         )
 
         # --- M2: x offset regression (continuous within-cell target)
