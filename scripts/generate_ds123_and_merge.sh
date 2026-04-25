@@ -52,6 +52,30 @@ run_generate() {
   eval "${exec_cmd}"
 }
 
+cleanup_merge_root() {
+  target_root="$1"
+
+  if [ ! -d "${target_root}" ]; then
+    return 0
+  fi
+
+  if [ -z "$(ls -A "${target_root}" 2>/dev/null)" ]; then
+    return 0
+  fi
+
+  case "${target_root}" in
+    "${GROUND_TRUTH_ROOT}"/*)
+      ;;
+    *)
+      echo "Refusing to clear merge root outside ${GROUND_TRUTH_ROOT}: ${target_root}" >&2
+      exit 1
+      ;;
+  esac
+
+  echo "Clearing existing merged output root: ${target_root}"
+  rm -rf "${target_root}"
+}
+
 echo "Using Python: ${PYTHON_BIN}"
 echo "Base dataset root: ${DATASET_ROOT}"
 echo "Base ground truth root: ${GROUND_TRUTH_ROOT}"
@@ -63,6 +87,7 @@ run_generate "DS2" "${DS2_ROOT}"
 run_generate "DS3" "${DS3_ROOT}"
 
 echo "Merging generated roots into ${MERGED_ROOT}"
+cleanup_merge_root "${MERGED_ROOT}"
 "${PYTHON_BIN}" generate_ground_truth.py \
   --merge-generated-root "ds1=${DS1_ROOT}" \
   --merge-generated-root "ds2=${DS2_ROOT}" \

@@ -15,6 +15,8 @@ class OrientationLoss(nn.Module):
         self.register_buffer("smooth_kernel", kernel)
 
     def forward(self, pred, target, mask):
+        pred = pred.float()
+        target = target.float()
         if mask.dim() == 3:
             mask = mask.unsqueeze(1)
         mask = mask.float()
@@ -54,11 +56,13 @@ class RidgePeriodLoss(nn.Module):
         self.beta = beta
 
     def forward(self, pred, target, mask):
+        pred = pred.float()
+        target = target.float()
         if mask.dim() == 3:
             mask = mask.unsqueeze(1)
         mask = mask.float()
         mse = ((pred - target) ** 2)
-        loss_mse = (mse * mask).sum() / mask.sum()
+        loss_mse = (mse * mask).sum() / (mask.sum() + 1e-8)
         dx = pred[:, :, 1:, :] - pred[:, :, :-1, :]
         dy = pred[:, :, :, 1:] - pred[:, :, :, :-1]
         grad_loss = (dx**2).mean() + (dy**2).mean()
@@ -71,6 +75,8 @@ class GradientLoss(nn.Module):
         self.sigma = sigma
 
     def forward(self, pred, target, mask):
+        pred = pred.float()
+        target = target.float()
         if mask.dim() == 3:
             mask = mask.unsqueeze(1)
         mask = mask.float()

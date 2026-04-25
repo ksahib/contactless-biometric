@@ -178,6 +178,7 @@ class FeatureNetDataset(Dataset):
         )
 
         targets = prepare_targets(sample.get("targets", {}), mask_tensor)
+        targets["_sample_index"] = torch.tensor(index, dtype=torch.long)
         return input_tensor, targets
 
 
@@ -286,18 +287,75 @@ def _loss_dict_to_scalars(losses: Mapping[str, torch.Tensor]) -> dict[str, float
     return {key: float(value.detach().item()) for key, value in losses.items() if key in LOSS_KEYS}
 
 
+def _float_outputs(outputs: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    return {
+        key: value.float() if torch.is_floating_point(value) else value
+        for key, value in outputs.items()
+    }
+
+
+def _loss_context(device: torch.device):
+    if device.type == "cuda":
+        return torch.autocast(device_type="cuda", enabled=False)
+    return nullcontext()
+
+
+def _sample_ids_for_batch(dataloader: DataLoader, targets: Mapping[str, torch.Tensor]) -> list[str]:
+    sample_indices = targets.get("_sample_index")
+    dataset = getattr(dataloader, "dataset", None)
+    samples = getattr(dataset, "samples", None)
+    if sample_indices is None or samples is None:
+        return []
+    ids: list[str] = []
+    for sample_index in sample_indices.detach().cpu().flatten().tolist():
+        try:
+            sample = samples[int(sample_index)]
+            ids.append(str(sample.get("sample_id", sample_index)))
+        except (IndexError, TypeError, ValueError):
+            ids.append(str(sample_index))
+    return ids
+
+
+def _non_finite_loss_message(
+    losses: Mapping[str, torch.Tensor],
+    batch_index: int,
+    sample_ids: list[str],
+) -> str:
+    parts = []
+    for key in LOSS_KEYS:
+        value = losses.get(key)
+        if value is None:
+            continue
+        scalar = value.detach()
+        if scalar.numel() == 1:
+            try:
+                parts.append(f"{key}={float(scalar.item()):.6g}")
+            except (RuntimeError, ValueError):
+                parts.append(f"{key}=<unavailable>")
+    sample_text = ", ".join(sample_ids[:8])
+    if len(sample_ids) > 8:
+        sample_text += ", ..."
+    if sample_text:
+        sample_text = f"; samples=[{sample_text}]"
+    return f"encountered non-finite total loss during training at batch {batch_index}: {', '.join(parts)}{sample_text}"
+
+
 def _run_model_step(
     model: FeatureExtractor,
     criterion: FeatureNetLoss,
     inputs: torch.Tensor,
     targets: Mapping[str, torch.Tensor],
+    amp: bool = False,
 ) -> dict[str, torch.Tensor]:
     image = inputs[:, :1]
     mask = inputs[:, 1:2]
-    outputs = model(image, mask=mask)
+    device = inputs.device
+    with _autocast_context(device, amp):
+        outputs = model(image, mask=mask)
     if "gradient" not in targets:
         raise KeyError("missing explicit reconstruction-derived gradient target for gradient supervision")
-    return criterion(outputs, targets)
+    with _loss_context(device):
+        return criterion(_float_outputs(outputs), targets)
 
 
 def train_one_epoch(
@@ -322,11 +380,11 @@ def train_one_epoch(
         inputs = inputs.to(resolved_device, non_blocking=True)
         inputs = _prepare_inputs_for_model(inputs, channels_last)
         targets = _move_targets_to_device(targets, resolved_device)
-        with _autocast_context(resolved_device, amp):
-            losses = _run_model_step(model, criterion, inputs, targets)
-            total_loss = losses["total"]
+        losses = _run_model_step(model, criterion, inputs, targets, amp=amp)
+        total_loss = losses["total"]
         if not torch.isfinite(total_loss):
-            raise RuntimeError("encountered non-finite total loss during training")
+            sample_ids = _sample_ids_for_batch(dataloader, targets)
+            raise RuntimeError(_non_finite_loss_message(losses, batch_index, sample_ids))
 
         scaled_loss = total_loss / grad_accum_steps
         if scaler is not None and amp and resolved_device.type == "cuda":
@@ -379,8 +437,7 @@ def evaluate(
         inputs = inputs.to(resolved_device, non_blocking=True)
         inputs = _prepare_inputs_for_model(inputs, channels_last)
         targets = _move_targets_to_device(targets, resolved_device)
-        with _autocast_context(resolved_device, amp):
-            losses = _run_model_step(model, criterion, inputs, targets)
+        losses = _run_model_step(model, criterion, inputs, targets, amp=amp)
 
         scalar_losses = _loss_dict_to_scalars(losses)
         for key in LOSS_KEYS:
