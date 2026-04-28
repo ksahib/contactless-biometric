@@ -11,3 +11,4 @@ tmp/
 s01_f01_a02/
 weights/*.pt
 problem_samples/
+ground_truth_smoke*/
