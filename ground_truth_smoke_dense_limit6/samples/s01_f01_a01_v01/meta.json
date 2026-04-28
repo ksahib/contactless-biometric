@@ -1,0 +1,148 @@
+{
+  "sample_id": "s01_f01_a01_v01",
+  "subject_id": 1,
+  "finger_id": 1,
+  "acquisition_id": 1,
+  "raw_view_index": 1,
+  "finger_class_id": 0,
+  "raw_image_path": "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\raw\\1_1_1_1.jpg",
+  "sire_path": "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\SIRE-1_1_1.bmp",
+  "raw_view_paths": [
+    "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\raw\\1_1_1_0.jpg",
+    "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\raw\\1_1_1_1.jpg",
+    "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\raw\\1_1_1_2.jpg",
+    "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\raw\\1_1_1_3.jpg",
+    "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\raw\\1_1_1_4.jpg",
+    "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\raw\\1_1_1_5.jpg"
+  ],
+  "variant_paths": {
+    "HT1": "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\SIRE-1_1_1_HT1.bmp",
+    "HT2": "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\SIRE-1_1_1_HT2.bmp",
+    "HT4": "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\SIRE-1_1_1_HT4.bmp",
+    "HT6": "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\SIRE-1_1_1_HT6.bmp",
+    "R414": "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\SIRE-1_1_1_R414.bmp"
+  },
+  "approximate": true,
+  "input_domain": "raw_contactless_preprocessed",
+  "execution": {
+    "execution_target": "local",
+    "gpu_only": false,
+    "stage_devices": {
+      "rembg": "cpu",
+      "fingerflow": "cpu",
+      "classical_preprocess": "cpu",
+      "bundle_write": "cpu"
+    }
+  },
+  "preprocessing": {
+    "masking": "rembg",
+    "contrast": "clahe_clip_4_tile_4_then_clip_1_tile_10",
+    "pose_normalization": {
+      "method": "contour_centerline_rotated_to_vertical",
+      "rotation_degrees": -87.60575375008537
+    },
+    "ridge_frequency_normalization": {
+      "method": "central_region_spacing_rescaled_to_10_pixels",
+      "target_spacing_pixels": 10.0,
+      "scale_factor": 0.5240784322265132,
+      "actual_scale_x": 0.52421875,
+      "actual_scale_y": 0.5244140625
+    },
+    "saved_artifacts": [
+      "raw_input.png",
+      "preprocess_normalized.png",
+      "preprocess_pose_normalized.png",
+      "preprocess_pose_mask.png",
+      "preprocessed_input.png",
+      "preprocess_mask.png"
+    ]
+  },
+  "methods": {
+    "mask": "copied_main_segmentation_used as primary preprocessing and label mask",
+    "geometry_mask": "pose_normalized_pre_scale_mask retained for multiview reconstruction",
+    "orientation": "pyfing.orientation_field_estimation(method='SNFOE')",
+    "ridge_period": "pyfing.frequency_estimation(method='SNFFE')",
+    "gradient": "MLS-smoothed reconstruction depth partial derivatives resized to the FeatureNet output grid",
+    "gradient_visualization": "cv2.Sobel on masked grayscale preprocessed raw image for preview/debug only",
+    "enhancement": "fingerprint_enhancer.enhance_fingerprint",
+    "minutiae": "pyfing_fallback",
+    "minutiae_ground_truth_pipeline": "direct_per_sample_extraction",
+    "featurenet_adapter": "dense orientation/ridge/gradient resize plus paper-style minutiae heatmap and precise subcell labels",
+    "minutiae_targets": "binary score heatmap with continuous x/y offsets plus legacy 8-bin x/y labels, legacy 360-bin orientation labels, and optional cos/sin orientation vectors"
+  },
+  "shapes": {
+    "input_image": [
+      537,
+      671
+    ],
+    "featurenet_output": [
+      67,
+      83
+    ]
+  },
+  "counts": {
+    "raw_views": 6,
+    "variants": 5,
+    "minutiae": 71,
+    "minutia_support_pixels": 71,
+    "rasterized_minutiae_count": 71,
+    "output_mask_pixels": 1595,
+    "point_mask_pixels": 1688,
+    "dense_output_mask_pixels": 1595
+  },
+  "version": 2,
+  "multiview_reconstruction": {
+    "role": "left",
+    "acquisition_id": "s01_f01_a01",
+    "reconstruction_dir": "D:\\contactless biome\\contactless-biometric\\ground_truth_smoke_dense_limit6\\reconstructions\\s01_f01_a01",
+    "depth_front_path": "D:\\contactless biome\\contactless-biometric\\ground_truth_smoke_dense_limit6\\reconstructions\\s01_f01_a01\\depth_front.npy",
+    "depth_left_path": "D:\\contactless biome\\contactless-biometric\\ground_truth_smoke_dense_limit6\\reconstructions\\s01_f01_a01\\depth_left.npy",
+    "depth_right_path": "D:\\contactless biome\\contactless-biometric\\ground_truth_smoke_dense_limit6\\reconstructions\\s01_f01_a01\\depth_right.npy",
+    "depth_gradient_labels_path": "D:\\contactless biome\\contactless-biometric\\ground_truth_smoke_dense_limit6\\reconstructions\\s01_f01_a01\\depth_gradient_labels.npz",
+    "reconstruction_maps_path": "D:\\contactless biome\\contactless-biometric\\ground_truth_smoke_dense_limit6\\reconstructions\\s01_f01_a01\\reconstruction_maps.npz",
+    "support_mask_path": "D:\\contactless biome\\contactless-biometric\\ground_truth_smoke_dense_limit6\\reconstructions\\s01_f01_a01\\support_mask.png",
+    "preview_path": "D:\\contactless biome\\contactless-biometric\\ground_truth_smoke_dense_limit6\\reconstructions\\s01_f01_a01\\preview.png",
+    "center_unwarp_maps_path": "D:\\contactless biome\\contactless-biometric\\ground_truth_smoke_dense_limit6\\reconstructions\\s01_f01_a01\\center_unwarp_maps.npz",
+    "center_unwarped_image_path": "D:\\contactless biome\\contactless-biometric\\ground_truth_smoke_dense_limit6\\reconstructions\\s01_f01_a01\\center_unwarped.png",
+    "center_unwarped_mask_path": "D:\\contactless biome\\contactless-biometric\\ground_truth_smoke_dense_limit6\\reconstructions\\s01_f01_a01\\center_unwarped_mask.png",
+    "surface_front_3d_html_path": "D:\\contactless biome\\contactless-biometric\\ground_truth_smoke_dense_limit6\\reconstructions\\s01_f01_a01\\surface_front_3d.html",
+    "surface_front_3d_png_path": "D:\\contactless biome\\contactless-biometric\\ground_truth_smoke_dense_limit6\\reconstructions\\s01_f01_a01\\surface_front_3d.png",
+    "surface_all_branches_3d_html_path": "D:\\contactless biome\\contactless-biometric\\ground_truth_smoke_dense_limit6\\reconstructions\\s01_f01_a01\\surface_all_branches_3d.html",
+    "surface_all_branches_3d_png_path": "D:\\contactless biome\\contactless-biometric\\ground_truth_smoke_dense_limit6\\reconstructions\\s01_f01_a01\\surface_all_branches_3d.png",
+    "reprojection_report_path": "D:\\contactless biome\\contactless-biometric\\ground_truth_smoke_dense_limit6\\reconstructions\\s01_f01_a01\\reprojection_report.json",
+    "reprojection_preview_path": "D:\\contactless biome\\contactless-biometric\\ground_truth_smoke_dense_limit6\\reconstructions\\s01_f01_a01\\reprojection_preview.png"
+  },
+  "minutiae_ground_truth": {
+    "mode": "direct_fallback_after_empty_reprojection",
+    "view_role": "left",
+    "fallback_reason": "empty_reprojection",
+    "fallback_source": "pyfing_fallback",
+    "canonical_source": "pyfing_fallback_reconstruction_unwarp",
+    "canonical_minutiae_count": 149,
+    "reprojected_minutiae_count_before_fallback": 0,
+    "rasterized_minutiae_count_before_fallback": 0,
+    "center_unwarped_image_path": "D:\\contactless biome\\contactless-biometric\\ground_truth_smoke_dense_limit6\\reconstructions\\s01_f01_a01\\center_unwarped.png",
+    "center_unwarped_mask_path": "D:\\contactless biome\\contactless-biometric\\ground_truth_smoke_dense_limit6\\reconstructions\\s01_f01_a01\\center_unwarped_mask.png",
+    "center_unwarp_maps_path": "D:\\contactless biome\\contactless-biometric\\ground_truth_smoke_dense_limit6\\reconstructions\\s01_f01_a01\\center_unwarp_maps.npz",
+    "reconstruction_maps_path": "D:\\contactless biome\\contactless-biometric\\ground_truth_smoke_dense_limit6\\reconstructions\\s01_f01_a01\\reconstruction_maps.npz",
+    "reprojected_minutiae_count": 0,
+    "canonical_unwarped_minutiae_path": "D:\\contactless biome\\contactless-biometric\\ground_truth_smoke_dense_limit6\\reconstructions\\s01_f01_a01\\canonical_unwarped_minutiae.json",
+    "center_unwarped_enhanced_path": "D:\\contactless biome\\contactless-biometric\\ground_truth_smoke_dense_limit6\\reconstructions\\s01_f01_a01\\center_unwarped_enhanced.png",
+    "projection_map_mode": "dense_pose_map",
+    "scale_x": 0.52421875,
+    "scale_y": 0.5244140625,
+    "canonical_total": 149,
+    "dropped_nonfinite_canonical_xy": 0,
+    "dropped_outside_unwarped_bounds": 0,
+    "dropped_outside_unwarped_mask": 0,
+    "dropped_no_inverse_source": 5,
+    "inverse_mapped_count": 144,
+    "dropped_projection_failed": 0,
+    "dropped_out_of_training_bounds": 30,
+    "dropped_no_final_mask_support": 114,
+    "orientation_projected_count": 0,
+    "orientation_fallback_count": 0,
+    "fallback_minutiae_count": 71,
+    "fallback_rasterized_minutiae_count": 71
+  }
+}

@@ -1,0 +1,61 @@
+{
+  "projection_model": {
+    "type": "branch_support_rowwise_silhouette",
+    "description": "compare each reconstructed branch against its matching pose-normalized view by reusing the branch's shared row support and aligning it to that view's row center; this checks whether the branch occupancy matches the observed silhouette without fusing branches across views",
+    "view_checks": {
+      "front": "front branch compared against the front pose-normalized silhouette on the shared row support grid",
+      "left": "left branch compared against the left pose-normalized silhouette using the branch's shared row support shifted to the left-view row centers",
+      "right": "right branch compared against the right pose-normalized silhouette using the branch's shared row support shifted to the right-view row centers"
+    }
+  },
+  "views": {
+    "front": {
+      "iou": 1.0,
+      "precision": 1.0,
+      "recall": 1.0,
+      "intersection_pixels": 419600,
+      "union_pixels": 419600,
+      "target_pixels": 419600,
+      "projected_pixels": 419600,
+      "false_positive_pixels": 0,
+      "false_negative_pixels": 0,
+      "target_rows": 796,
+      "projected_rows": 796,
+      "overlap_rows": 796,
+      "row_width_mae": 0.0,
+      "row_center_mae": 0.0
+    },
+    "left": {
+      "iou": 0.0,
+      "precision": 0.0,
+      "recall": 0.0,
+      "intersection_pixels": 0,
+      "union_pixels": 547205,
+      "target_pixels": 380073,
+      "projected_pixels": 167132,
+      "false_positive_pixels": 167132,
+      "false_negative_pixels": 380073,
+      "target_rows": 805,
+      "projected_rows": 796,
+      "overlap_rows": 796,
+      "row_width_mae": 262.5829162597656,
+      "row_center_mae": 499.26507568359375
+    },
+    "right": {
+      "iou": 0.0,
+      "precision": 0.0,
+      "recall": 0.0,
+      "intersection_pixels": 0,
+      "union_pixels": 573230,
+      "target_pixels": 385347,
+      "projected_pixels": 187883,
+      "false_positive_pixels": 187883,
+      "false_negative_pixels": 385347,
+      "target_rows": 807,
+      "projected_rows": 796,
+      "overlap_rows": 796,
+      "row_width_mae": 241.75502014160156,
+      "row_center_mae": 512.3184814453125
+    }
+  }
+}

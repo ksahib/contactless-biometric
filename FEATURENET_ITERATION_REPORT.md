@@ -1,173 +1,251 @@
 # FeatureNet Iteration Report
 
 Date: 2026-04-26  
-Scope: End-to-end experiment history for FeatureNet training/evaluation and DS123 ground-truth generation in this repo.
+Scope: Detailed documentation of model-facing iterations (data targets, losses, heads, evaluator, training objective/monitoring) and observed results.
 
-## 1) Initial State and Early Failures
+## 1) Experiment Tracking Conventions
 
-- Ground-truth generation initially failed repeatedly on GPU with TensorFlow/cuDNN runtime mismatch.
-- Early merge attempts failed when shard roots did not exist yet (`FileNotFoundError` on merge root).
-- Early training runs also hit environment issues:
-  - PyTorch/CUDA library mismatch (`libcusparse ... __nvJitLink...`).
-  - Unsupported CUDA kernel image for RTX 5090 with incompatible PyTorch build.
+- Detection metric of record: `best_score_f1` (from evaluator threshold sweep).
+- Detection summaries are from paper-style matching runs unless marked otherwise.
+- Label metrics:
+  - `minutia_x` / `minutia_y` accuracy: tolerance-based offset accuracy.
+  - `minutia_orientation` accuracy: within-15deg angular accuracy.
+- Some iterations are not perfectly apples-to-apples due to target/regime/dataset updates; this is noted inline.
 
-## 2) Dataset Strategy and Merge Decisions
+## 2) Iteration Chronology (What Changed + Results)
 
-- DS1, DS2, DS3 were generated separately and merged at the bundle level (not raw image overwrite).
-- Sample ID namespace collisions were handled by prefixed IDs in merged outputs.
-- Ground-truth generation and merge workflows were standardized:
-  - shard generation per dataset
-  - shard merge per dataset
-  - final DS1+DS2+DS3 merged root for training/eval
-- Later, regenerated roots (`*_v2`, `*_v3`) were used to align targets with newer model expectations.
+## I0 - Initial baseline (legacy evaluator regime)
 
-## 3) Training Loop and Monitoring Refactors
+### What was tried
+- Baseline training/eval before paper-style matching refactor.
+- Early objective centered around loss minimization and initial checkpoint selection.
 
-- Added configurable validation cadence and early stopping controls:
+### Result (available)
+- `best_score_f1 = 0.043954` (legacy metric path baseline reference).
+- Precision extremely low and threshold behavior mostly flat.
+
+---
+
+## I1 - Validation cadence + early stopping controls
+
+### What was tried
+- Added configurable validation cadence and early-stopping behavior:
   - `--validate-every`
   - `--early-stopping`
-  - `--early-stopping-metric` (`val_total`, `best_score_f1`, label metrics)
-  - patience/min-delta controls
-- Training records/history now capture validation cadence, monitor values, patience state, and stop reason.
-- `best.pt` and `last.pt` behavior preserved with monitored-metric alignment.
+  - metric choice (`val_total`, `best_score_f1`, label metrics)
+  - patience/min-delta tracking
+- Checkpointing aligned with monitored metric.
 
-## 4) Ground-Truth Target Evolution
+### Result (available)
+- Enabled controlled F1-first experiments and reproducible stop behavior.
+- No standalone metric delta isolated for this iteration alone (infrastructure iteration).
 
-- Ground-truth bundles were extended to include continuous supervision fields:
-  - `minutia_x_offset`, `minutia_y_offset` in `[0,1)` within output cell
-  - `minutia_orientation_vec = [cos(theta), sin(theta)]`
-- Legacy fields were retained for compatibility:
-  - `minutia_x`, `minutia_y`, `minutia_orientation` bins
-- Loader fallback was added:
-  - If offsets are missing, recover from `minutiae.json` with same cell ownership/tie-break policy.
-- Important observed issue in latest eval:
-  - large number of samples skipped for "minutiae present but zero active minutia target cells"
-  - this materially changes effective sample pool and comparability across runs
+---
 
-## 5) Loss and Objective Iterations
+## I2 - DS1/DS2/DS3 merged training corpus strategy
 
-### 5.1 Baseline Behavior
+### What was tried
+- Merged DS1+DS2+DS3 at generated bundle level with dataset-prefix sample IDs.
+- Standardized train/val split flow on merged bundle root.
 
-- Minutia detection quality was poor under earlier setup: very low precision, near-flat threshold response, low F1.
+### Result (available)
+- Created a stable combined dataset path for all subsequent model iterations.
+- No single isolated metric snapshot tied only to this change.
 
-### 5.2 Score-Head Supervision Changes (M1)
+---
 
-- Implemented focal BCE with class imbalance handling.
-- Introduced dynamic `pos_weight` logic and later strengthened adaptive behavior.
-- Switched M1 supervision to stronger negative/background learning in valid fingerprint regions.
-- Added hard-negative mining controls (enable/disable, ratio/min/fraction, hardest-by-loss selection).
+## I3 - F1-first objective alignment
 
-### 5.3 X/Y Supervision Changes
+### What was tried
+- Switched experiment focus from `val_total` to detection quality (`best_score_f1`) for model selection and early stopping in F1-centric runs.
 
-- Migrated x/y from discrete bins to continuous offset regression.
-- M2/M3 use masked SmoothL1 on positive minutia cells.
-- Gaussian soft-target CE phase for ordered-bin x/y was also tested in earlier stage.
+### Result (available)
+- Made improvements visible that were previously masked by loss-only monitoring.
+- No isolated number without accompanying model/loss changes.
 
-### 5.4 Orientation Supervision Changes (M4)
+---
 
-- Replaced 360-bin minutia-orientation classification with continuous vector regression:
-  - model predicts 2 channels (`cos`, `sin`)
-  - M4 loss uses vector-space regression on minutia-positive cells
-  - eval recovers degrees with `atan2`
-- Added `orientation_mae_deg` metric.
-- `label_accuracy.minutia_orientation` is interpreted as within-15deg accuracy in the current evaluator path.
+## I4 - Minutia score loss reweighting (first major score-head intervention)
 
-## 6) Architecture Iterations
+### What was tried
+- Introduced class-balancing and focal behavior for M1 (score supervision).
+- Rebalanced minutia-component weights (`mu_score`, `mu_x`, `mu_y`, `mu_ori`) to reduce score dominance and support localization heads.
 
-### 6.1 Raw-Logit Head Refactor
+### Result (available)
+- Improved calibration behavior versus earlier flat-threshold baseline.
+- Representative progression in this phase moved from ~`0.04395` to ~`0.04517`, then into stronger gains in later score-focused iterations.
 
-- Prediction heads moved to raw terminal logits where required to align with BCE/CE assumptions.
+---
 
-### 6.2 Continuous X/Y Head Refactor
+## I5 - Raw-logit prediction head refactor
 
-- X/Y heads changed from 8-bin logits to 1-channel continuous offset logits.
-- Decode remained anchored to selected score cell:
-  - `x = col + sigmoid(x_logit)`
-  - `y = row + sigmoid(y_logit)`
+### What was tried
+- Refactored prediction-head terminals to true logits (no final activation-style distortion in terminal prediction conv).
+- Architecture treated as new-run branch.
 
-### 6.3 Patch-Aware X/Y Refactor (Latest Architecture Step)
+### Result (available)
+- Improved x/y label metrics in that branch, but detection F1 remained limited before further objective fixes.
+- Representative run in this phase (paper-style evaluator): `best_score_f1 = 0.032628`.
 
-- Replaced old `/4 -> stride-2 compress -> /8` x/y descriptor path with:
-  - fused `/4` localization map
-  - bottom/right pad-to-even policy
-  - `pixel_unshuffle(..., 2)` to preserve 2x2 `/4` local geometry per `/8` cell
-  - patch refinement blocks on regrouped `/8` descriptor
-  - crop back to exact score-grid `/8` shape for strict alignment
-- Score and orientation paths remained unchanged.
+---
 
-## 7) Evaluator Refactors
+## I6 - Paper-style minutia evaluator implementation
 
-- Replaced old overlap-style detection accounting with paper-style one-to-one matching:
-  - distance threshold `< 8 px`
-  - angular threshold `< 15deg`
+### What was tried
+- Replaced old overlap-like detection metric with paper-style one-to-one matching:
+  - distance `< 8 px`
+  - angle `< 15deg`
   - one-to-one bipartite matching
-  - threshold sweep and NMS retained
-- Added split reporting: `all`, `front`, `side`.
-- Added regression diagnostics:
-  - `minutia_x_mae_cell`, `minutia_y_mae_cell`
-  - `minutia_x_mae_px`, `minutia_y_mae_px`
-  - `orientation_mae_deg`
+  - threshold sweep + NMS
+  - split reporting (`all/front/side`)
 
-## 8) Iteration-by-Iteration Results (Available Logs)
+### Result (available)
+- Detection metric became stricter and more realistic.
+- Early paper-style reference values:
+  - `best_score_f1 = 0.032628` (first strict run)
+  - later this pipeline captured improvement to `0.061491` after score-objective updates.
 
-Notes:
-- `Regime=legacy-overlap` and `Regime=paper-match` are not directly comparable.
-- Some runs used different effective sample pools due skipping/filtering.
-- `N/A` means the metric was not present in the captured log for that run.
+---
 
-| Iter | Regime | Main change set | best_score_f1 | best thr | Precision@best | Recall@best | x acc | y acc | ori acc | ori mae (deg) | Notes |
-|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| I0 | legacy-overlap | Early baseline eval | 0.043954 | 0.10 | 0.022471 | 1.000000 | 0.1182 | 0.1204 | 0.0889 | N/A | Flat threshold behavior, very low precision |
-| I1 | legacy-overlap | Tuned baseline eval checkpoint | 0.045173 | 0.90 | 0.023109 | 0.999244 | 0.1182 | 0.1184 | 0.0736 | N/A | Slight F1 bump only |
-| I2 | paper-match | First paper-style evaluator run | 0.032628 | 0.10 | 0.022009 | 0.063048 | 0.1326 | 0.1394 | 0.0130 | N/A | Strict matching exposed low recall/precision |
-| I3 | paper-match | Stronger score supervision + hard negatives (early) | 0.061491 | 0.10 | 0.031844 | 0.891745 | 0.1326 | 0.1170 | 0.0981 | N/A | Big recall jump, precision still low |
-| I4 | paper-match | Continuous orientation phase, stabilized run | 0.426165 | 0.60 | 0.469603 | 0.390082 | 0.1848 | 0.1817 | 0.7746 | 18.71 | Major detection jump |
-| I5 | paper-match | Follow-up tuned run | 0.452410 | 0.60 | 0.527599 | 0.395978 | 0.2046 | 0.1979 | 0.8022 | 17.80 | Better precision and label accuracy |
-| I6 | paper-match | Next tuned run (peak logged F1 in chat) | 0.484694 | 0.60 | 0.511152 | 0.460841 | 0.1990 | 0.1920 | 0.8199 | 17.42 | Best logged F1 in this thread |
-| I7 | paper-match | Another strong run before latest regressions | 0.476653 | 0.60 | 0.558125 | 0.415936 | 0.1893 | 0.1793 | 0.8657 | 15.09 | Best logged orientation quality |
-| I8 | paper-match | Later run with changed data/target mix | 0.442435 | 0.60 | 0.495778 | 0.399456 | 0.3701 | 0.3379 | 0.7744 | 18.54 | X/Y acc increased sharply, F1 dropped |
-| I9 | paper-match | Latest shared eval on `DS123_merged_v3` | 0.420428 | 0.60 | 0.497547 | 0.364008 | 0.4300 | 0.4276 | 0.7436 | 27.29 | Effective sample pool reduced by skip filters |
+## I7 - Full-negative score supervision + hard-negative mining
 
-Observed pattern:
+### What was tried
+- Changed score supervision to learn positives and background negatives strongly.
+- Added hard-negative mining controls and stronger imbalance handling.
+- Kept x/y/orientation objective structure intact in this step.
 
-- X/Y metrics improved significantly in later runs.
-- Orientation quality was sensitive to objective/data changes.
-- Detection F1 peaked mid-iteration (I6) and regressed in later runs with changed data composition.
-- Direct run-to-run comparison is sometimes non-apples-to-apples because evaluator semantics and filtered sample sets changed.
+### Result (available)
+- Major detection jump:
+  - from early paper-style values (`0.0326` / `0.0615`) to strong runs around:
+    - `0.426165`
+    - `0.452410`
+    - `0.484694` (best logged in this thread)
 
-## 9) Current Snapshot (Latest Shared Eval)
+---
 
-- Ground truth root: `ground_truth/DS123_merged_v3`
-- Effective sample count after loader filtering: `3539`
-- Validation sample count: `725`
-- Best detection threshold: `0.60`
-- `best_score_f1`: `0.4204`
-- Precision/Recall at best threshold:
-  - precision: `0.4975`
-  - recall: `0.3640`
-- Label accuracy:
-  - x: `0.4300`
-  - y: `0.4276`
-  - orientation: `0.7436`
-- MAE:
-  - x cell: `0.1858`
-  - y cell: `0.1891`
-  - x px: `1.4917`
-  - y px: `1.5171`
-  - orientation deg: `27.29`
+## I8 - Continuous minutia orientation (cos/sin) replacing 360-bin orientation head
 
-## 10) Main Lessons So Far
+### What was tried
+- Replaced minutia orientation classification with continuous 2D vector prediction (`cos`, `sin`).
+- Loss moved to vector regression; eval decodes via `atan2`.
+- Added `orientation_mae_deg`.
 
-- Objective alignment matters more than raw training loss magnitude.
-- Score head required stronger negative supervision and hard-negative pressure to improve precision/F1.
-- Paper-style detection evaluation exposed quality gaps hidden by earlier metric style.
-- Continuous orientation and continuous x/y formulations enabled better geometric diagnostics.
-- Ground-truth consistency is critical; regenerated targets are necessary to avoid fallback/recovery artifacts in training/eval.
+### Result (available)
+- Orientation quality improved significantly in strong runs:
+  - Orientation accuracy up to `0.8657`
+  - Orientation MAE down to `15.09 deg`
+- These orientation improvements coexisted with high-F1 runs in the `0.45-0.48` range.
 
-## 11) Immediate Action Items
+---
 
-- Fully regenerate DS1/DS2/DS3 targets in current format (offset + orientation vector) to eliminate on-the-fly recovery.
-- Re-merge and run a clean apples-to-apples evaluation set (same filtering rules across compared runs).
-- Re-run the strongest known configuration and compare against current patch-aware x/y path.
-- Investigate root cause of "minutiae present but zero active target cells" in skipped samples.
+## I9 - Continuous x/y offsets (head + targets + loss)
+
+### What was tried
+- Migrated x/y from 8-bin classification heads to 1-channel continuous offset logits.
+- Supervision shifted to `minutia_x_offset` / `minutia_y_offset` with masked SmoothL1.
+- Ground-truth generation writes offsets; loader supports compatibility recovery when offsets absent.
+
+### Result (available)
+- X/Y localization metrics improved materially in later runs:
+  - x/y accuracy climbed from ~`0.18-0.20` range to ~`0.37-0.43` range in later reports.
+- Tradeoff observed in some runs: detection F1 and/or orientation MAE could regress depending on data composition and target quality.
+
+---
+
+## I10 - Adaptive hard-negative/imbalance strengthening
+
+### What was tried
+- Increased score-loss pressure with stronger hard-negative settings and adaptive balancing:
+  - higher hard-negative ratio/min
+  - stronger positive-weight cap strategy
+
+### Result (available)
+- Produced one of the largest precision/F1 gains in paper-style detection.
+- Representative strong checkpoint behavior:
+  - `best_score_f1` in the `0.45-0.48` band
+  - better precision at practical thresholds.
+
+---
+
+## I11 - Gaussian soft-target CE phase for ordered x/y bins (intermediate experiment)
+
+### What was tried
+- Tested Gaussian soft-target CE for x/y ordered bins (`sigma=1.0`) in the bin-based phase.
+- Intended to smooth class boundaries and improve sub-bin localization learning.
+
+### Result (available)
+- Helped stabilize x/y behavior in that phase, but was superseded by continuous offset formulation.
+- Not the final x/y design in current branch.
+
+---
+
+## I12 - Patch-aware x/y localization path (`pixel_unshuffle` 2x2 preservation)
+
+### What was tried
+- Replaced early `/4 -> stride-2 compress -> /8` x/y descriptor collapse with patch-aware regrouping:
+  - fused `/4` localization map
+  - pad-to-even (bottom/right)
+  - `pixel_unshuffle(..., 2)` to preserve per-cell 2x2 `/4` structure at `/8`
+  - patch refinement at `/8`
+  - crop to exact score-grid shape for alignment
+- Score and orientation paths unchanged.
+
+### Result (available)
+- Further x/y quality increase observed in later reports.
+- Depending on dataset/target version, detection F1 ranged from strong to regressed:
+  - strong prior references around `0.476653`
+  - later run with changed data composition at `0.420428`
+
+---
+
+## I13 - Ground-truth regeneration alignment work (`*_v2`, `*_v3`)
+
+### What was tried
+- Regenerating ground truth to match current model target contract directly:
+  - continuous x/y offsets
+  - orientation vectors
+- Goal: remove dependence on on-the-fly compatibility reconstruction.
+
+### Result (available)
+- Latest shared eval on `DS123_merged_v3`:
+  - `best_score_f1 = 0.420428`
+  - best threshold `0.60`
+  - precision `0.497547`, recall `0.364008`
+  - x acc `0.42996`, y acc `0.42758`, orientation acc `0.74363`
+  - x MAE cell `0.18584`, y MAE cell `0.18906`
+  - orientation MAE `27.29 deg`
+- Important context from same run:
+  - large sample skipping due to zero active minutia support affected effective pool and comparability.
+
+## 3) Consolidated Results Table (Available Metrics)
+
+| Iter | Main change focus | best_score_f1 | best thr | Precision@best | Recall@best | x acc | y acc | ori acc | ori mae (deg) |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| I0 | Initial baseline (legacy regime) | 0.043954 | 0.10 | 0.022471 | 1.000000 | 0.1182 | 0.1204 | 0.0889 | N/A |
+| I5/I6 early | Raw-logit + first paper-style strict eval | 0.032628 | 0.10 | 0.022009 | 0.063048 | 0.1326 | 0.1394 | 0.0130 | N/A |
+| I7 early | Full-negative score + hard negatives (early) | 0.061491 | 0.10 | 0.031844 | 0.891745 | 0.1326 | 0.1170 | 0.0981 | N/A |
+| I8/I9 | Continuous orientation/x-y era strong run | 0.426165 | 0.60 | 0.469603 | 0.390082 | 0.1848 | 0.1817 | 0.7746 | 18.71 |
+| I8/I9 | Tuned follow-up | 0.452410 | 0.60 | 0.527599 | 0.395978 | 0.2046 | 0.1979 | 0.8022 | 17.80 |
+| I10 peak | Strongest logged F1 run | 0.484694 | 0.60 | 0.511152 | 0.460841 | 0.1990 | 0.1920 | 0.8199 | 17.42 |
+| I10 alt | High-precision/strong orientation run | 0.476653 | 0.60 | 0.558125 | 0.415936 | 0.1893 | 0.1793 | 0.8657 | 15.09 |
+| I12/I13 | Later data/target mix run | 0.442435 | 0.60 | 0.495778 | 0.399456 | 0.3701 | 0.3379 | 0.7744 | 18.54 |
+| I13 latest | `DS123_merged_v3` latest shared eval | 0.420428 | 0.60 | 0.497547 | 0.364008 | 0.4300 | 0.4276 | 0.7436 | 27.29 |
+
+## 4) Current Understanding
+
+- Biggest improvement lever so far was score-head objective alignment (full-negative learning + hard negatives).
+- Continuous orientation and continuous offsets gave much better geometric interpretability and strong gains in several runs.
+- Patch-aware x/y representation improved localization behavior, but global detection quality remained sensitive to data-target consistency.
+- The most recent regression signals are likely confounded by target-support/skipping behavior in latest dataset variant.
+
+## 5) Next Iteration Logging Template (Recommended)
+
+For each next run, log this exact block for strict comparability:
+
+- Data root + exact sample_count/val_sample_count after loader filtering
+- Training config hash (loss weights, hard-neg params, monitor metric, seeds)
+- `best_score_f1`, best threshold, precision/recall at best threshold
+- x/y/orientation accuracy
+- x/y cell MAE and orientation MAE
+- skip statistics (`missing gradient`, `zero active minutia target cells`)
 

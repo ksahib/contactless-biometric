@@ -1,0 +1,164 @@
+[
+  {
+    "sample_id": "s01_f01_a01_v00",
+    "subject_id": 1,
+    "subject_index": 0,
+    "finger_id": 1,
+    "acquisition_id": 1,
+    "finger_class_id": 0,
+    "raw_image_path": "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\raw\\1_1_1_0.jpg",
+    "raw_view_index": 0,
+    "sire_path": "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\SIRE-1_1_1.bmp",
+    "raw_view_paths": [
+      "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\raw\\1_1_1_0.jpg",
+      "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\raw\\1_1_1_1.jpg",
+      "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\raw\\1_1_1_2.jpg",
+      "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\raw\\1_1_1_3.jpg",
+      "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\raw\\1_1_1_4.jpg",
+      "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\raw\\1_1_1_5.jpg"
+    ],
+    "variant_paths": {
+      "HT1": "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\SIRE-1_1_1_HT1.bmp",
+      "HT2": "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\SIRE-1_1_1_HT2.bmp",
+      "HT4": "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\SIRE-1_1_1_HT4.bmp",
+      "HT6": "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\SIRE-1_1_1_HT6.bmp",
+      "R414": "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\SIRE-1_1_1_R414.bmp"
+    },
+    "is_extra_acquisition": false
+  },
+  {
+    "sample_id": "s01_f01_a01_v01",
+    "subject_id": 1,
+    "subject_index": 0,
+    "finger_id": 1,
+    "acquisition_id": 1,
+    "finger_class_id": 0,
+    "raw_image_path": "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\raw\\1_1_1_1.jpg",
+    "raw_view_index": 1,
+    "sire_path": "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\SIRE-1_1_1.bmp",
+    "raw_view_paths": [
+      "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\raw\\1_1_1_0.jpg",
+      "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\raw\\1_1_1_1.jpg",
+      "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\raw\\1_1_1_2.jpg",
+      "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\raw\\1_1_1_3.jpg",
+      "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\raw\\1_1_1_4.jpg",
+      "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\raw\\1_1_1_5.jpg"
+    ],
+    "variant_paths": {
+      "HT1": "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\SIRE-1_1_1_HT1.bmp",
+      "HT2": "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\SIRE-1_1_1_HT2.bmp",
+      "HT4": "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\SIRE-1_1_1_HT4.bmp",
+      "HT6": "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\SIRE-1_1_1_HT6.bmp",
+      "R414": "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\SIRE-1_1_1_R414.bmp"
+    },
+    "is_extra_acquisition": false
+  },
+  {
+    "sample_id": "s01_f01_a01_v02",
+    "subject_id": 1,
+    "subject_index": 0,
+    "finger_id": 1,
+    "acquisition_id": 1,
+    "finger_class_id": 0,
+    "raw_image_path": "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\raw\\1_1_1_2.jpg",
+    "raw_view_index": 2,
+    "sire_path": "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\SIRE-1_1_1.bmp",
+    "raw_view_paths": [
+      "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\raw\\1_1_1_0.jpg",
+      "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\raw\\1_1_1_1.jpg",
+      "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\raw\\1_1_1_2.jpg",
+      "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\raw\\1_1_1_3.jpg",
+      "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\raw\\1_1_1_4.jpg",
+      "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\raw\\1_1_1_5.jpg"
+    ],
+    "variant_paths": {
+      "HT1": "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\SIRE-1_1_1_HT1.bmp",
+      "HT2": "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\SIRE-1_1_1_HT2.bmp",
+      "HT4": "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\SIRE-1_1_1_HT4.bmp",
+      "HT6": "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\SIRE-1_1_1_HT6.bmp",
+      "R414": "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\SIRE-1_1_1_R414.bmp"
+    },
+    "is_extra_acquisition": false
+  },
+  {
+    "sample_id": "s01_f01_a01_v03",
+    "subject_id": 1,
+    "subject_index": 0,
+    "finger_id": 1,
+    "acquisition_id": 1,
+    "finger_class_id": 0,
+    "raw_image_path": "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\raw\\1_1_1_3.jpg",
+    "raw_view_index": 3,
+    "sire_path": "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\SIRE-1_1_1.bmp",
+    "raw_view_paths": [
+      "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\raw\\1_1_1_0.jpg",
+      "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\raw\\1_1_1_1.jpg",
+      "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\raw\\1_1_1_2.jpg",
+      "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\raw\\1_1_1_3.jpg",
+      "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\raw\\1_1_1_4.jpg",
+      "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\raw\\1_1_1_5.jpg"
+    ],
+    "variant_paths": {
+      "HT1": "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\SIRE-1_1_1_HT1.bmp",
+      "HT2": "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\SIRE-1_1_1_HT2.bmp",
+      "HT4": "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\SIRE-1_1_1_HT4.bmp",
+      "HT6": "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\SIRE-1_1_1_HT6.bmp",
+      "R414": "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\SIRE-1_1_1_R414.bmp"
+    },
+    "is_extra_acquisition": false
+  },
+  {
+    "sample_id": "s01_f01_a01_v04",
+    "subject_id": 1,
+    "subject_index": 0,
+    "finger_id": 1,
+    "acquisition_id": 1,
+    "finger_class_id": 0,
+    "raw_image_path": "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\raw\\1_1_1_4.jpg",
+    "raw_view_index": 4,
+    "sire_path": "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\SIRE-1_1_1.bmp",
+    "raw_view_paths": [
+      "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\raw\\1_1_1_0.jpg",
+      "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\raw\\1_1_1_1.jpg",
+      "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\raw\\1_1_1_2.jpg",
+      "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\raw\\1_1_1_3.jpg",
+      "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\raw\\1_1_1_4.jpg",
+      "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\raw\\1_1_1_5.jpg"
+    ],
+    "variant_paths": {
+      "HT1": "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\SIRE-1_1_1_HT1.bmp",
+      "HT2": "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\SIRE-1_1_1_HT2.bmp",
+      "HT4": "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\SIRE-1_1_1_HT4.bmp",
+      "HT6": "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\SIRE-1_1_1_HT6.bmp",
+      "R414": "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\SIRE-1_1_1_R414.bmp"
+    },
+    "is_extra_acquisition": false
+  },
+  {
+    "sample_id": "s01_f01_a01_v05",
+    "subject_id": 1,
+    "subject_index": 0,
+    "finger_id": 1,
+    "acquisition_id": 1,
+    "finger_class_id": 0,
+    "raw_image_path": "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\raw\\1_1_1_5.jpg",
+    "raw_view_index": 5,
+    "sire_path": "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\SIRE-1_1_1.bmp",
+    "raw_view_paths": [
+      "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\raw\\1_1_1_0.jpg",
+      "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\raw\\1_1_1_1.jpg",
+      "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\raw\\1_1_1_2.jpg",
+      "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\raw\\1_1_1_3.jpg",
+      "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\raw\\1_1_1_4.jpg",
+      "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\raw\\1_1_1_5.jpg"
+    ],
+    "variant_paths": {
+      "HT1": "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\SIRE-1_1_1_HT1.bmp",
+      "HT2": "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\SIRE-1_1_1_HT2.bmp",
+      "HT4": "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\SIRE-1_1_1_HT4.bmp",
+      "HT6": "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\SIRE-1_1_1_HT6.bmp",
+      "R414": "D:\\contactless biome\\contactless-biometric\\dataset\\DS1\\1\\SIRE-1_1_1_R414.bmp"
+    },
+    "is_extra_acquisition": false
+  }
+]

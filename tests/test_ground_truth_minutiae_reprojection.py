@@ -109,6 +109,71 @@ class GroundTruthMinutiaeReprojectionTests(unittest.TestCase):
         self.assertEqual(counters["dropped_outside_unwarped_mask"], 1)
         self.assertEqual(counters["dropped_outside_unwarped_bounds"], 1)
 
+    def test_cpu_segment_preprocessing_does_not_call_rembg(self):
+        raw = np.tile(np.arange(64, dtype=np.uint8), (64, 1))
+        mask = np.zeros((64, 64), dtype=np.uint8)
+        mask[8:56, 16:48] = 255
+
+        with mock.patch.object(gt, "rembg_mask_from_bgr", side_effect=AssertionError("rembg should stay main-process")):
+            preprocessed = gt._preprocess_contactless_segment_cpu(raw, mask, "test_mask")
+
+        self.assertEqual(preprocessed.mask_source, "test_mask")
+        self.assertGreater(int(np.count_nonzero(preprocessed.final_mask)), 0)
+
+    def test_reconstruction_geometry_can_use_presegmented_view(self):
+        segmented = gt.SegmentedContactlessInput(
+            raw_image_path=str(Path("view_0.jpg").resolve()),
+            raw_gray=np.zeros((8, 8), dtype=np.uint8),
+            initial_mask=np.ones((8, 8), dtype=np.uint8) * 255,
+            mask_source="test",
+        )
+        preprocessed = gt.PreprocessedContactlessImage(
+            raw_gray=np.zeros((8, 8), dtype=np.uint8),
+            normalized_gray=np.zeros((8, 8), dtype=np.uint8),
+            pose_normalized_gray=np.zeros((8, 8), dtype=np.uint8),
+            pose_normalized_mask=np.ones((8, 8), dtype=np.uint8) * 255,
+            preprocessed_gray=np.zeros((8, 8), dtype=np.uint8),
+            final_mask=np.ones((8, 8), dtype=np.uint8) * 255,
+            mask_source="test",
+            pose_rotation_degrees=0.0,
+            ridge_scale_factor=1.0,
+        )
+
+        with (
+            mock.patch.object(gt, "_preprocess_contactless_segment_cpu", return_value=preprocessed) as cpu_preprocess,
+            mock.patch.object(gt, "_preprocess_contactless_raw", side_effect=AssertionError("raw rembg path should not run")),
+        ):
+            _, geometry = gt._extract_reconstruction_view_geometry_from_segment("front", segmented)
+
+        cpu_preprocess.assert_called_once()
+        self.assertEqual(geometry.image_shape, (8, 8))
+        self.assertTrue(np.all(geometry.valid_rows))
+
+    def test_collect_reconstruction_candidates_keeps_one_sample_per_acquisition(self):
+        raw_views = [str(Path(f"1_1_1_{idx}.jpg").resolve()) for idx in range(3)]
+        samples = [
+            gt.RawViewSample(
+                sample_id=f"s01_f01_a01_v0{idx}",
+                subject_id=1,
+                subject_index=0,
+                finger_id=1,
+                acquisition_id=1,
+                finger_class_id=0,
+                raw_image_path=raw_views[idx],
+                raw_view_index=idx,
+                sire_path=None,
+                raw_view_paths=raw_views,
+                variant_paths={},
+                is_extra_acquisition=False,
+            )
+            for idx in range(3)
+        ]
+
+        candidates = gt._collect_reconstruction_candidates(samples)
+
+        self.assertEqual(list(candidates.keys()), [(1, 1, 1)])
+        self.assertEqual(candidates[(1, 1, 1)].raw_view_index, 0)
+
     def test_post_rasterization_fallback_after_zero_reconstruction_cells(self):
         with tempfile.TemporaryDirectory() as directory:
             tmp_path = Path(directory)

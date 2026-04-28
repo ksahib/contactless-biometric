@@ -12,8 +12,8 @@ import subprocess
 import sys
 import sysconfig
 import time
-from collections import deque
-from concurrent.futures import Future, ThreadPoolExecutor
+import multiprocessing as mp
+from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Any, Iterable
 from urllib import error as urlerror
@@ -226,6 +226,14 @@ class LoadedSampleInput:
 
 
 @dataclass(slots=True)
+class SegmentedContactlessInput:
+    raw_image_path: str
+    raw_gray: np.ndarray
+    initial_mask: np.ndarray
+    mask_source: str
+
+
+@dataclass(slots=True)
 class PreparedBundleArtifacts:
     sample: RawViewSample
     bundle_dir: Path
@@ -260,6 +268,28 @@ class BundleWritePayload:
     visualize: bool
 
 
+@dataclass(slots=True)
+class TimedReconstructionResult:
+    reconstruction: AcquisitionReconstructionResult
+    stage_seconds: dict[str, float]
+
+
+@dataclass(slots=True)
+class TimedPreparedBundle:
+    prepared: PreparedBundleArtifacts
+    stage_seconds: dict[str, float]
+
+
+@dataclass(slots=True)
+class BuiltBundleTargets:
+    minutiae: list[dict[str, Any]]
+    minutiae_source: str
+    featurenet_targets: dict[str, np.ndarray]
+    rasterized_count: int
+    minutiae_ground_truth_details: dict[str, Any]
+    stage_seconds: dict[str, float]
+
+
 def _require_grayscale(path: Path) -> np.ndarray:
     image = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
     if image is None:
@@ -269,6 +299,65 @@ def _require_grayscale(path: Path) -> np.ndarray:
 
 def _record_stage_time(stage: str, seconds: float) -> None:
     _PIPELINE_STAGE_TOTALS[stage] = _PIPELINE_STAGE_TOTALS.get(stage, 0.0) + max(0.0, float(seconds))
+
+
+def _stage_totals_snapshot() -> dict[str, float]:
+    return {key: float(value) for key, value in _PIPELINE_STAGE_TOTALS.items()}
+
+
+def _stage_totals_delta(before: dict[str, float]) -> dict[str, float]:
+    after = _stage_totals_snapshot()
+    return {
+        key: max(0.0, after.get(key, 0.0) - before.get(key, 0.0))
+        for key in sorted(set(before) | set(after))
+        if max(0.0, after.get(key, 0.0) - before.get(key, 0.0)) > 0.0
+    }
+
+
+def _merge_stage_seconds(stage_seconds: dict[str, float]) -> None:
+    for stage, seconds in stage_seconds.items():
+        _record_stage_time(stage, seconds)
+
+
+def _completed_future(result: Any = None, exception: BaseException | None = None) -> Future[Any]:
+    future: Future[Any] = Future()
+    if exception is not None:
+        future.set_exception(exception)
+    else:
+        future.set_result(result)
+    return future
+
+
+def _submit_cpu_task(
+    executor: ProcessPoolExecutor | None,
+    function: Any,
+    *args: Any,
+) -> Future[Any]:
+    if executor is not None:
+        return executor.submit(function, *args)
+    try:
+        result = function(*args)
+        if hasattr(result, "stage_seconds"):
+            result.stage_seconds = {}
+        return _completed_future(result)
+    except BaseException as exc:
+        return _completed_future(exception=exc)
+
+
+def _cpu_worker_initializer() -> None:
+    # Worker processes must not become accidental owners of model-backed GPU runtimes.
+    os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+    os.environ["NVIDIA_VISIBLE_DEVICES"] = ""
+    os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+    os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+    os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "false"
+    os.environ["FINGERFLOW_ALLOW_CPU"] = "1"
+
+
+def _cpu_worker_ready() -> int:
+    _cpu_worker_initializer()
+    time.sleep(0.1)
+    return os.getpid()
 
 
 def _current_runtime_config() -> GeneratorRuntimeConfig:
@@ -771,12 +860,25 @@ def _normalize_ridge_frequency(gray_image: np.ndarray, mask: np.ndarray, target_
     return resized_image, resized_mask, scale
 
 
-def _preprocess_contactless_bgr(full_bgr: np.ndarray) -> PreprocessedContactlessImage:
+def _segment_contactless_bgr_main(full_bgr: np.ndarray, raw_image_path: Path | None = None) -> SegmentedContactlessInput:
     raw_gray = cv2.cvtColor(full_bgr, cv2.COLOR_BGR2GRAY)
     rembg_started_at = time.perf_counter()
     initial_mask, mask_source = rembg_mask_from_bgr(full_bgr)
     _record_stage_time("rembg", time.perf_counter() - rembg_started_at)
     validate_foreground_area(initial_mask, minimum_ratio=0.03)
+    return SegmentedContactlessInput(
+        raw_image_path=str(raw_image_path.resolve()) if raw_image_path is not None else "",
+        raw_gray=raw_gray,
+        initial_mask=initial_mask,
+        mask_source=mask_source,
+    )
+
+
+def _preprocess_contactless_segment_cpu(
+    raw_gray: np.ndarray,
+    initial_mask: np.ndarray,
+    mask_source: str,
+) -> PreprocessedContactlessImage:
     cpu_started_at = time.perf_counter()
     normalized_gray = normalise_brightness_array(raw_gray, initial_mask)
     pose_rotation_degrees = _estimate_pose_rotation(initial_mask)
@@ -800,6 +902,15 @@ def _preprocess_contactless_bgr(full_bgr: np.ndarray) -> PreprocessedContactless
         mask_source=mask_source,
         pose_rotation_degrees=pose_rotation_degrees,
         ridge_scale_factor=ridge_scale_factor,
+    )
+
+
+def _preprocess_contactless_bgr(full_bgr: np.ndarray) -> PreprocessedContactlessImage:
+    segmented = _segment_contactless_bgr_main(full_bgr)
+    return _preprocess_contactless_segment_cpu(
+        segmented.raw_gray,
+        segmented.initial_mask,
+        segmented.mask_source,
     )
 
 
@@ -833,8 +944,11 @@ def _resolve_reconstruction_triplet(raw_view_paths: Iterable[str]) -> dict[str, 
     }
 
 
-def _extract_reconstruction_view_geometry(role: str, raw_image_path: Path) -> tuple[PreprocessedContactlessImage, ReconstructionViewGeometry]:
-    preprocessed = _preprocess_contactless_raw(raw_image_path)
+def _build_reconstruction_view_geometry(
+    role: str,
+    raw_image_path: Path,
+    preprocessed: PreprocessedContactlessImage,
+) -> ReconstructionViewGeometry:
     mask = preprocessed.pose_normalized_mask
     height, width = mask.shape
     x_left = np.full(height, -1.0, dtype=np.float32)
@@ -855,7 +969,7 @@ def _extract_reconstruction_view_geometry(role: str, raw_image_path: Path) -> tu
         centers[y] = 0.5 * (left + right)
         valid_rows[y] = True
 
-    return preprocessed, ReconstructionViewGeometry(
+    return ReconstructionViewGeometry(
         role=role,
         raw_image_path=str(raw_image_path.resolve()),
         image_shape=(height, width),
@@ -865,6 +979,24 @@ def _extract_reconstruction_view_geometry(role: str, raw_image_path: Path) -> tu
         centers=centers,
         valid_rows=valid_rows,
     )
+
+
+def _extract_reconstruction_view_geometry_from_segment(
+    role: str,
+    segmented: SegmentedContactlessInput,
+) -> tuple[PreprocessedContactlessImage, ReconstructionViewGeometry]:
+    raw_image_path = Path(segmented.raw_image_path)
+    preprocessed = _preprocess_contactless_segment_cpu(
+        segmented.raw_gray,
+        segmented.initial_mask,
+        segmented.mask_source,
+    )
+    return preprocessed, _build_reconstruction_view_geometry(role, raw_image_path, preprocessed)
+
+
+def _extract_reconstruction_view_geometry(role: str, raw_image_path: Path) -> tuple[PreprocessedContactlessImage, ReconstructionViewGeometry]:
+    preprocessed = _preprocess_contactless_raw(raw_image_path)
+    return preprocessed, _build_reconstruction_view_geometry(role, raw_image_path, preprocessed)
 
 
 def _rotate_depth_branch(x_coords: np.ndarray, depth: np.ndarray, angle_degrees: float) -> tuple[np.ndarray, np.ndarray]:
@@ -2404,6 +2536,14 @@ def _project_front_source_to_pose_frame(
     y_front: float,
 ) -> tuple[float, float] | None:
     support_mask = reconstruction_maps["support_mask"]
+    x_key = f"{role}_pose_x_map"
+    y_key = f"{role}_pose_y_map"
+    if x_key in reconstruction_maps and y_key in reconstruction_maps:
+        x_pose = _sample_2d_bilinear(reconstruction_maps[x_key], x_front, y_front, valid_mask=support_mask)
+        y_pose = _sample_2d_bilinear(reconstruction_maps[y_key], x_front, y_front, valid_mask=support_mask)
+        if x_pose is not None and y_pose is not None:
+            return float(x_pose), float(y_pose)
+
     x_relative = _sample_2d_bilinear(reconstruction_maps["x_relative"], x_front, y_front, valid_mask=support_mask)
     if x_relative is None:
         return None
@@ -2479,17 +2619,26 @@ def _remap_unwarped_minutiae_to_sample(
     height, width = preprocessed.preprocessed_gray.shape
     scale_x, scale_y = _training_frame_scale_from_preprocessed(preprocessed)
     source_minutiae, filter_counters = _canonical_minutiae_with_front_sources(canonical_minutiae, unwarp_maps)
+    projection_map_mode = (
+        "dense_pose_map"
+        if f"{role}_pose_x_map" in reconstruction_maps and f"{role}_pose_y_map" in reconstruction_maps
+        else "legacy_pointwise_fallback"
+    )
     remap_details: dict[str, Any] = {
         "view_role": role,
+        "projection_map_mode": projection_map_mode,
         "scale_x": scale_x,
         "scale_y": scale_y,
         **filter_counters,
         "dropped_projection_failed": 0,
         "dropped_out_of_training_bounds": 0,
         "dropped_no_final_mask_support": 0,
+        "orientation_projected_count": 0,
+        "orientation_fallback_count": 0,
         "reprojected_minutiae_count": 0,
     }
     delta = 4.0
+    min_orientation_baseline_px = 1.5
     for minutia, source_x, source_y in source_minutiae:
         destination = _project_front_source_to_training_frame(
             reconstruction_maps,
@@ -2531,18 +2680,27 @@ def _remap_unwarped_minutiae_to_sample(
             if projected is not None:
                 projected_points.append(projected)
 
+        theta_dst = theta
         if len(projected_points) == 2:
-            theta_dst = math.atan2(
-                float(projected_points[0][1] - projected_points[1][1]),
-                float(projected_points[0][0] - projected_points[1][0]),
-            )
+            dx_proj = float(projected_points[0][0] - projected_points[1][0])
+            dy_proj = float(projected_points[0][1] - projected_points[1][1])
+            baseline = math.hypot(dx_proj, dy_proj)
+            if baseline >= min_orientation_baseline_px:
+                theta_dst = math.atan2(dy_proj, dx_proj)
+                remap_details["orientation_projected_count"] += 1
+            else:
+                remap_details["orientation_fallback_count"] += 1
         elif len(projected_points) == 1:
-            theta_dst = math.atan2(
-                float(projected_points[0][1] - y_dst),
-                float(projected_points[0][0] - x_dst),
-            )
+            dx_proj = float(projected_points[0][0] - x_dst)
+            dy_proj = float(projected_points[0][1] - y_dst)
+            baseline = math.hypot(dx_proj, dy_proj)
+            if baseline >= min_orientation_baseline_px:
+                theta_dst = math.atan2(dy_proj, dx_proj)
+                remap_details["orientation_projected_count"] += 1
+            else:
+                remap_details["orientation_fallback_count"] += 1
         else:
-            theta_dst = theta
+            remap_details["orientation_fallback_count"] += 1
 
         remapped.append(
             {
@@ -2694,7 +2852,11 @@ def _write_row_measurements(
     (reconstruction_dir / "row_measurements.json").write_text(json.dumps(rows, indent=2), encoding="utf-8")
 
 
-def _reconstruct_multiview_acquisition(sample: RawViewSample, output_root: Path) -> AcquisitionReconstructionResult:
+def _reconstruct_multiview_acquisition_from_segmented(
+    sample: RawViewSample,
+    output_root: Path,
+    segmented_views: dict[str, SegmentedContactlessInput] | None = None,
+) -> AcquisitionReconstructionResult:
     triplet_paths = _resolve_reconstruction_triplet(sample.raw_view_paths)
     if triplet_paths is None:
         raise RuntimeError("missing one or more required reconstruction views 0/1/2")
@@ -2702,7 +2864,10 @@ def _reconstruct_multiview_acquisition(sample: RawViewSample, output_root: Path)
     preprocessed_views: dict[str, PreprocessedContactlessImage] = {}
     view_geometries: dict[str, ReconstructionViewGeometry] = {}
     for role, raw_view_path in triplet_paths.items():
-        preprocessed, geometry = _extract_reconstruction_view_geometry(role, raw_view_path)
+        if segmented_views is not None and role in segmented_views:
+            preprocessed, geometry = _extract_reconstruction_view_geometry_from_segment(role, segmented_views[role])
+        else:
+            preprocessed, geometry = _extract_reconstruction_view_geometry(role, raw_view_path)
         preprocessed_views[role] = preprocessed
         view_geometries[role] = geometry
 
@@ -2825,6 +2990,29 @@ def _reconstruct_multiview_acquisition(sample: RawViewSample, output_root: Path)
     np.save(reconstruction_dir / "depth_left.npy", depth_left)
     np.save(reconstruction_dir / "depth_right.npy", depth_right)
     _save_npz(reconstruction_dir / "depth_gradient_labels.npz", depth_gradient_labels)
+
+    # Dense pose maps are model-exact for this surrogate reconstruction, not calibrated camera projections.
+    yy = np.arange(height, dtype=np.float32)[:, None]
+    y_grid = np.repeat(yy, width, axis=1).astype(np.float32)
+    front_pose_x_map = front_centers[:, None].astype(np.float32) + x_relative_masked
+    front_pose_y_map = y_grid.copy()
+    # Side x_rot values are measured in the front-centered surrogate surface frame.
+    # Add the front and target row centers to land back in the target pose image.
+    left_pose_x_map = front_centers[:, None].astype(np.float32) + left_centers[:, None].astype(np.float32) + x_left_rot
+    left_pose_y_map = y_grid.copy()
+    right_pose_x_map = front_centers[:, None].astype(np.float32) + right_centers[:, None].astype(np.float32) - x_right_rot
+    right_pose_y_map = y_grid.copy()
+    valid_pose_map = support_mask > 0
+    for pose_map in (
+        front_pose_x_map,
+        front_pose_y_map,
+        left_pose_x_map,
+        left_pose_y_map,
+        right_pose_x_map,
+        right_pose_y_map,
+    ):
+        pose_map[~valid_pose_map] = np.nan
+
     _save_npz(
         reconstruction_dir / "reconstruction_maps.npz",
         {
@@ -2843,6 +3031,12 @@ def _reconstruct_multiview_acquisition(sample: RawViewSample, output_root: Path)
             "front_valid_rows": front_geometry.valid_rows.astype(np.uint8),
             "left_valid_rows": left_geometry.valid_rows.astype(np.uint8),
             "right_valid_rows": right_geometry.valid_rows.astype(np.uint8),
+            "front_pose_x_map": front_pose_x_map.astype(np.float32),
+            "front_pose_y_map": front_pose_y_map.astype(np.float32),
+            "left_pose_x_map": left_pose_x_map.astype(np.float32),
+            "left_pose_y_map": left_pose_y_map.astype(np.float32),
+            "right_pose_x_map": right_pose_x_map.astype(np.float32),
+            "right_pose_y_map": right_pose_y_map.astype(np.float32),
             "x_crit": x_crit.astype(np.float32),
         },
     )
@@ -3042,6 +3236,29 @@ def _reconstruct_multiview_acquisition(sample: RawViewSample, output_root: Path)
         input_view_paths={role: str(path.resolve()) for role, path in triplet_paths.items()},
         debug_view_paths=debug_view_paths,
     )
+
+
+def _reconstruct_multiview_acquisition(sample: RawViewSample, output_root: Path) -> AcquisitionReconstructionResult:
+    return _reconstruct_multiview_acquisition_from_segmented(sample, output_root, segmented_views=None)
+
+
+def _reconstruct_multiview_acquisition_cpu(
+    sample: RawViewSample,
+    output_root: Path,
+    segmented_views: dict[str, SegmentedContactlessInput],
+) -> TimedReconstructionResult:
+    before = _stage_totals_snapshot()
+    triplet_paths = _resolve_reconstruction_triplet(sample.raw_view_paths)
+    required_roles = set(triplet_paths or {})
+    missing_roles = sorted(required_roles - set(segmented_views))
+    if missing_roles:
+        raise RuntimeError(f"CPU reconstruction missing pre-segmented roles: {', '.join(missing_roles)}")
+    reconstruction = _reconstruct_multiview_acquisition_from_segmented(
+        sample,
+        output_root,
+        segmented_views=segmented_views,
+    )
+    return TimedReconstructionResult(reconstruction=reconstruction, stage_seconds=_stage_totals_delta(before))
 
 
 def _build_manifest(dataset_root: Path) -> list[RawViewSample]:
@@ -3742,8 +3959,18 @@ def _load_sample_input(
     return loaded
 
 
-def _prepare_bundle_from_loaded(loaded: LoadedSampleInput, dpi: int) -> PreparedBundleArtifacts:
-    preprocessed = _preprocess_contactless_bgr(loaded.full_bgr)
+def _prepare_bundle_from_segmented(
+    sample: RawViewSample,
+    image_path: Path,
+    raw_gray: np.ndarray,
+    initial_mask: np.ndarray,
+    mask_source: str,
+    visualize: bool,
+    bundle_dir: Path,
+    reconstruction: AcquisitionReconstructionResult | None,
+    dpi: int,
+) -> PreparedBundleArtifacts:
+    preprocessed = _preprocess_contactless_segment_cpu(raw_gray, initial_mask, mask_source)
     gray_image = preprocessed.preprocessed_gray
     mask = preprocessed.final_mask.copy()
     cpu_started_at = time.perf_counter()
@@ -3757,16 +3984,16 @@ def _prepare_bundle_from_loaded(loaded: LoadedSampleInput, dpi: int) -> Prepared
     ridge_period[mask <= 0] = 0.0
 
     visualization_gradient = _compute_gradient(gray_image, mask)
-    reconstruction_gradient = _load_reconstruction_gradient_for_sample(loaded.sample, loaded.reconstruction)
+    reconstruction_gradient = _load_reconstruction_gradient_for_sample(sample, reconstruction)
     masked_image = gray_image.copy()
     masked_image[mask <= 0] = 0
     enhanced_image = _enhance_for_minutiae(masked_image)
     _record_stage_time("cpu_preprocess", time.perf_counter() - cpu_started_at)
 
     return PreparedBundleArtifacts(
-        sample=loaded.sample,
-        bundle_dir=loaded.bundle_dir,
-        image_path=loaded.image_path,
+        sample=sample,
+        bundle_dir=bundle_dir,
+        image_path=image_path,
         preprocessed=preprocessed,
         gray_image=gray_image,
         mask=mask,
@@ -3776,8 +4003,49 @@ def _prepare_bundle_from_loaded(loaded: LoadedSampleInput, dpi: int) -> Prepared
         reconstruction_gradient=reconstruction_gradient,
         masked_image=masked_image,
         enhanced_image=enhanced_image,
-        visualize=loaded.visualize,
-        reconstruction=loaded.reconstruction,
+        visualize=visualize,
+        reconstruction=reconstruction,
+    )
+
+
+def _prepare_bundle_cpu(
+    sample: RawViewSample,
+    image_path: Path,
+    raw_gray: np.ndarray,
+    initial_mask: np.ndarray,
+    mask_source: str,
+    visualize: bool,
+    bundle_dir: Path,
+    reconstruction: AcquisitionReconstructionResult | None,
+    dpi: int,
+) -> TimedPreparedBundle:
+    before = _stage_totals_snapshot()
+    prepared = _prepare_bundle_from_segmented(
+        sample,
+        image_path,
+        raw_gray,
+        initial_mask,
+        mask_source,
+        visualize,
+        bundle_dir,
+        reconstruction,
+        dpi,
+    )
+    return TimedPreparedBundle(prepared=prepared, stage_seconds=_stage_totals_delta(before))
+
+
+def _prepare_bundle_from_loaded(loaded: LoadedSampleInput, dpi: int) -> PreparedBundleArtifacts:
+    segmented = _segment_contactless_bgr_main(loaded.full_bgr, loaded.image_path)
+    return _prepare_bundle_from_segmented(
+        loaded.sample,
+        loaded.image_path,
+        segmented.raw_gray,
+        segmented.initial_mask,
+        segmented.mask_source,
+        loaded.visualize,
+        loaded.bundle_dir,
+        loaded.reconstruction,
+        dpi,
     )
 
 
@@ -3926,6 +4194,179 @@ def _persist_bundle(payload: BundleWritePayload) -> None:
             payload.minutiae,
         )
     _record_stage_time("write_bundle", time.perf_counter() - started_at)
+
+
+def _build_reprojected_targets_cpu(
+    prepared: PreparedBundleArtifacts,
+    canonical_minutiae: list[dict[str, Any]],
+    canonical_source: str,
+    canonical_details: dict[str, Any],
+) -> BuiltBundleTargets:
+    before = _stage_totals_snapshot()
+    reconstruction = prepared.reconstruction
+    role = _view_role_for_sample(prepared.sample)
+    if reconstruction is None or role is None:
+        raise RuntimeError("reprojected target build requires a reconstruction-backed sample")
+
+    unwarp_maps = _load_npz_arrays(Path(reconstruction.center_unwarp_maps_path))
+    reconstruction_maps = _load_npz_arrays(Path(reconstruction.reconstruction_maps_path))
+    reprojected_minutiae, remap_details = _remap_unwarped_minutiae_to_sample(
+        canonical_minutiae,
+        unwarp_maps,
+        reconstruction_maps,
+        prepared.sample,
+        prepared.preprocessed,
+    )
+    featurenet_targets, rasterized_count = _build_targets_and_count_rasterized_minutiae(
+        prepared,
+        reprojected_minutiae,
+    )
+    minutiae_ground_truth_details = {
+        "mode": "reconstruction_backed",
+        "canonical_source": canonical_source,
+        "view_role": role,
+        "canonical_minutiae_count": len(canonical_minutiae),
+        "reprojected_minutiae_count": len(reprojected_minutiae),
+        "rasterized_minutiae_count": rasterized_count,
+        "center_unwarped_image_path": reconstruction.center_unwarped_image_path,
+        "center_unwarped_mask_path": reconstruction.center_unwarped_mask_path,
+        "center_unwarp_maps_path": reconstruction.center_unwarp_maps_path,
+        "reconstruction_maps_path": reconstruction.reconstruction_maps_path,
+        **canonical_details,
+        **remap_details,
+    }
+    return BuiltBundleTargets(
+        minutiae=reprojected_minutiae,
+        minutiae_source=f"{canonical_source}_reprojected_{role}",
+        featurenet_targets=featurenet_targets,
+        rasterized_count=rasterized_count,
+        minutiae_ground_truth_details=minutiae_ground_truth_details,
+        stage_seconds=_stage_totals_delta(before),
+    )
+
+
+def _build_direct_targets_cpu(
+    prepared: PreparedBundleArtifacts,
+    minutiae: list[dict[str, Any]],
+    minutiae_source: str,
+    minutiae_ground_truth_details: dict[str, Any],
+) -> BuiltBundleTargets:
+    before = _stage_totals_snapshot()
+    featurenet_targets, rasterized_count = _build_targets_and_count_rasterized_minutiae(prepared, minutiae)
+    details = dict(minutiae_ground_truth_details)
+    if str(details.get("mode", "")).startswith("direct_fallback"):
+        details.pop("rasterized_minutiae_count", None)
+        details["fallback_rasterized_minutiae_count"] = rasterized_count
+    elif "rasterized_minutiae_count" not in details:
+        details["rasterized_minutiae_count"] = rasterized_count
+    return BuiltBundleTargets(
+        minutiae=minutiae,
+        minutiae_source=minutiae_source,
+        featurenet_targets=featurenet_targets,
+        rasterized_count=rasterized_count,
+        minutiae_ground_truth_details=details,
+        stage_seconds=_stage_totals_delta(before),
+    )
+
+
+def _finalize_bundle_from_targets(
+    prepared: PreparedBundleArtifacts,
+    built_targets: BuiltBundleTargets,
+) -> tuple[dict[str, Any], BundleWritePayload]:
+    reconstruction = prepared.reconstruction
+    role = _view_role_for_sample(prepared.sample)
+    meta = _build_bundle_meta(
+        prepared,
+        built_targets.featurenet_targets,
+        built_targets.minutiae,
+        built_targets.minutiae_source,
+        minutiae_ground_truth_details=built_targets.minutiae_ground_truth_details,
+    )
+    write_payload = BundleWritePayload(
+        bundle_dir=prepared.bundle_dir,
+        preprocessed=prepared.preprocessed,
+        gray_image=prepared.gray_image,
+        mask=prepared.mask,
+        orientation=prepared.orientation,
+        ridge_period=prepared.ridge_period,
+        visualization_gradient=prepared.visualization_gradient,
+        masked_image=prepared.masked_image,
+        enhanced_image=prepared.enhanced_image,
+        minutiae=built_targets.minutiae,
+        featurenet_targets=built_targets.featurenet_targets,
+        meta=meta,
+        visualize=prepared.visualize,
+    )
+    return {
+        "bundle_dir": str(prepared.bundle_dir.resolve()),
+        "sample_id": prepared.sample.sample_id,
+        "raw_view_index": prepared.sample.raw_view_index,
+        "view_role": role,
+        "minutiae_count": len(built_targets.minutiae),
+        "rasterized_minutiae_count": built_targets.rasterized_count,
+        "minutiae_source": built_targets.minutiae_source,
+        "minutiae_gt_mode": built_targets.minutiae_ground_truth_details.get("mode"),
+        "reconstruction_available": reconstruction is not None,
+        "used_reconstruction_backed_final_labels": (
+            built_targets.minutiae_ground_truth_details.get("mode") == "reconstruction_backed"
+        ),
+        "used_direct_fallback": str(built_targets.minutiae_ground_truth_details.get("mode", "")).startswith(
+            "direct_fallback"
+        ),
+        "mask_source": prepared.preprocessed.mask_source,
+        "pose_rotation_degrees": prepared.preprocessed.pose_rotation_degrees,
+        "ridge_scale_factor": prepared.preprocessed.ridge_scale_factor,
+    }, write_payload
+
+
+def _segment_raw_path_main(raw_path: Path) -> SegmentedContactlessInput:
+    started_at = time.perf_counter()
+    bgr = load_bgr_image(raw_path)
+    _record_stage_time("load_input", time.perf_counter() - started_at)
+    return _segment_contactless_bgr_main(bgr, raw_path)
+
+
+def _segment_reconstruction_triplet_main(sample: RawViewSample) -> dict[str, SegmentedContactlessInput]:
+    triplet_paths = _resolve_reconstruction_triplet(sample.raw_view_paths)
+    if triplet_paths is None:
+        raise RuntimeError("missing one or more required reconstruction views 0/1/2")
+    return {role: _segment_raw_path_main(raw_path) for role, raw_path in triplet_paths.items()}
+
+
+def _make_cpu_executor(cpu_workers: int) -> ProcessPoolExecutor | None:
+    if cpu_workers <= 1:
+        return None
+    inherited_env = {
+        "CUDA_VISIBLE_DEVICES": os.environ.get("CUDA_VISIBLE_DEVICES"),
+        "NVIDIA_VISIBLE_DEVICES": os.environ.get("NVIDIA_VISIBLE_DEVICES"),
+        "TF_CPP_MIN_LOG_LEVEL": os.environ.get("TF_CPP_MIN_LOG_LEVEL"),
+        "TF_ENABLE_ONEDNN_OPTS": os.environ.get("TF_ENABLE_ONEDNN_OPTS"),
+        "TF_FORCE_GPU_ALLOW_GROWTH": os.environ.get("TF_FORCE_GPU_ALLOW_GROWTH"),
+        "FINGERFLOW_ALLOW_CPU": os.environ.get("FINGERFLOW_ALLOW_CPU"),
+    }
+    _cpu_worker_initializer()
+    context = mp.get_context("spawn")
+    executor: ProcessPoolExecutor | None = None
+    try:
+        executor = ProcessPoolExecutor(
+            max_workers=cpu_workers,
+            mp_context=context,
+            initializer=_cpu_worker_initializer,
+        )
+        warmups = [executor.submit(_cpu_worker_ready) for _ in range(cpu_workers)]
+        for future in warmups:
+            future.result(timeout=120)
+        return executor
+    except Exception:
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
+        raise
+    finally:
+        for key, value in inherited_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def _generate_bundle_from_loaded(
@@ -5083,7 +5524,15 @@ def main() -> int:
     )
 
     verification = _verify_manifest(samples)
-    reconstruction_candidates = _collect_reconstruction_candidates(samples)
+    active_reconstruction_samples = [
+        sample
+        for sample in samples
+        if not (
+            runtime_config.skip_existing
+            and _bundle_outputs_exist(output_root / "samples" / sample.sample_id)
+        )
+    ]
+    reconstruction_candidates = _collect_reconstruction_candidates(active_reconstruction_samples)
     total_requested = len(samples)
     generation_results: dict[str, Any] = {}
     generated = 0
@@ -5091,9 +5540,8 @@ def main() -> int:
     errors: list[dict[str, str]] = []
     reconstruction_results: dict[tuple[int, int, int], AcquisitionReconstructionResult] = {}
     reconstruction_errors: list[dict[str, str]] = []
-    load_executor = ThreadPoolExecutor(max_workers=runtime_config.cpu_workers, thread_name_prefix="gt-load")
+    cpu_executor = _make_cpu_executor(runtime_config.cpu_workers)
     write_executor = ThreadPoolExecutor(max_workers=max(1, min(runtime_config.cpu_workers, 2)), thread_name_prefix="gt-write")
-    pending_inputs: deque[tuple[int, RawViewSample, Future[LoadedSampleInput]]] = deque()
     pending_writes: list[Future[None]] = []
 
     def emit_progress(status: str, sample_id: str | None = None) -> None:
@@ -5106,22 +5554,70 @@ def main() -> int:
             flush=True,
         )
 
-    def submit_sample(index: int, sample: RawViewSample) -> None:
-        nonlocal skipped_existing
-        bundle_dir = output_root / "samples" / sample.sample_id
-        if runtime_config.skip_existing and _bundle_outputs_exist(bundle_dir):
-            skipped_existing += 1
-            emit_progress("skipped_existing", sample.sample_id)
-            return
+    def submit_direct_targets(
+        prepared: PreparedBundleArtifacts,
+        details: dict[str, Any],
+        pending_targets: dict[Future[BuiltBundleTargets], tuple[str, PreparedBundleArtifacts]],
+    ) -> None:
+        minutiae_enhanced_path = prepared.bundle_dir / "minutiae_enhanced.png"
+        prepared.bundle_dir.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(minutiae_enhanced_path), prepared.enhanced_image)
+        minutiae, minutiae_source = _extract_direct_sample_minutiae(
+            prepared,
+            minutiae_enhanced_path,
+            args.fingerflow_model_dir.resolve(),
+            fingerflow_backend,
+        )
+        target_details = dict(details)
+        if target_details.get("mode") == "direct_per_sample":
+            target_details["source"] = minutiae_source
+        if str(target_details.get("mode", "")).startswith("direct_fallback"):
+            target_details["fallback_source"] = minutiae_source
+            target_details["fallback_minutiae_count"] = len(minutiae)
+        pending_targets[
+            _submit_cpu_task(
+                cpu_executor,
+                _build_direct_targets_cpu,
+                prepared,
+                minutiae,
+                minutiae_source,
+                target_details,
+            )
+        ] = ("direct", prepared)
 
-        reconstruction: AcquisitionReconstructionResult | None = None
-        acquisition_key = _acquisition_key(sample.subject_id, sample.finger_id, sample.acquisition_id)
-        if acquisition_key in reconstruction_candidates:
-            if acquisition_key not in reconstruction_results and not any(
-                item["acquisition_id"] == _acquisition_name(*acquisition_key) for item in reconstruction_errors
+    def finalize_targets(prepared: PreparedBundleArtifacts, built_targets: BuiltBundleTargets) -> None:
+        nonlocal generated
+        _merge_stage_seconds(built_targets.stage_seconds)
+        generation_results[prepared.sample.sample_id], write_payload = _finalize_bundle_from_targets(
+            prepared,
+            built_targets,
+        )
+        pending_writes.append(write_executor.submit(_persist_bundle, write_payload))
+        generated += 1
+        emit_progress("generated", prepared.sample.sample_id)
+
+    try:
+        print(f"[progress] starting total={total_requested}", flush=True)
+        reconstruction_items = list(reconstruction_candidates.items())
+        pending_reconstructions: dict[Future[TimedReconstructionResult], tuple[tuple[int, int, int], RawViewSample]] = {}
+        next_reconstruction = 0
+        while next_reconstruction < len(reconstruction_items) or pending_reconstructions:
+            while (
+                next_reconstruction < len(reconstruction_items)
+                and len(pending_reconstructions) < runtime_config.prefetch_samples
             ):
+                acquisition_key, sample = reconstruction_items[next_reconstruction]
+                next_reconstruction += 1
                 try:
-                    reconstruction_results[acquisition_key] = _reconstruct_multiview_acquisition(sample, output_root)
+                    segmented_views = _segment_reconstruction_triplet_main(sample)
+                    future = _submit_cpu_task(
+                        cpu_executor,
+                        _reconstruct_multiview_acquisition_cpu,
+                        sample,
+                        output_root,
+                        segmented_views,
+                    )
+                    pending_reconstructions[future] = (acquisition_key, sample)
                 except Exception as exc:
                     reconstruction_errors.append(
                         {
@@ -5130,48 +5626,181 @@ def main() -> int:
                             "error": str(exc),
                         }
                     )
-            reconstruction = reconstruction_results.get(acquisition_key)
-        future = load_executor.submit(
-            _load_sample_input,
-            sample,
-            output_root,
-            index < args.visualize_count,
-            reconstruction,
-        )
-        pending_inputs.append((index, sample, future))
+            if not pending_reconstructions:
+                continue
+            completed, _ = wait(pending_reconstructions.keys(), return_when=FIRST_COMPLETED)
+            for future in completed:
+                acquisition_key, sample = pending_reconstructions.pop(future)
+                try:
+                    timed_reconstruction = future.result()
+                    _merge_stage_seconds(timed_reconstruction.stage_seconds)
+                    reconstruction_results[acquisition_key] = timed_reconstruction.reconstruction
+                    print(
+                        f"[progress] status=reconstructed acquisition={_acquisition_name(*acquisition_key)}",
+                        flush=True,
+                    )
+                except Exception as exc:
+                    reconstruction_errors.append(
+                        {
+                            "acquisition_id": _acquisition_name(*acquisition_key),
+                            "sample_id": sample.sample_id,
+                            "error": str(exc),
+                        }
+                    )
 
-    try:
         scheduled = 0
-        print(f"[progress] starting total={total_requested}", flush=True)
-        while scheduled < len(samples) and (args.limit is None or scheduled < args.limit) and len(pending_inputs) < runtime_config.prefetch_samples:
-            submit_sample(scheduled, samples[scheduled])
-            scheduled += 1
+        pending_prepared: dict[Future[TimedPreparedBundle], tuple[int, RawViewSample]] = {}
+        pending_targets: dict[Future[BuiltBundleTargets], tuple[str, PreparedBundleArtifacts]] = {}
 
-        while pending_inputs:
-            index, sample, future = pending_inputs.popleft()
-            try:
-                loaded = future.result()
-                generation_results[sample.sample_id], write_payload = _generate_bundle_from_loaded(
-                    loaded,
-                    fingerflow_model_dir=args.fingerflow_model_dir.resolve(),
-                    dpi=args.dpi,
-                    fingerflow_backend=fingerflow_backend,
-                )
-                pending_writes.append(write_executor.submit(_persist_bundle, write_payload))
-                generated += 1
-                emit_progress("generated", sample.sample_id)
-            except Exception as exc:
-                errors.append({"sample_id": sample.sample_id, "error": str(exc)})
-                emit_progress("error", sample.sample_id)
-
-            while scheduled < len(samples) and (args.limit is None or scheduled < args.limit) and len(pending_inputs) < runtime_config.prefetch_samples:
-                submit_sample(scheduled, samples[scheduled])
+        def schedule_prepared_samples() -> None:
+            nonlocal scheduled, skipped_existing
+            while (
+                scheduled < len(samples)
+                and (len(pending_prepared) + len(pending_targets)) < runtime_config.prefetch_samples
+            ):
+                index = scheduled
+                sample = samples[scheduled]
                 scheduled += 1
+                bundle_dir = output_root / "samples" / sample.sample_id
+                if runtime_config.skip_existing and _bundle_outputs_exist(bundle_dir):
+                    skipped_existing += 1
+                    emit_progress("skipped_existing", sample.sample_id)
+                    continue
+                try:
+                    segmented = _segment_raw_path_main(Path(sample.raw_image_path))
+                    acquisition_key = _acquisition_key(sample.subject_id, sample.finger_id, sample.acquisition_id)
+                    future = _submit_cpu_task(
+                        cpu_executor,
+                        _prepare_bundle_cpu,
+                        sample,
+                        Path(sample.raw_image_path),
+                        segmented.raw_gray,
+                        segmented.initial_mask,
+                        segmented.mask_source,
+                        index < args.visualize_count,
+                        bundle_dir,
+                        reconstruction_results.get(acquisition_key),
+                        args.dpi,
+                    )
+                    pending_prepared[future] = (index, sample)
+                except Exception as exc:
+                    errors.append({"sample_id": sample.sample_id, "error": str(exc)})
+                    emit_progress("error", sample.sample_id)
+
+        while scheduled < len(samples) or pending_prepared or pending_targets:
+            schedule_prepared_samples()
+            futures: list[Future[Any]] = list(pending_prepared.keys()) + list(pending_targets.keys())
+            if not futures:
+                continue
+            completed, _ = wait(futures, return_when=FIRST_COMPLETED)
+            for future in completed:
+                if future in pending_prepared:
+                    _, sample = pending_prepared.pop(future)
+                    try:
+                        timed_prepared = future.result()
+                        _merge_stage_seconds(timed_prepared.stage_seconds)
+                        prepared = timed_prepared.prepared
+                        minutiae_enhanced_path = prepared.bundle_dir / "minutiae_enhanced.png"
+                        prepared.bundle_dir.mkdir(parents=True, exist_ok=True)
+                        cv2.imwrite(str(minutiae_enhanced_path), prepared.enhanced_image)
+                        role = _view_role_for_sample(prepared.sample)
+                        if prepared.reconstruction is not None and role is not None:
+                            canonical_minutiae, canonical_source, canonical_details = (
+                                _load_or_extract_canonical_reconstruction_minutiae(
+                                    prepared.reconstruction,
+                                    args.fingerflow_model_dir.resolve(),
+                                    fingerflow_backend,
+                                )
+                            )
+                            target_future = _submit_cpu_task(
+                                cpu_executor,
+                                _build_reprojected_targets_cpu,
+                                prepared,
+                                canonical_minutiae,
+                                canonical_source,
+                                canonical_details,
+                            )
+                            pending_targets[target_future] = ("reprojected", prepared)
+                        else:
+                            submit_direct_targets(
+                                prepared,
+                                {
+                                    "mode": "direct_per_sample",
+                                    "source": f"fingerflow_{fingerflow_backend.backend}",
+                                },
+                                pending_targets,
+                            )
+                    except Exception as exc:
+                        errors.append({"sample_id": sample.sample_id, "error": str(exc)})
+                        emit_progress("error", sample.sample_id)
+                    continue
+
+                kind, prepared = pending_targets.pop(future)
+                try:
+                    built_targets = future.result()
+                    if (
+                        kind == "reprojected"
+                        and built_targets.rasterized_count < MIN_RASTERIZED_MINUTIAE_FOR_RECONSTRUCTION
+                    ):
+                        _merge_stage_seconds(built_targets.stage_seconds)
+                        reconstruction = prepared.reconstruction
+                        fallback_reason = (
+                            "empty_reprojection"
+                            if not built_targets.minutiae
+                            else "zero_rasterized_minutiae_after_reprojection"
+                        )
+                        fallback_details = {
+                            "mode": (
+                                "direct_fallback_after_empty_reprojection"
+                                if not built_targets.minutiae
+                                else "direct_fallback_after_zero_rasterized_reprojection"
+                            ),
+                            "view_role": _view_role_for_sample(prepared.sample),
+                            "fallback_reason": fallback_reason,
+                            "fallback_source": f"fingerflow_{fingerflow_backend.backend}",
+                            "canonical_source": built_targets.minutiae_ground_truth_details.get("canonical_source"),
+                            "canonical_minutiae_count": built_targets.minutiae_ground_truth_details.get(
+                                "canonical_minutiae_count"
+                            ),
+                            "reprojected_minutiae_count_before_fallback": len(built_targets.minutiae),
+                            "rasterized_minutiae_count_before_fallback": built_targets.rasterized_count,
+                            "center_unwarped_image_path": reconstruction.center_unwarped_image_path if reconstruction else None,
+                            "center_unwarped_mask_path": reconstruction.center_unwarped_mask_path if reconstruction else None,
+                            "center_unwarp_maps_path": reconstruction.center_unwarp_maps_path if reconstruction else None,
+                            "reconstruction_maps_path": reconstruction.reconstruction_maps_path if reconstruction else None,
+                        }
+                        for key, value in built_targets.minutiae_ground_truth_details.items():
+                            fallback_details.setdefault(key, value)
+                        submit_direct_targets(prepared, fallback_details, pending_targets)
+                    else:
+                        finalize_targets(prepared, built_targets)
+                except Exception as exc:
+                    if kind == "reprojected":
+                        try:
+                            submit_direct_targets(
+                                prepared,
+                                {
+                                    "mode": "direct_fallback_after_reconstruction_failure",
+                                    "view_role": _view_role_for_sample(prepared.sample),
+                                    "fallback_reason": "reconstruction_exception",
+                                    "reason": str(exc),
+                                    "fallback_source": f"fingerflow_{fingerflow_backend.backend}",
+                                    "fallback_minutiae_count": 0,
+                                },
+                                pending_targets,
+                            )
+                        except Exception as fallback_exc:
+                            errors.append({"sample_id": prepared.sample.sample_id, "error": str(fallback_exc)})
+                            emit_progress("error", prepared.sample.sample_id)
+                    else:
+                        errors.append({"sample_id": prepared.sample.sample_id, "error": str(exc)})
+                        emit_progress("error", prepared.sample.sample_id)
 
         for future in pending_writes:
             future.result()
     finally:
-        load_executor.shutdown(wait=True)
+        if cpu_executor is not None:
+            cpu_executor.shutdown(wait=True)
         write_executor.shutdown(wait=True)
 
     minutiae_audit = _summarize_minutiae_generation_results(generation_results)
