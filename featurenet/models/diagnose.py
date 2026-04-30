@@ -38,7 +38,15 @@ from .evaluate import (
 from .infer import _torch_load_checkpoint
 from .feature_extractor import FeatureExtractor
 from .losses import FeatureNetLoss
-from .train import _resolve_device, create_dataloader, evaluate, load_bundle_samples, split_samples, _move_targets_to_device
+from .train import (
+    _resolve_amp_dtype,
+    _resolve_device,
+    create_dataloader,
+    evaluate,
+    load_bundle_samples,
+    split_samples,
+    _move_targets_to_device,
+)
 
 
 def _decode_count_diagnostics(
@@ -48,6 +56,7 @@ def _decode_count_diagnostics(
     score_thresholds: list[float],
     target_threshold: float,
     amp: bool = False,
+    amp_dtype: torch.dtype = torch.float16,
     channels_last: bool = False,
 ) -> dict[str, Any]:
     aggregate: dict[str, dict[str, float]] = {
@@ -73,7 +82,11 @@ def _decode_count_diagnostics(
 
             image = inputs[:, :1]
             mask = inputs[:, 1:2]
-            autocast_ctx = torch.autocast(device_type="cuda", dtype=torch.float16) if amp and device.type == "cuda" else nullcontext()
+            autocast_ctx = (
+                torch.autocast(device_type="cuda", dtype=amp_dtype)
+                if amp and device.type == "cuda"
+                else nullcontext()
+            )
             with autocast_ctx:
                 outputs = model(image, mask=mask)
 
@@ -188,6 +201,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--amp-dtype",
+        choices=("fp16", "bf16"),
+        default="fp16",
+        help="Floating dtype to use inside CUDA autocast when --amp is enabled.",
+    )
     parser.add_argument("--pin-memory", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--persistent-workers", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--prefetch-factor", type=int, default=2)
@@ -203,6 +222,9 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     device = _resolve_device(args.device)
+    if args.amp and args.amp_dtype == "bf16" and device.type == "cuda" and not torch.cuda.is_bf16_supported():
+        raise SystemExit("--amp-dtype bf16 requested, but this CUDA device does not report bfloat16 support")
+    amp_dtype = _resolve_amp_dtype(args.amp_dtype)
     checkpoint = _torch_load_checkpoint(args.checkpoint_path, device)
     model = FeatureExtractor().to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
@@ -243,6 +265,7 @@ def main() -> None:
             criterion,
             device,
             amp=use_amp,
+            amp_dtype=amp_dtype,
             channels_last=args.channels_last,
         )
         loss_metrics_status: dict[str, Any] = {"available": True, "reason": None}
@@ -259,6 +282,7 @@ def main() -> None:
         score_thresholds=_default_thresholds(),
         target_threshold=args.target_threshold,
         amp=use_amp,
+        amp_dtype=amp_dtype,
         channels_last=args.channels_last,
     )
     decode_diagnostics = _decode_count_diagnostics(
@@ -268,6 +292,7 @@ def main() -> None:
         score_thresholds=_default_thresholds(),
         target_threshold=args.target_threshold,
         amp=use_amp,
+        amp_dtype=amp_dtype,
         channels_last=args.channels_last,
     )
 

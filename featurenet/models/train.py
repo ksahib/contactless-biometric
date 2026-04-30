@@ -250,10 +250,18 @@ def _resolve_device(device: str | torch.device | None) -> torch.device:
     return torch.device("cpu")
 
 
-def _autocast_context(device: torch.device, enabled: bool):
+def _resolve_amp_dtype(name: str) -> torch.dtype:
+    if name == "fp16":
+        return torch.float16
+    if name == "bf16":
+        return torch.bfloat16
+    raise ValueError(f"unsupported AMP dtype: {name}")
+
+
+def _autocast_context(device: torch.device, enabled: bool, dtype: torch.dtype = torch.float16):
     if not enabled or device.type != "cuda":
         return nullcontext()
-    return torch.autocast(device_type="cuda", dtype=torch.float16)
+    return torch.autocast(device_type="cuda", dtype=dtype)
 
 
 def _maybe_channels_last(model: FeatureExtractor, enabled: bool) -> FeatureExtractor:
@@ -404,10 +412,11 @@ def _diagnose_non_finite_step(
     inputs: torch.Tensor,
     targets: Mapping[str, torch.Tensor],
     amp: bool,
+    amp_dtype: torch.dtype = torch.float16,
 ) -> tuple[list[str], list[str]]:
     image = inputs[:, :1]
     mask = inputs[:, 1:2]
-    with _autocast_context(inputs.device, amp):
+    with _autocast_context(inputs.device, amp, amp_dtype):
         outputs = model(image, mask=mask)
     output_issues = _tensor_non_finite_issues(outputs)
     if amp and output_issues:
@@ -465,11 +474,12 @@ def _run_model_step(
     inputs: torch.Tensor,
     targets: Mapping[str, torch.Tensor],
     amp: bool = False,
+    amp_dtype: torch.dtype = torch.float16,
 ) -> dict[str, torch.Tensor]:
     image = inputs[:, :1]
     mask = inputs[:, 1:2]
     device = inputs.device
-    with _autocast_context(device, amp):
+    with _autocast_context(device, amp, amp_dtype):
         outputs = model(image, mask=mask)
     if amp:
         output_issues = _tensor_non_finite_issues(outputs)
@@ -497,6 +507,7 @@ def train_one_epoch(
     device: str | torch.device,
     scaler: torch.cuda.amp.GradScaler | None = None,
     amp: bool = False,
+    amp_dtype: torch.dtype = torch.float16,
     channels_last: bool = False,
     grad_accum_steps: int = 1,
     max_grad_norm: float | None = None,
@@ -519,11 +530,11 @@ def train_one_epoch(
         inputs = inputs.to(resolved_device, non_blocking=True)
         inputs = _prepare_inputs_for_model(inputs, channels_last)
         targets = _move_targets_to_device(targets, resolved_device)
-        losses = _run_model_step(model, criterion, inputs, targets, amp=amp)
+        losses = _run_model_step(model, criterion, inputs, targets, amp=amp, amp_dtype=amp_dtype)
         total_loss = losses["total"]
         if not torch.isfinite(total_loss):
             sample_ids = _sample_ids_for_batch(dataloader, targets)
-            target_issues, output_issues = _diagnose_non_finite_step(model, inputs, targets, amp=amp)
+            target_issues, output_issues = _diagnose_non_finite_step(model, inputs, targets, amp=amp, amp_dtype=amp_dtype)
             if skip_non_finite_target_batches and target_issues and not output_issues:
                 skipped_batches += 1
                 optimizer.zero_grad(set_to_none=True)
@@ -604,6 +615,7 @@ def evaluate(
     criterion: FeatureNetLoss,
     device: str | torch.device,
     amp: bool = False,
+    amp_dtype: torch.dtype = torch.float16,
     channels_last: bool = False,
 ) -> dict[str, float]:
     model.eval()
@@ -615,7 +627,7 @@ def evaluate(
         inputs = inputs.to(resolved_device, non_blocking=True)
         inputs = _prepare_inputs_for_model(inputs, channels_last)
         targets = _move_targets_to_device(targets, resolved_device)
-        losses = _run_model_step(model, criterion, inputs, targets, amp=amp)
+        losses = _run_model_step(model, criterion, inputs, targets, amp=amp, amp_dtype=amp_dtype)
 
         scalar_losses = _loss_dict_to_scalars(losses)
         for key in LOSS_KEYS:
@@ -637,6 +649,7 @@ def fit_debug(
     shuffle: bool = True,
     num_workers: int = 0,
     amp: bool = False,
+    amp_dtype: torch.dtype = torch.float16,
     channels_last: bool = False,
 ) -> dict[str, Any]:
     if not samples:
@@ -669,6 +682,7 @@ def fit_debug(
             device=resolved_device,
             scaler=scaler,
             amp=amp,
+            amp_dtype=amp_dtype,
             channels_last=channels_last,
         )
         metrics["epoch"] = float(epoch + 1)
@@ -1010,6 +1024,7 @@ def _compute_extended_validation_metrics(
     dataloader: DataLoader,
     device: torch.device,
     amp: bool,
+    amp_dtype: torch.dtype,
     channels_last: bool,
 ) -> dict[str, Any]:
     from .evaluate import _default_thresholds, compute_validation_metrics
@@ -1021,6 +1036,7 @@ def _compute_extended_validation_metrics(
         score_thresholds=_default_thresholds(),
         target_threshold=0.0,
         amp=amp,
+        amp_dtype=amp_dtype,
         channels_last=channels_last,
     )
 
@@ -1076,6 +1092,7 @@ def train_model(args: argparse.Namespace) -> dict[str, Any]:
     train_samples, val_samples = split_samples(samples, val_fraction=args.val_fraction, seed=args.seed)
     resolved_device = _resolve_device(args.device)
     use_amp = bool(args.amp) and resolved_device.type == "cuda"
+    amp_dtype = _resolve_amp_dtype(args.amp_dtype)
     use_pin_memory = bool(args.pin_memory) and resolved_device.type == "cuda"
     if args.cudnn_benchmark and resolved_device.type == "cuda":
         torch.backends.cudnn.benchmark = True
@@ -1121,7 +1138,7 @@ def train_model(args: argparse.Namespace) -> dict[str, Any]:
         betas=(0.9, 0.999),
         weight_decay=0.0,
     )
-    scaler = _make_grad_scaler(use_amp)
+    scaler = _make_grad_scaler(use_amp and amp_dtype == torch.float16)
 
     resume_epoch = 0
     resume_metrics: Mapping[str, Any] = {}
@@ -1181,6 +1198,7 @@ def train_model(args: argparse.Namespace) -> dict[str, Any]:
             resolved_device,
             scaler=scaler,
             amp=use_amp,
+            amp_dtype=amp_dtype,
             channels_last=args.channels_last,
             grad_accum_steps=args.grad_accum_steps,
             max_grad_norm=args.max_grad_norm,
@@ -1218,6 +1236,7 @@ def train_model(args: argparse.Namespace) -> dict[str, Any]:
                 criterion,
                 resolved_device,
                 amp=use_amp,
+                amp_dtype=amp_dtype,
                 channels_last=args.channels_last,
             )
             record["val"] = val_metrics
@@ -1230,6 +1249,7 @@ def train_model(args: argparse.Namespace) -> dict[str, Any]:
                     dataloader=val_loader,
                     device=resolved_device,
                     amp=use_amp,
+                    amp_dtype=amp_dtype,
                     channels_last=args.channels_last,
                 )
                 record["val_metrics"] = extended_val_metrics
@@ -1296,6 +1316,7 @@ def train_model(args: argparse.Namespace) -> dict[str, Any]:
         "batch_size": args.batch_size,
         "lr": args.lr,
         "amp": use_amp,
+        "amp_dtype": args.amp_dtype,
         "channels_last": bool(args.channels_last),
         "compile": bool(args.compile and resolved_device.type == "cuda"),
         "grad_accum_steps": args.grad_accum_steps,
@@ -1352,6 +1373,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=max(1, min((os.cpu_count() or 1), 4)))
     parser.add_argument("--device", type=str, default=None, help="Explicit torch device, e.g. cuda, cuda:0, or cpu.")
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--amp-dtype",
+        choices=("fp16", "bf16"),
+        default="fp16",
+        help="Floating dtype to use inside CUDA autocast when --amp is enabled.",
+    )
     parser.add_argument("--channels-last", action="store_true")
     parser.add_argument("--compile", action="store_true", help="Use torch.compile on supported CUDA runtimes.")
     parser.add_argument("--persistent-workers", action=argparse.BooleanOptionalAction, default=True)
@@ -1419,6 +1446,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--grad-accum-steps must be at least 1")
     if args.max_grad_norm < 0.0:
         parser.error("--max-grad-norm must be non-negative")
+    if args.amp and args.amp_dtype == "bf16" and torch.cuda.is_available() and not torch.cuda.is_bf16_supported():
+        parser.error("--amp-dtype bf16 requested, but this CUDA device does not report bfloat16 support")
     if args.mu_score <= 0.0 or args.mu_x <= 0.0 or args.mu_y <= 0.0 or args.mu_ori <= 0.0:
         parser.error("--mu-score, --mu-x, --mu-y, and --mu-ori must be positive")
     if args.m1_focal_gamma < 0.0:

@@ -29,6 +29,7 @@ from .losses import FeatureNetLoss
 from .train import (
     LOSS_KEYS,
     _move_targets_to_device,
+    _resolve_amp_dtype,
     _resolve_device,
     create_dataloader,
     evaluate,
@@ -279,6 +280,7 @@ def compute_validation_metrics(
     score_thresholds: list[float],
     target_threshold: float,
     amp: bool = False,
+    amp_dtype: torch.dtype = torch.float16,
     channels_last: bool = False,
 ) -> dict[str, Any]:
     score_stats = _init_score_stats(score_thresholds)
@@ -304,7 +306,11 @@ def compute_validation_metrics(
 
         image = inputs[:, :1]
         mask = inputs[:, 1:2]
-        autocast_ctx = torch.autocast(device_type="cuda", dtype=torch.float16) if amp and device.type == "cuda" else nullcontext()
+        autocast_ctx = (
+            torch.autocast(device_type="cuda", dtype=amp_dtype)
+            if amp and device.type == "cuda"
+            else nullcontext()
+        )
         with autocast_ctx:
             outputs = model(image, mask=mask)
 
@@ -494,6 +500,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--amp-dtype",
+        choices=("fp16", "bf16"),
+        default="fp16",
+        help="Floating dtype to use inside CUDA autocast when --amp is enabled.",
+    )
     parser.add_argument("--pin-memory", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--persistent-workers", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--prefetch-factor", type=int, default=2)
@@ -509,6 +521,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     device = _resolve_device(args.device)
+    if args.amp and args.amp_dtype == "bf16" and device.type == "cuda" and not torch.cuda.is_bf16_supported():
+        raise SystemExit("--amp-dtype bf16 requested, but this CUDA device does not report bfloat16 support")
     model, checkpoint = _load_checkpoint(args.checkpoint_path, device)
 
     checkpoint_args = checkpoint.get("args", {})
@@ -538,7 +552,16 @@ def main() -> None:
 
     criterion = FeatureNetLoss().to(device)
     use_amp = bool(args.amp) and device.type == "cuda"
-    loss_metrics = evaluate(model, dataloader, criterion, device, amp=use_amp, channels_last=args.channels_last)
+    amp_dtype = _resolve_amp_dtype(args.amp_dtype)
+    loss_metrics = evaluate(
+        model,
+        dataloader,
+        criterion,
+        device,
+        amp=use_amp,
+        amp_dtype=amp_dtype,
+        channels_last=args.channels_last,
+    )
     metric_payload = compute_validation_metrics(
         model=model,
         dataloader=dataloader,
@@ -546,6 +569,7 @@ def main() -> None:
         score_thresholds=_default_thresholds(),
         target_threshold=args.target_threshold,
         amp=use_amp,
+        amp_dtype=amp_dtype,
         channels_last=args.channels_last,
     )
 
@@ -554,6 +578,7 @@ def main() -> None:
         "device": str(device),
         "ground_truth_root": str(ground_truth_root),
         "amp": use_amp,
+        "amp_dtype": args.amp_dtype,
         "pin_memory": bool(args.pin_memory) and device.type == "cuda",
         "persistent_workers": args.persistent_workers,
         "prefetch_factor": args.prefetch_factor,
