@@ -185,36 +185,56 @@ class FeatureNetLoss(nn.Module):
 
         selected = torch.zeros_like(valid_mask, dtype=torch.bool)
         batch_size = focal_map.shape[0]
+
         for batch_index in range(batch_size):
             valid_b = valid_mask[batch_index, 0]
             if not bool(valid_b.any().item()):
                 continue
+
             target_b = target_score[batch_index, 0]
             focal_b = focal_map[batch_index, 0]
+
+            # Center positives only.
             positive_b = (target_b > 0.5) & valid_b
-            negative_b = (~positive_b) & valid_b
+
+            # Soft shoulder is intentionally ignored:
+            # ignore_b = (target_b > 0.0) & (target_b <= 0.5) & valid_b
+
+            # True background only.
+            negative_b = (target_b <= 0.0) & valid_b
 
             selected_b = positive_b.clone()
+
             negative_count = int(negative_b.sum().item())
             positive_count = int(positive_b.sum().item())
+
             if negative_count > 0:
                 ratio_k = int(positive_count * self.m1_hard_neg_ratio)
                 fraction_k = int(negative_count * self.m1_hard_neg_fraction)
                 hard_k = max(ratio_k, self.m1_hard_neg_min, fraction_k)
                 hard_k = min(hard_k, negative_count)
+
                 if hard_k > 0:
                     negative_scores = focal_b[negative_b]
                     negative_indices = torch.nonzero(negative_b, as_tuple=False)
+
                     if hard_k < negative_count:
-                        topk_indices = torch.topk(negative_scores, k=hard_k, sorted=False).indices
+                        topk_indices = torch.topk(
+                            negative_scores,
+                            k=hard_k,
+                            sorted=False,
+                        ).indices
                         chosen_indices = negative_indices[topk_indices]
                     else:
                         chosen_indices = negative_indices
+
                     selected_b[chosen_indices[:, 0], chosen_indices[:, 1]] = True
+
             selected[batch_index, 0] = selected_b
 
         if float(selected.float().sum().item()) <= 0.0:
             return valid_mask
+
         return selected
 
     def _compute_m1_score_loss(self, logits, target_score, score_mask):
