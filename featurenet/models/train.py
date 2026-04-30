@@ -1113,6 +1113,7 @@ def train_model(args: argparse.Namespace) -> dict[str, Any]:
         m1_hard_neg_ratio=args.m1_hard_neg_ratio,
         m1_hard_neg_min=args.m1_hard_neg_min,
         m1_hard_neg_fraction=args.m1_hard_neg_fraction,
+        m1_neg_weight=args.m1_neg_weight,
     ).to(resolved_device)
     optimizer = optim.Adam(
         model.parameters(),
@@ -1392,7 +1393,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--m1-hard-neg-enable", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--m1-hard-neg-ratio", type=float, default=20.0)
     parser.add_argument("--m1-hard-neg-min", type=int, default=2000)
-    parser.add_argument("--m1-hard-neg-fraction", type=float, default=0.05)
+    parser.add_argument("--m1-hard-neg-fraction", type=float, default=0.00)
     parser.add_argument(
         "--strict-gradient-targets",
         action="store_true",
