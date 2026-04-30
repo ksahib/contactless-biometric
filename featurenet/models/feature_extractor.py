@@ -56,9 +56,9 @@ class FeatureExtractor(nn.Module):
             nn.Conv2d(256, 2, kernel_size=1, stride=1, padding=0),
         )
 
-        # score head semantics remain unchanged (deep /8 feature map)
+        # score head uses fused deep /8 features from the minutiae, orientation, and ridge stems.
         self.minutiae_score_head = nn.Sequential(
-            ConvBlock(256, 256, kernel_size=3, stride=1, padding=1),
+            ConvBlock(768, 256, kernel_size=3, stride=1, padding=1),
             ConvBlock(256, 256, kernel_size=3, stride=1, padding=1),
             nn.Conv2d(256, 1, kernel_size=1, stride=1, padding=0),
         )
