@@ -1357,6 +1357,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prefetch-factor", type=int, default=2)
     parser.add_argument("--pin-memory", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--grad-accum-steps", type=int, default=1)
+    parser.add_argument("--m1-neg-weight", type=float, default=2.0)
     parser.add_argument(
         "--max-grad-norm",
         type=float,

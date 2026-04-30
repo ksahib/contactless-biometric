@@ -5,11 +5,12 @@ import torch.nn.functional as F
 MINUTIA_ORIENTATION_BINS = 360
 
 class OrientationLoss(nn.Module):
-    def __init__(self, num_bins=180, alpha=1.0, eps=1e-8):
+    def __init__(self, num_bins=180, alpha=1.0, eps=1e-8, m1_neg_weight=2.0):
         super().__init__()
         self.num_bins = num_bins
         self.alpha = alpha
         self.eps = eps
+        self.m1_neg_weight = float(m1_neg_weight)
 
         kernel = torch.ones(1, 1, 3, 3) / 9.0
         self.register_buffer("smooth_kernel", kernel)
@@ -112,7 +113,8 @@ class FeatureNetLoss(nn.Module):
         m1_hard_neg_enable=True,
         m1_hard_neg_ratio=20.0,
         m1_hard_neg_min=2000,
-        m1_hard_neg_fraction=0.05,
+        m1_hard_neg_fraction=0.00,
+        m1_neg_weight=2.0,
     ):
         super().__init__()
 
@@ -132,6 +134,7 @@ class FeatureNetLoss(nn.Module):
         self.m1_hard_neg_ratio = float(m1_hard_neg_ratio)
         self.m1_hard_neg_min = int(m1_hard_neg_min)
         self.m1_hard_neg_fraction = float(m1_hard_neg_fraction)
+        self.m1_neg_weight = float(m1_neg_weight)
 
     def _orientation_bins_to_unit_vectors(self, bins: torch.Tensor) -> torch.Tensor:
         if bins.dim() == 4 and bins.shape[1] == 1:
@@ -216,27 +219,76 @@ class FeatureNetLoss(nn.Module):
 
     def _compute_m1_score_loss(self, logits, target_score, score_mask):
         eps = 1e-8
+
         if target_score.dim() == 3:
             target_score = target_score.unsqueeze(1)
+
         valid = score_mask > 0.5
-        positive = ((target_score > 0.5) & valid).float().sum()
-        negative = ((target_score <= 0.5) & valid).float().sum()
-        pos_weight = torch.sqrt(negative / (positive + eps)).clamp(min=1.0, max=self.m1_pos_weight_max)
+
+        # If your target_score is a binary mask, this is fine.
+        # If it is a soft heatmap, use the ignore-band version below.
+        positive_mask = (target_score > 0.5) & valid
+        negative_mask = (target_score <= 0.0) & valid
+
+        positive_count = positive_mask.float().sum()
+        negative_count = negative_mask.float().sum()
+
+        # Keep pos_weight moderate. This helps positives survive when negatives are many.
+        pos_weight = torch.sqrt(negative_count / (positive_count + eps)).clamp(
+            min=1.0,
+            max=self.m1_pos_weight_max,
+        )
+
         bce_map = F.binary_cross_entropy_with_logits(
             logits,
             target_score,
             reduction="none",
             pos_weight=pos_weight,
         )
+
+        # Focal term: punishes hard/confident mistakes more than easy ones.
         pt = torch.exp(-bce_map)
         focal_map = torch.pow((1.0 - pt).clamp(min=0.0), self.m1_focal_gamma) * bce_map
-        selected_mask = self._select_hard_negative_mask(
-            focal_map=focal_map,
-            target_score=target_score,
-            valid_mask=valid,
-        )
-        selected_mask_float = selected_mask.float()
-        return (focal_map * selected_mask_float).sum() / (selected_mask_float.sum() + eps)
+
+        # Select hard negatives only from true background.
+        selected_negative_mask = torch.zeros_like(valid, dtype=torch.bool)
+        batch_size = logits.shape[0]
+
+        for b in range(batch_size):
+            neg_b = negative_mask[b, 0]
+            pos_b = positive_mask[b, 0]
+
+            negative_count_b = int(neg_b.sum().item())
+            positive_count_b = int(pos_b.sum().item())
+
+            if negative_count_b <= 0:
+                continue
+
+            ratio_k = int(positive_count_b * self.m1_hard_neg_ratio)
+            hard_k = max(ratio_k, self.m1_hard_neg_min)
+            hard_k = min(hard_k, negative_count_b)
+
+            if hard_k <= 0:
+                continue
+
+            scores_b = focal_map[b, 0][neg_b]
+            neg_indices = torch.nonzero(neg_b, as_tuple=False)
+
+            if hard_k < negative_count_b:
+                topk = torch.topk(scores_b, k=hard_k, sorted=False).indices
+                chosen = neg_indices[topk]
+            else:
+                chosen = neg_indices
+
+            selected_negative_mask[b, 0, chosen[:, 0], chosen[:, 1]] = True
+
+        pos_loss = focal_map[positive_mask].mean() if positive_mask.any() else logits.new_tensor(0.0)
+        neg_loss = focal_map[selected_negative_mask].mean() if selected_negative_mask.any() else logits.new_tensor(0.0)
+
+        # Tune this. Start with 2.0, maybe 4.0 later.
+        neg_weight = getattr(self, "m1_neg_weight", 2.0)
+
+        return pos_loss + neg_weight * neg_loss
 
     def _resolve_offset_target(
         self,

@@ -58,7 +58,8 @@ class FeatureExtractor(nn.Module):
 
         # score head semantics remain unchanged (deep /8 feature map)
         self.minutiae_score_head = nn.Sequential(
-            ConvBlock(256, 256, kernel_size=1, stride=1, padding=0),
+            ConvBlock(256, 256, kernel_size=3, stride=1, padding=1),
+            ConvBlock(256, 256, kernel_size=3, stride=1, padding=1),
             nn.Conv2d(256, 1, kernel_size=1, stride=1, padding=0),
         )
 
@@ -130,7 +131,8 @@ class FeatureExtractor(nn.Module):
         minu_orient = self.minuiae_orient_head(minu_orient_input)
 
         # score remains on deep /8 features
-        minu_score = self.minutiae_score_head(branch2_feat_8x)
+        score_input = torch.cat([branch2_feat_8x, orient_interim, ridge_interim], dim=1)
+        minu_score = self.minutiae_score_head(score_input)
 
         # x/y localization from fused /4 + /8 context.
         # We keep explicit 2x2 /4 geometry for each /8 cell using pixel_unshuffle.
