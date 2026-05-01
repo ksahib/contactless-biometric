@@ -183,63 +183,47 @@ class FeatureNetLoss(nn.Module):
             minutia_mask = minutia_mask.unsqueeze(1)
         return minutia_mask.float()
 
-    def _select_hard_negative_mask(self, focal_map, target_score, valid_mask):
+    def _select_m1_hard_negative_mask(self, focal_map, positive_mask, negative_mask):
+        selected_negative_mask = torch.zeros_like(negative_mask, dtype=torch.bool)
         if not self.m1_hard_neg_enable:
-            return valid_mask
+            return negative_mask
 
-        selected = torch.zeros_like(valid_mask, dtype=torch.bool)
         batch_size = focal_map.shape[0]
 
         for batch_index in range(batch_size):
-            valid_b = valid_mask[batch_index, 0]
-            if not bool(valid_b.any().item()):
-                continue
-
-            target_b = target_score[batch_index, 0]
             focal_b = focal_map[batch_index, 0]
-
-            # Center positives only.
-            positive_b = (target_b > 0.5) & valid_b
-
-            # Soft shoulder is intentionally ignored:
-            # ignore_b = (target_b > 0.0) & (target_b <= 0.5) & valid_b
-
-            # True background only.
-            negative_b = (target_b <= 0.0) & valid_b
-
-            selected_b = positive_b.clone()
+            positive_b = positive_mask[batch_index, 0]
+            negative_b = negative_mask[batch_index, 0]
 
             negative_count = int(negative_b.sum().item())
             positive_count = int(positive_b.sum().item())
 
-            if negative_count > 0:
-                ratio_k = int(positive_count * self.m1_hard_neg_ratio)
-                fraction_k = int(negative_count * self.m1_hard_neg_fraction)
-                hard_k = max(ratio_k, self.m1_hard_neg_min, fraction_k)
-                hard_k = min(hard_k, negative_count)
+            if negative_count <= 0:
+                continue
 
-                if hard_k > 0:
-                    negative_scores = focal_b[negative_b]
-                    negative_indices = torch.nonzero(negative_b, as_tuple=False)
+            ratio_k = int(positive_count * self.m1_hard_neg_ratio)
+            hard_k = max(ratio_k, self.m1_hard_neg_min)
+            hard_k = min(hard_k, negative_count)
 
-                    if hard_k < negative_count:
-                        topk_indices = torch.topk(
-                            negative_scores,
-                            k=hard_k,
-                            sorted=False,
-                        ).indices
-                        chosen_indices = negative_indices[topk_indices]
-                    else:
-                        chosen_indices = negative_indices
+            if hard_k <= 0:
+                continue
 
-                    selected_b[chosen_indices[:, 0], chosen_indices[:, 1]] = True
+            negative_scores = focal_b[negative_b]
+            negative_indices = torch.nonzero(negative_b, as_tuple=False)
 
-            selected[batch_index, 0] = selected_b
+            if hard_k < negative_count:
+                topk_indices = torch.topk(
+                    negative_scores,
+                    k=hard_k,
+                    sorted=False,
+                ).indices
+                chosen_indices = negative_indices[topk_indices]
+            else:
+                chosen_indices = negative_indices
 
-        if float(selected.float().sum().item()) <= 0.0:
-            return valid_mask
+            selected_negative_mask[batch_index, 0, chosen_indices[:, 0], chosen_indices[:, 1]] = True
 
-        return selected
+        return selected_negative_mask
 
     def _m1_side_positive_weight_map(self, focal_map, raw_view_index=None):
         side_weight_map = torch.ones_like(focal_map)
@@ -294,36 +278,11 @@ class FeatureNetLoss(nn.Module):
         focal_map = torch.pow((1.0 - pt).clamp(min=0.0), self.m1_focal_gamma) * bce_map
 
         # Select hard negatives only from true background.
-        selected_negative_mask = torch.zeros_like(valid, dtype=torch.bool)
-        batch_size = logits.shape[0]
-
-        for b in range(batch_size):
-            neg_b = negative_mask[b, 0]
-            pos_b = positive_mask[b, 0]
-
-            negative_count_b = int(neg_b.sum().item())
-            positive_count_b = int(pos_b.sum().item())
-
-            if negative_count_b <= 0:
-                continue
-
-            ratio_k = int(positive_count_b * self.m1_hard_neg_ratio)
-            hard_k = max(ratio_k, self.m1_hard_neg_min)
-            hard_k = min(hard_k, negative_count_b)
-
-            if hard_k <= 0:
-                continue
-
-            scores_b = focal_map[b, 0][neg_b]
-            neg_indices = torch.nonzero(neg_b, as_tuple=False)
-
-            if hard_k < negative_count_b:
-                topk = torch.topk(scores_b, k=hard_k, sorted=False).indices
-                chosen = neg_indices[topk]
-            else:
-                chosen = neg_indices
-
-            selected_negative_mask[b, 0, chosen[:, 0], chosen[:, 1]] = True
+        selected_negative_mask = self._select_m1_hard_negative_mask(
+            focal_map,
+            positive_mask,
+            negative_mask,
+        )
 
         side_weight_map = self._m1_side_positive_weight_map(focal_map, raw_view_index)
         pos_loss = (focal_map * positive_mask.float() * side_weight_map).sum() / (positive_count + eps)

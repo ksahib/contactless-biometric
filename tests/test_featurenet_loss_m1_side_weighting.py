@@ -142,3 +142,22 @@ def test_m1_side_weight_does_not_change_negative_only_loss():
 
     assert torch.allclose(side_loss, front_loss)
     assert math.isfinite(float(side_loss.item()))
+
+
+def test_m1_hard_negative_selection_excludes_positives():
+    criterion = _criterion()
+    logits = torch.tensor([[[[0.0, 4.0, -4.0, 2.0]]]], dtype=torch.float32)
+    target = torch.tensor([[[[1.0, 0.0, 0.25, 0.0]]]], dtype=torch.float32)
+    valid = torch.ones_like(target, dtype=torch.bool)
+    positive_mask = (target > 0.5) & valid
+    negative_mask = (target <= 0.0) & valid
+
+    selected_negative_mask = criterion._select_m1_hard_negative_mask(
+        logits,
+        positive_mask,
+        negative_mask,
+    )
+
+    assert not bool((selected_negative_mask & positive_mask).any().item())
+    assert not bool((selected_negative_mask & ((target > 0.0) & (target <= 0.5))).any().item())
+    assert bool(selected_negative_mask.any().item())
