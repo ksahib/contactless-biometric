@@ -115,8 +115,11 @@ class FeatureNetLoss(nn.Module):
         m1_hard_neg_min=2000,
         m1_hard_neg_fraction=0.00,
         m1_neg_weight=2.0,
+        m1_side_pos_weight=2.0,
     ):
         super().__init__()
+        if m1_side_pos_weight <= 0.0:
+            raise ValueError("m1_side_pos_weight must be positive")
 
         # sub-losses
         self.orientation_loss = OrientationLoss(alpha=alpha)
@@ -135,6 +138,7 @@ class FeatureNetLoss(nn.Module):
         self.m1_hard_neg_min = int(m1_hard_neg_min)
         self.m1_hard_neg_fraction = float(m1_hard_neg_fraction)
         self.m1_neg_weight = float(m1_neg_weight)
+        self.m1_side_pos_weight = float(m1_side_pos_weight)
 
     def _orientation_bins_to_unit_vectors(self, bins: torch.Tensor) -> torch.Tensor:
         if bins.dim() == 4 and bins.shape[1] == 1:
@@ -237,7 +241,26 @@ class FeatureNetLoss(nn.Module):
 
         return selected
 
-    def _compute_m1_score_loss(self, logits, target_score, score_mask):
+    def _m1_side_positive_weight_map(self, focal_map, raw_view_index=None):
+        side_weight_map = torch.ones_like(focal_map)
+        if raw_view_index is None:
+            return side_weight_map
+
+        raw_view_tensor = torch.as_tensor(raw_view_index, device=focal_map.device).flatten()
+        batch_size = focal_map.shape[0]
+        if raw_view_tensor.numel() == 1 and batch_size > 1:
+            raw_view_tensor = raw_view_tensor.expand(batch_size)
+        if raw_view_tensor.numel() != batch_size:
+            raise ValueError(
+                f"expected raw_view_index with {batch_size} values, got {raw_view_tensor.numel()}"
+            )
+
+        side = (raw_view_tensor == 1) | (raw_view_tensor == 2)
+        if bool(side.any().item()):
+            side_weight_map[side, :, :, :] = self.m1_side_pos_weight
+        return side_weight_map
+
+    def _compute_m1_score_loss(self, logits, target_score, score_mask, raw_view_index=None):
         eps = 1e-8
 
         if target_score.dim() == 3:
@@ -302,7 +325,8 @@ class FeatureNetLoss(nn.Module):
 
             selected_negative_mask[b, 0, chosen[:, 0], chosen[:, 1]] = True
 
-        pos_loss = focal_map[positive_mask].mean() if positive_mask.any() else logits.new_tensor(0.0)
+        side_weight_map = self._m1_side_positive_weight_map(focal_map, raw_view_index)
+        pos_loss = (focal_map * positive_mask.float() * side_weight_map).sum() / (positive_count + eps)
         neg_loss = focal_map[selected_negative_mask].mean() if selected_negative_mask.any() else logits.new_tensor(0.0)
 
         # Tune this. Start with 2.0, maybe 4.0 later.
@@ -399,6 +423,7 @@ class FeatureNetLoss(nn.Module):
             outputs["minutia_score"],
             targets["minutia_score"],
             minutia_score_mask,
+            raw_view_index=targets.get("raw_view_index"),
         )
 
         # --- M2: x offset regression (continuous within-cell target)

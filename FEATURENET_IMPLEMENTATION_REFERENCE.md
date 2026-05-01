@@ -493,6 +493,7 @@ Loss tuning:
 - `--m1-hard-neg-ratio` (default `20.0`, must be >=0)
 - `--m1-hard-neg-min` (default `2000`, must be >=0)
 - `--m1-hard-neg-fraction` (default `0.05`, must be in `[0,1]`)
+- `--m1-side-pos-weight` (default `2.0`, must be >0; multiplies positive M1 loss for raw view indices 1 and 2 only)
 
 Data selection:
 - `--strict-gradient-targets` (default `False`)

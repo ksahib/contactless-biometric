@@ -1131,6 +1131,7 @@ def train_model(args: argparse.Namespace) -> dict[str, Any]:
         m1_hard_neg_min=args.m1_hard_neg_min,
         m1_hard_neg_fraction=args.m1_hard_neg_fraction,
         m1_neg_weight=args.m1_neg_weight,
+        m1_side_pos_weight=args.m1_side_pos_weight,
     ).to(resolved_device)
     optimizer = optim.Adam(
         model.parameters(),
@@ -1342,6 +1343,8 @@ def train_model(args: argparse.Namespace) -> dict[str, Any]:
         "m1_hard_neg_ratio": args.m1_hard_neg_ratio,
         "m1_hard_neg_min": args.m1_hard_neg_min,
         "m1_hard_neg_fraction": args.m1_hard_neg_fraction,
+        "m1_neg_weight": args.m1_neg_weight,
+        "m1_side_pos_weight": args.m1_side_pos_weight,
         "validate_every": args.validate_every,
         "early_stopping": {
             "configured": bool(args.early_stopping),
@@ -1386,6 +1389,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pin-memory", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--grad-accum-steps", type=int, default=1)
     parser.add_argument("--m1-neg-weight", type=float, default=2.0)
+    parser.add_argument("--m1-side-pos-weight", type=float, default=2.0)
     parser.add_argument(
         "--max-grad-norm",
         type=float,
@@ -1454,6 +1458,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--m1-focal-gamma must be non-negative")
     if args.m1_pos_weight_max < 1.0:
         parser.error("--m1-pos-weight-max must be at least 1.0")
+    if args.m1_neg_weight <= 0.0:
+        parser.error("--m1-neg-weight must be positive")
+    if args.m1_side_pos_weight <= 0.0:
+        parser.error("--m1-side-pos-weight must be positive")
     if args.m1_hard_neg_ratio < 0.0:
         parser.error("--m1-hard-neg-ratio must be non-negative")
     if args.m1_hard_neg_min < 0:
