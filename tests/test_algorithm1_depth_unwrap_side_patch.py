@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import argparse
 from pathlib import Path
 import sys
 import unittest
@@ -64,6 +65,39 @@ class Algorithm1DepthUnwrapSidePatchTests(unittest.TestCase):
         self.assertEqual(len(scaled), 1)
         self.assertEqual(details["orientation_projected_count"], 1)
         self.assertAlmostEqual(scaled[0]["theta"], np.arctan2(1.0, 2.0), places=5)
+
+    def test_manual_shard_selects_whole_acquisition_units(self):
+        units = [
+            side_depth_patch.AcquisitionWorkUnit(
+                acquisition_id=f"a{idx}",
+                reconstruction_dir=Path(f"recon/{idx}"),
+                cache_dir=Path(f"cache/{idx}"),
+            )
+            for idx in range(5)
+        ]
+        args = argparse.Namespace(shard_mode="manual", shard_count=2, shard_index=1, target_shard_size=10)
+
+        selected, info = side_depth_patch._select_sharded_units(units, args)
+
+        self.assertEqual([unit.acquisition_id for unit in selected], ["a3", "a4"])
+        self.assertEqual(info["selected_start"], 3)
+        self.assertEqual(info["selected_end"], 5)
+
+    def test_auto_shard_keeps_first_chunk_deterministic(self):
+        units = [
+            side_depth_patch.AcquisitionWorkUnit(
+                acquisition_id=f"a{idx}",
+                reconstruction_dir=Path(f"recon/{idx}"),
+                cache_dir=Path(f"cache/{idx}"),
+            )
+            for idx in range(5)
+        ]
+        args = argparse.Namespace(shard_mode="auto", shard_count=1, shard_index=0, target_shard_size=2)
+
+        selected, info = side_depth_patch._select_sharded_units(units, args)
+
+        self.assertEqual([unit.acquisition_id for unit in selected], ["a0", "a1"])
+        self.assertEqual(info["shard_count"], 3)
 
 
 if __name__ == "__main__":
