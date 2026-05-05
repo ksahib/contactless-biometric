@@ -1120,6 +1120,9 @@ def train_model(args: argparse.Namespace) -> dict[str, Any]:
 
     model = _maybe_channels_last(FeatureExtractor().to(resolved_device), args.channels_last)
     criterion = FeatureNetLoss(
+        orientation_weight=args.orientation_weight,
+        ridge_weight=args.ridge_weight,
+        gradient_weight=args.gradient_weight,
         mu_score=args.mu_score,
         mu_x=args.mu_x,
         mu_y=args.mu_y,
@@ -1333,6 +1336,9 @@ def train_model(args: argparse.Namespace) -> dict[str, Any]:
         "seed": args.seed,
         "strict_gradient_targets": bool(args.strict_gradient_targets),
         "strict_finite_targets": bool(args.strict_finite_targets),
+        "orientation_weight": args.orientation_weight,
+        "ridge_weight": args.ridge_weight,
+        "gradient_weight": args.gradient_weight,
         "mu_score": args.mu_score,
         "mu_x": args.mu_x,
         "mu_y": args.mu_y,
@@ -1415,6 +1421,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--early-stopping-metric", choices=EARLY_STOPPING_METRICS, default="val_total")
     parser.add_argument("--early-stopping-patience", type=int, default=5)
     parser.add_argument("--early-stopping-min-delta", type=float, default=1e-4)
+    parser.add_argument("--orientation-weight", type=float, default=1.0)
+    parser.add_argument("--ridge-weight", type=float, default=1.0)
+    parser.add_argument("--gradient-weight", type=float, default=1.0)
     parser.add_argument("--mu-score", type=float, default=120.0)
     parser.add_argument("--mu-x", type=float, default=20.0)
     parser.add_argument("--mu-y", type=float, default=20.0)
@@ -1452,8 +1461,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--max-grad-norm must be non-negative")
     if args.amp and args.amp_dtype == "bf16" and torch.cuda.is_available() and not torch.cuda.is_bf16_supported():
         parser.error("--amp-dtype bf16 requested, but this CUDA device does not report bfloat16 support")
-    if args.mu_score <= 0.0 or args.mu_x <= 0.0 or args.mu_y <= 0.0 or args.mu_ori <= 0.0:
-        parser.error("--mu-score, --mu-x, --mu-y, and --mu-ori must be positive")
+    if args.orientation_weight < 0.0 or args.ridge_weight < 0.0 or args.gradient_weight < 0.0:
+        parser.error("--orientation-weight, --ridge-weight, and --gradient-weight must be non-negative")
+    if args.mu_score < 0.0 or args.mu_x < 0.0 or args.mu_y < 0.0 or args.mu_ori < 0.0:
+        parser.error("--mu-score, --mu-x, --mu-y, and --mu-ori must be non-negative")
     if args.m1_focal_gamma < 0.0:
         parser.error("--m1-focal-gamma must be non-negative")
     if args.m1_pos_weight_max < 1.0:

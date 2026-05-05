@@ -9,6 +9,7 @@ import math
 import sys
 import sysconfig
 import time
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -28,31 +29,20 @@ ensure_stdlib_copy_module()
 
 
 def prepend_workspace_site_packages() -> None:
-    site_packages = Path(__file__).resolve().parent / ".venv" / "lib" / "site-packages"
-    if site_packages.exists():
-        sys.path.insert(0, str(site_packages))
+    venv_dir = Path(__file__).resolve().parent / ".venv"
+    for site_packages in (
+        venv_dir / "Lib" / "site-packages",
+        venv_dir / "lib" / "site-packages",
+    ):
+        if site_packages.exists():
+            sys.path.insert(0, str(site_packages))
 
 
 prepend_workspace_site_packages()
 
 from dataclasses import asdict, dataclass
 
-import cv2
 import numpy as np
-
-from featurenet.models.infer import (
-    decode_minutiae_rows,
-    load_checkpoint_model,
-    preprocess_input_bgr,
-    run_inference,
-    save_minutiae_csv,
-    save_pose_sidecars,
-    _resolve_device,
-)
-from featurenet.models.match_infer import (
-    _crop_distal_phalanx_with_main,
-    _save_mask_png,
-)
 
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -60,6 +50,35 @@ DEFAULT_DATASET_ROOTS = (REPO_ROOT / "dataset" / "DS1", REPO_ROOT / "dataset" / 
 DEFAULT_WEIGHTS_PATH = REPO_ROOT / "weights" / "best.pt"
 DEFAULT_MATCH_OUTPUTS_DIR = REPO_ROOT / "match_outputs"
 FAR_TARGETS = (0.10, 0.05, 0.01, 0.001)
+
+
+@lru_cache(maxsize=1)
+def _load_infer_helpers() -> dict[str, Any]:
+    from featurenet.models.infer import (
+        decode_minutiae_rows,
+        load_checkpoint_model,
+        preprocess_input_bgr,
+        run_inference,
+        save_minutiae_csv,
+        save_pose_sidecars,
+        _resolve_device,
+    )
+    from featurenet.models.match_infer import (
+        _crop_distal_phalanx_with_main,
+        _save_mask_png,
+    )
+
+    return {
+        "decode_minutiae_rows": decode_minutiae_rows,
+        "load_checkpoint_model": load_checkpoint_model,
+        "preprocess_input_bgr": preprocess_input_bgr,
+        "run_inference": run_inference,
+        "save_minutiae_csv": save_minutiae_csv,
+        "save_pose_sidecars": save_pose_sidecars,
+        "_resolve_device": _resolve_device,
+        "_crop_distal_phalanx_with_main": _crop_distal_phalanx_with_main,
+        "_save_mask_png": _save_mask_png,
+    }
 
 
 @dataclass(frozen=True)
@@ -71,6 +90,10 @@ class ImageRecord:
     acquisition_id: int
     view_index: int
     image_path: str
+
+    @property
+    def identity_key(self) -> tuple[str, int, int]:
+        return self.dataset, self.subject_id, self.finger_id
 
     @property
     def cache_key(self) -> str:
@@ -93,6 +116,10 @@ class PairSpec:
     @property
     def same_acquisition(self) -> bool:
         return self.a.acquisition_id == self.b.acquisition_id
+
+    @property
+    def same_identity(self) -> bool:
+        return self.a.identity_key == self.b.identity_key
 
     @property
     def pair_key(self) -> tuple[str, str, str]:
@@ -174,6 +201,7 @@ def build_genuine_pairs(
     side_views: set[int],
     rng: np.random.Generator,
     max_pairs: int | None,
+    same_acquisition_only: bool,
 ) -> list[PairSpec]:
     pairs: list[PairSpec] = []
     for group_records in _group_by_identity(records).values():
@@ -181,6 +209,8 @@ def build_genuine_pairs(
         sides = [record for record in group_records if record.view_index in side_views]
         for front in fronts:
             for side in sides:
+                if same_acquisition_only and front.acquisition_id != side.acquisition_id:
+                    continue
                 pairs.append(PairSpec(label="genuine", a=front, b=side))
     pairs.sort(key=lambda pair: (pair.a.dataset, pair.a.subject_id, pair.a.finger_id, pair.a.acquisition_id, pair.b.acquisition_id, pair.b.view_index))
     if max_pairs is not None and len(pairs) > max_pairs:
@@ -192,10 +222,16 @@ def build_genuine_pairs(
 def _build_impostor_candidate_groups(
     records: Iterable[ImageRecord],
     side_views: set[int],
+    same_acquisition_only: bool,
 ) -> list[tuple[list[ImageRecord], list[ImageRecord]]]:
-    grouped: dict[tuple[str, int], dict[str, list[ImageRecord]]] = {}
+    grouped: dict[tuple[str, int] | tuple[str], dict[str, list[ImageRecord]]] = {}
     for record in records:
-        bucket = grouped.setdefault((record.dataset, record.finger_id), {"fronts": [], "sides": []})
+        group_key: tuple[str, int] | tuple[str]
+        if same_acquisition_only:
+            group_key = (record.dataset, record.acquisition_id)
+        else:
+            group_key = (record.dataset,)
+        bucket = grouped.setdefault(group_key, {"fronts": [], "sides": []})
         if record.view_index == 0:
             bucket["fronts"].append(record)
         elif record.view_index in side_views:
@@ -205,7 +241,8 @@ def _build_impostor_candidate_groups(
     for bucket in grouped.values():
         fronts = bucket["fronts"]
         sides = bucket["sides"]
-        if fronts and sides and len({record.subject_id for record in fronts + sides}) >= 2:
+        identities = {record.identity_key for record in fronts + sides}
+        if fronts and sides and len(identities) >= 2:
             candidate_groups.append((fronts, sides))
     return candidate_groups
 
@@ -215,11 +252,12 @@ def build_impostor_pairs(
     side_views: set[int],
     rng: np.random.Generator,
     max_pairs: int,
+    same_acquisition_only: bool,
 ) -> list[PairSpec]:
     if max_pairs <= 0:
         return []
 
-    candidate_groups = _build_impostor_candidate_groups(records, side_views)
+    candidate_groups = _build_impostor_candidate_groups(records, side_views, same_acquisition_only)
     if not candidate_groups:
         return []
 
@@ -232,7 +270,9 @@ def build_impostor_pairs(
         fronts, sides = candidate_groups[int(rng.integers(0, len(candidate_groups)))]
         front = fronts[int(rng.integers(0, len(fronts)))]
         side = sides[int(rng.integers(0, len(sides)))]
-        if front.subject_id == side.subject_id:
+        if front.identity_key == side.identity_key:
+            continue
+        if same_acquisition_only and front.acquisition_id != side.acquisition_id:
             continue
         pair = PairSpec(label="impostor", a=front, b=side)
         if pair.pair_key in seen:
@@ -274,6 +314,7 @@ def extract_image(
     score_threshold: float,
     reuse_cache: bool,
 ) -> ExtractedImage:
+    helpers = _load_infer_helpers()
     cache_dir = cache_root / record.cache_key
     files = _cache_files(cache_dir)
     if reuse_cache and _cached_extraction_is_complete(files):
@@ -294,22 +335,22 @@ def extract_image(
 
     cache_dir.mkdir(parents=True, exist_ok=True)
     image_path = Path(record.image_path)
-    crop_result = _crop_distal_phalanx_with_main(image_path=image_path, crop_output_dir=cache_dir / "crop")
-    image_tensor, mask_tensor, input_shape_hw = preprocess_input_bgr(
+    crop_result = helpers["_crop_distal_phalanx_with_main"](image_path=image_path, crop_output_dir=cache_dir / "crop")
+    image_tensor, mask_tensor, input_shape_hw = helpers["preprocess_input_bgr"](
         full_bgr=crop_result["inference_bgr"],
         save_preprocess_dir=cache_dir / "preprocess",
     )
-    outputs = run_inference(model=model, image_tensor=image_tensor, mask_tensor=mask_tensor, device=device)
-    minutiae_rows = decode_minutiae_rows(
+    outputs = helpers["run_inference"](model=model, image_tensor=image_tensor, mask_tensor=mask_tensor, device=device)
+    minutiae_rows = helpers["decode_minutiae_rows"](
         outputs=outputs,
         input_shape_hw=input_shape_hw,
         score_threshold=score_threshold,
         apply_nms=True,
     )
 
-    save_minutiae_csv(minutiae_rows, files["minutiae_csv"])
-    orientation_npy, ridge_period_npy = save_pose_sidecars(outputs, cache_dir)
-    _save_mask_png(mask_tensor, files["mask_png"])
+    helpers["save_minutiae_csv"](minutiae_rows, files["minutiae_csv"])
+    orientation_npy, ridge_period_npy = helpers["save_pose_sidecars"](outputs, cache_dir)
+    helpers["_save_mask_png"](mask_tensor, files["mask_png"])
 
     metadata = {
         "record": asdict(record),
@@ -456,6 +497,7 @@ def _pair_row_base(pair: PairSpec) -> dict[str, Any]:
         "label": pair.label,
         "dataset": pair.a.dataset,
         "finger_id": pair.a.finger_id,
+        "same_identity": str(pair.same_identity).lower(),
         "same_acquisition": str(pair.same_acquisition).lower(),
         "a_dataset": pair.a.dataset,
         "a_subject_id": pair.a.subject_id,
@@ -589,9 +631,12 @@ def _write_score_csv(path: Path, rows: list[dict[str, Any]], label: str) -> None
             "score": row["score"],
             "dataset": row["dataset"],
             "finger_id": row["finger_id"],
+            "same_identity": row["same_identity"],
             "same_acquisition": row["same_acquisition"],
             "a_subject_id": row["a_subject_id"],
+            "a_finger_id": row["a_finger_id"],
             "b_subject_id": row["b_subject_id"],
+            "b_finger_id": row["b_finger_id"],
             "a_acquisition_id": row["a_acquisition_id"],
             "b_acquisition_id": row["b_acquisition_id"],
             "b_view_index": row["b_view_index"],
@@ -616,9 +661,11 @@ def _write_threshold_report(path: Path, summary: dict[str, Any]) -> None:
         f"FRR at threshold: {thresholds.get('frr_at_eer_threshold')}",
         "",
         f"Genuine pairs scored: {genuine.get('count')}",
-        f"Genuine median/mean: {genuine.get('median')} / {genuine.get('mean')}",
+        f"Genuine average/lowest/highest: {genuine.get('mean')} / {genuine.get('min')} / {genuine.get('max')}",
+        f"Genuine median/std: {genuine.get('median')} / {genuine.get('std')}",
         f"Impostor pairs scored: {impostor.get('count')}",
-        f"Impostor median/mean: {impostor.get('median')} / {impostor.get('mean')}",
+        f"Impostor average/lowest/highest: {impostor.get('mean')} / {impostor.get('min')} / {impostor.get('max')}",
+        f"Impostor median/std: {impostor.get('median')} / {impostor.get('std')}",
         "",
         "TAR at FAR targets:",
     ]
@@ -643,6 +690,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--method", type=str, default="LSA-R", help="MCC method passed to main.match_minutiae_csv.")
     parser.add_argument("--side-views", type=int, nargs="+", default=[1, 2], help="Side view indices to match against view 0.")
     parser.add_argument("--minutia-score-threshold", type=float, default=0.6, help="FeatureNet minutia score threshold.")
+    parser.add_argument(
+        "--include-cross-acquisition-pairs",
+        action="store_true",
+        help=(
+            "Also compare front views against side views from other acquisitions of the same finger. "
+            "By default, pairs stay within the same acquisition so the comparison is strictly different views."
+        ),
+    )
     parser.add_argument("--max-genuine-pairs", type=int, default=None, help="Maximum genuine pairs to score. Default: unlimited.")
     parser.add_argument("--max-impostor-pairs", type=int, default=50000, help="Maximum impostor pairs to sample and score.")
     parser.add_argument("--seed", type=int, default=13, help="Random seed for pair sampling.")
@@ -679,8 +734,9 @@ def main() -> int:
     if not records:
         raise RuntimeError(f"no raw .jpg images discovered under: {[str(path) for path in dataset_roots]}")
 
-    genuine_pairs = build_genuine_pairs(records, side_views, rng, args.max_genuine_pairs)
-    impostor_pairs = build_impostor_pairs(records, side_views, rng, args.max_impostor_pairs)
+    same_acquisition_only = not bool(args.include_cross_acquisition_pairs)
+    genuine_pairs = build_genuine_pairs(records, side_views, rng, args.max_genuine_pairs, same_acquisition_only)
+    impostor_pairs = build_impostor_pairs(records, side_views, rng, args.max_impostor_pairs, same_acquisition_only)
     if not genuine_pairs:
         raise RuntimeError("no genuine front-vs-side pairs were found")
     if not impostor_pairs:
@@ -691,8 +747,9 @@ def main() -> int:
     print(f"Impostor pairs to score: {len(impostor_pairs)}")
     print(f"Output directory: {output_dir}")
 
-    device = _resolve_device(args.device)
-    model = load_checkpoint_model(weights_path, device)
+    helpers = _load_infer_helpers()
+    device = helpers["_resolve_device"](args.device)
+    model = helpers["load_checkpoint_model"](weights_path, device)
 
     all_pairs = genuine_pairs + impostor_pairs
     pair_rows, errors = score_pairs(
@@ -719,6 +776,7 @@ def main() -> int:
             "method": str(args.method),
             "side_views": sorted(side_views),
             "minutia_score_threshold": float(args.minutia_score_threshold),
+            "same_acquisition_only": bool(same_acquisition_only),
             "max_genuine_pairs": args.max_genuine_pairs,
             "max_impostor_pairs": int(args.max_impostor_pairs),
             "seed": int(args.seed),

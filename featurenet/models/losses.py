@@ -104,6 +104,9 @@ class FeatureNetLoss(nn.Module):
         beta=60.0,
         gamma=300.0,
         sigma=0.5,
+        orientation_weight=1.0,
+        ridge_weight=1.0,
+        gradient_weight=1.0,
         mu_score=120.0,
         mu_x=20.0,
         mu_y=20.0,
@@ -120,6 +123,10 @@ class FeatureNetLoss(nn.Module):
         super().__init__()
         if m1_side_pos_weight <= 0.0:
             raise ValueError("m1_side_pos_weight must be positive")
+        if orientation_weight < 0.0 or ridge_weight < 0.0 or gradient_weight < 0.0:
+            raise ValueError("orientation_weight, ridge_weight, and gradient_weight must be non-negative")
+        if mu_score < 0.0 or mu_x < 0.0 or mu_y < 0.0 or mu_ori < 0.0:
+            raise ValueError("mu_score, mu_x, mu_y, and mu_ori must be non-negative")
 
         # sub-losses
         self.orientation_loss = OrientationLoss(alpha=alpha)
@@ -127,6 +134,9 @@ class FeatureNetLoss(nn.Module):
         self.gradient_loss = GradientLoss(gamma=gamma, sigma=sigma)
 
         # weights
+        self.orientation_weight = float(orientation_weight)
+        self.ridge_weight = float(ridge_weight)
+        self.gradient_weight = float(gradient_weight)
         self.mu_score = mu_score
         self.mu_x = mu_x
         self.mu_y = mu_y
@@ -428,7 +438,12 @@ class FeatureNetLoss(nn.Module):
         # ---------------------------
         # 5. Final total loss
         # ---------------------------
-        total_loss = L_ori + L_ridge + L_grad + L_minu
+        total_loss = (
+            self.orientation_weight * L_ori +
+            self.ridge_weight * L_ridge +
+            self.gradient_weight * L_grad +
+            L_minu
+        )
 
         return {
             "total": total_loss,
