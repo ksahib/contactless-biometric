@@ -71,6 +71,12 @@ class FeatureExtractor(nn.Module):
         self.xy_patch_refine1 = ConvBlock(1024, 256, kernel_size=1, stride=1, padding=0)
         self.xy_patch_refine2 = ConvBlock(256, 256, kernel_size=3, stride=1, padding=1)
 
+        # x/y context refinement: fused patch-local feature + deep minutiae/orientation/ridge context
+        self.xy_context_refine = nn.Sequential(
+            ConvBlock(1024, 256, kernel_size=3, stride=1, padding=1),
+            ConvBlock(256, 256, kernel_size=3, stride=1, padding=1),
+        )
+
         # continuous x/y offsets: one raw logit per /8 score cell
         self.minutia_head_x = nn.Sequential(
             ConvBlock(256, 256, kernel_size=1, stride=1, padding=0),
@@ -157,11 +163,6 @@ class FeatureExtractor(nn.Module):
             orient_interim,
             ridge_interim,
         ], dim=1)
-
-        self.xy_context_refine = nn.Sequential(
-            ConvBlock(256 + 256 + 256 + 256, 256, kernel_size=3, stride=1, padding=1),
-            ConvBlock(256, 256, kernel_size=3, stride=1, padding=1),
-        )
 
         xy_feat_8x = self.xy_context_refine(xy_context)
         minu_x = self.minutia_head_x(xy_feat_8x)
