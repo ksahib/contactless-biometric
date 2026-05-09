@@ -151,7 +151,19 @@ class FeatureExtractor(nn.Module):
         xy_feat_8x = self.xy_patch_refine2(self.xy_patch_refine1(xy_patch_feat_8x))
         # Align x/y logits to the exact score-grid resolution.
         xy_feat_8x = self._crop_to_spatial_shape(xy_feat_8x, branch2_feat_8x.shape[-2:])
+        xy_context = torch.cat([
+            xy_feat_8x,
+            branch2_feat_8x,
+            orient_interim,
+            ridge_interim,
+        ], dim=1)
 
+        self.xy_context_refine = nn.Sequential(
+            ConvBlock(256 + 256 + 256 + 256, 256, kernel_size=3, stride=1, padding=1),
+            ConvBlock(256, 256, kernel_size=3, stride=1, padding=1),
+        )
+
+        xy_feat_8x = self.xy_context_refine(xy_context)
         minu_x = self.minutia_head_x(xy_feat_8x)
         minu_y = self.minutia_head_y(xy_feat_8x)
 

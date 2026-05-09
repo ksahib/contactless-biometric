@@ -150,6 +150,26 @@ class FeatureNetLoss(nn.Module):
         self.m1_neg_weight = float(m1_neg_weight)
         self.m1_side_pos_weight = float(m1_side_pos_weight)
 
+
+    def _resolve_center_minutia_mask(self, targets, fallback_minutia_mask):
+        """
+        Use only true positive / center minutia cells for x/y regression.
+
+        Prefer minutia_score because it marks the actual rasterized minutia cell.
+        Fall back to minutia_valid_mask for older bundles.
+        """
+        if "minutia_score" not in targets:
+            return fallback_minutia_mask.float()
+
+        center_mask = targets["minutia_score"]
+        if center_mask.dim() == 3:
+            center_mask = center_mask.unsqueeze(1)
+
+        center_mask = center_mask.float().to(fallback_minutia_mask.device)
+
+        # Only keep cells that are both true score positives and valid minutia cells.
+        return ((center_mask > 0.5) & (fallback_minutia_mask > 0.5)).float()
+
     def _orientation_bins_to_unit_vectors(self, bins: torch.Tensor) -> torch.Tensor:
         if bins.dim() == 4 and bins.shape[1] == 1:
             bins = bins.squeeze(1)
@@ -355,6 +375,10 @@ class FeatureNetLoss(nn.Module):
         score_mask = self._resolve_score_mask(mask)
         minutia_mask = self._resolve_minutia_mask(targets, score_mask)
         minutia_score_mask = torch.maximum(score_mask.float(), minutia_mask.float())
+        minutia_center_mask = self._resolve_center_minutia_mask(
+            targets,
+            fallback_minutia_mask=minutia_mask,
+        )
 
         # ---------------------------
         # 1. Orientation loss
@@ -399,7 +423,7 @@ class FeatureNetLoss(nn.Module):
         L_m2 = self._compute_xy_offset_loss(
             outputs["minutia_x"],
             targets["minutia_x_offset"],
-            minutia_mask=minutia_mask,
+            minutia_mask=minutia_center_mask,
             head_name="minutia_x",
         )
 
@@ -407,7 +431,7 @@ class FeatureNetLoss(nn.Module):
         L_m3 = self._compute_xy_offset_loss(
             outputs["minutia_y"],
             targets["minutia_y_offset"],
-            minutia_mask=minutia_mask,
+            minutia_mask=minutia_center_mask,
             head_name="minutia_y",
         )
 
@@ -425,7 +449,7 @@ class FeatureNetLoss(nn.Module):
                 f"does not match prediction shape {tuple(pred_ori.shape)}"
             )
         ori_loss_map = (pred_ori - target_ori).pow(2).sum(dim=1, keepdim=True)
-        L_m4 = (ori_loss_map * minutia_mask).sum() / (minutia_mask.sum() + 1e-8)
+        L_m4 = (ori_loss_map * minutia_center_mask).sum() / (minutia_center_mask.sum() + 1e-8)
 
         # combine minutiae
         L_minu = (
