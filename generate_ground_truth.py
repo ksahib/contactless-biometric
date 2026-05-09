@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import errno
 import json
 import importlib.util
 import math
@@ -271,9 +272,6 @@ class BundleWritePayload:
     featurenet_targets: dict[str, np.ndarray]
     meta: dict[str, Any]
     visualize: bool
-    preview_gray_image: np.ndarray | None = None
-    preview_mask: np.ndarray | None = None
-    preview_gradient: np.ndarray | None = None
 
 
 @dataclass(slots=True)
@@ -296,11 +294,6 @@ class BuiltBundleTargets:
     rasterized_count: int
     minutiae_ground_truth_details: dict[str, Any]
     stage_seconds: dict[str, float]
-    dense_orientation: np.ndarray | None = None
-    dense_ridge_period: np.ndarray | None = None
-    dense_label_image: np.ndarray | None = None
-    dense_label_mask: np.ndarray | None = None
-    dense_label_gradient: np.ndarray | None = None
 
 
 def _require_grayscale(path: Path) -> np.ndarray:
@@ -531,8 +524,37 @@ def _to_uint8_image(image: np.ndarray) -> np.ndarray:
     return np.clip(array, 0.0, 255.0).astype(np.uint8)
 
 
+def _raise_image_write_error(path: Path) -> None:
+    free_bytes = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        free_bytes = shutil.disk_usage(path.parent).free
+    except OSError as exc:
+        raise OSError(exc.errno, f"unable to inspect output directory for failed image write {path}: {exc}") from exc
+    if free_bytes is not None and free_bytes < 1024 * 1024:
+        raise OSError(errno.ENOSPC, f"failed to write image {path}: no space left on device")
+    raise OSError(errno.EIO, f"failed to write image {path}")
+
+
+def _write_image(path: Path, image: np.ndarray) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not cv2.imwrite(str(path), image):
+        _raise_image_write_error(path)
+
+
 def _save_uint8_png(path: Path, image: np.ndarray) -> None:
-    cv2.imwrite(str(path), _to_uint8_image(image))
+    _write_image(path, _to_uint8_image(image))
+
+
+def _is_no_space_error(exc: BaseException) -> bool:
+    current: BaseException | None = exc
+    while current is not None:
+        if isinstance(current, OSError) and current.errno == errno.ENOSPC:
+            return True
+        if "No space left on device" in str(current) or "no space left on device" in str(current):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 def _resize_float(array: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
@@ -1745,7 +1767,7 @@ def _write_reprojection_diagnostics(
             np.hstack(overlay_panels[6:9]),
         ]
     )
-    cv2.imwrite(str(preview_path), reprojection_preview)
+    _write_image(preview_path, reprojection_preview)
 
     report = {
         "projection_model": {
@@ -2815,6 +2837,147 @@ def _remap_unwarped_minutiae_to_sample(
     return remapped, remap_details
 
 
+def _map_side_v4_chart_to_pose(
+    source_x_map: np.ndarray,
+    source_y_map: np.ndarray,
+    valid_map: np.ndarray,
+    x: float,
+    y: float,
+) -> tuple[float, float] | None:
+    source_x = _sample_2d_bilinear(source_x_map, x, y, valid_mask=valid_map)
+    source_y = _sample_2d_bilinear(source_y_map, x, y, valid_mask=valid_map)
+    if source_x is None or source_y is None:
+        return None
+    return float(source_x), float(source_y)
+
+
+def _remap_side_v4_unwrapped_minutiae_to_sample(
+    side_minutiae: list[dict[str, Any]],
+    side_maps: dict[str, np.ndarray],
+    side_unwrapped_mask: np.ndarray,
+    sample: RawViewSample,
+    preprocessed: PreprocessedContactlessImage,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    role = _view_role_for_sample(sample)
+    if role not in {"left", "right"}:
+        return [], {"view_role": role, "reason": "unsupported_side_view_role"}
+
+    source_x_map = side_maps["source_x_map"].astype(np.float32)
+    source_y_map = side_maps["source_y_map"].astype(np.float32)
+    unwrap_mask = np.asarray(side_unwrapped_mask, dtype=bool)
+    if "unwrapped_mask" in side_maps:
+        unwrap_mask &= side_maps["unwrapped_mask"].astype(bool)
+    valid_map = unwrap_mask & np.isfinite(source_x_map) & np.isfinite(source_y_map)
+    pose_mask = preprocessed.pose_normalized_mask
+    final_mask = preprocessed.final_mask
+    pose_height, pose_width = pose_mask.shape
+    train_height, train_width = final_mask.shape
+    scale_x, scale_y = _training_frame_scale_from_preprocessed(preprocessed)
+    delta = 4.0
+    min_orientation_baseline_px = 1.5
+
+    remapped: list[dict[str, Any]] = []
+    details: dict[str, Any] = {
+        "view_role": role,
+        "projection_map_mode": "algorithm1_v4_side_unwrap_source_maps",
+        "side_unwrapped_minutiae_count": int(len(side_minutiae)),
+        "scale_x": float(scale_x),
+        "scale_y": float(scale_y),
+        "dropped_nonfinite_unwrapped_xy": 0,
+        "dropped_outside_unwrapped_bounds": 0,
+        "dropped_outside_unwrapped_mask": 0,
+        "dropped_no_source_map": 0,
+        "dropped_outside_pose_bounds": 0,
+        "dropped_no_pose_mask_support": 0,
+        "dropped_out_of_training_bounds": 0,
+        "dropped_no_final_mask_support": 0,
+        "orientation_projected_count": 0,
+        "orientation_fallback_count": 0,
+        "reprojected_minutiae_count": 0,
+    }
+
+    for minutia in side_minutiae:
+        x = float(minutia.get("x", float("nan")))
+        y = float(minutia.get("y", float("nan")))
+        if not (math.isfinite(x) and math.isfinite(y)):
+            details["dropped_nonfinite_unwrapped_xy"] += 1
+            continue
+        if x < 0.0 or y < 0.0 or x >= float(valid_map.shape[1]) or y >= float(valid_map.shape[0]):
+            details["dropped_outside_unwrapped_bounds"] += 1
+            continue
+        if not _point_has_mask_support(unwrap_mask, x, y, radius=1):
+            details["dropped_outside_unwrapped_mask"] += 1
+            continue
+
+        pose_point = _map_side_v4_chart_to_pose(source_x_map, source_y_map, valid_map, x, y)
+        if pose_point is None:
+            details["dropped_no_source_map"] += 1
+            continue
+        pose_x, pose_y = pose_point
+        if pose_x < 0.0 or pose_y < 0.0 or pose_x >= float(pose_width) or pose_y >= float(pose_height):
+            details["dropped_outside_pose_bounds"] += 1
+            continue
+        if not _point_has_mask_support(pose_mask, pose_x, pose_y):
+            details["dropped_no_pose_mask_support"] += 1
+            continue
+
+        x_dst = float(pose_x * scale_x)
+        y_dst = float(pose_y * scale_y)
+        if x_dst < 0.0 or y_dst < 0.0 or x_dst >= float(train_width) or y_dst >= float(train_height):
+            details["dropped_out_of_training_bounds"] += 1
+            continue
+        if not _point_has_mask_support(final_mask, x_dst, y_dst):
+            details["dropped_no_final_mask_support"] += 1
+            continue
+
+        theta = float(minutia["theta"])
+        chart_dx = math.cos(theta) * delta
+        chart_dy = math.sin(theta) * delta
+        projected_points: list[tuple[float, float]] = []
+        for candidate in (
+            _map_side_v4_chart_to_pose(source_x_map, source_y_map, valid_map, x + chart_dx, y + chart_dy),
+            _map_side_v4_chart_to_pose(source_x_map, source_y_map, valid_map, x - chart_dx, y - chart_dy),
+        ):
+            if candidate is not None:
+                projected_points.append((float(candidate[0] * scale_x), float(candidate[1] * scale_y)))
+
+        theta_dst = theta
+        if len(projected_points) == 2:
+            dx_proj = float(projected_points[0][0] - projected_points[1][0])
+            dy_proj = float(projected_points[0][1] - projected_points[1][1])
+            if math.hypot(dx_proj, dy_proj) >= min_orientation_baseline_px:
+                theta_dst = math.atan2(dy_proj, dx_proj)
+                details["orientation_projected_count"] += 1
+            else:
+                details["orientation_fallback_count"] += 1
+        elif len(projected_points) == 1:
+            dx_proj = float(projected_points[0][0] - x_dst)
+            dy_proj = float(projected_points[0][1] - y_dst)
+            if math.hypot(dx_proj, dy_proj) >= min_orientation_baseline_px:
+                theta_dst = math.atan2(dy_proj, dx_proj)
+                details["orientation_projected_count"] += 1
+            else:
+                details["orientation_fallback_count"] += 1
+        else:
+            details["orientation_fallback_count"] += 1
+
+        remapped.append(
+            {
+                "x": float(x_dst),
+                "y": float(y_dst),
+                "theta": _normalize_angle_2pi_scalar(theta_dst),
+                "score": minutia.get("score"),
+                "type": minutia.get("type"),
+                "source": str(minutia.get("source", "algorithm1_v4_side_unwrap")) + "_reprojected",
+                "unwrap_x": x,
+                "unwrap_y": y,
+            }
+        )
+
+    details["reprojected_minutiae_count"] = int(len(remapped))
+    return remapped, details
+
+
 def _write_minutiae_json(path: Path, minutiae: list[dict[str, Any]]) -> None:
     path.write_text(json.dumps(minutiae, indent=2), encoding="utf-8")
 
@@ -2910,7 +3073,7 @@ def _write_reconstruction_preview(
         _depth_to_color_panel(depth_right, support_mask),
     ]
     preview = np.vstack([np.hstack(silhouette_panels), np.hstack(depth_panels)])
-    cv2.imwrite(str(reconstruction_dir / "preview.png"), preview)
+    _write_image(reconstruction_dir / "preview.png", preview)
 
 
 def _write_row_measurements(
@@ -3079,10 +3242,10 @@ def _reconstruct_multiview_acquisition_from_segmented(
             "pose_mask": debug_views_dir / f"{role}_pose_mask.png",
             "preprocessed_input": debug_views_dir / f"{role}_preprocessed_input.png",
         }
-        cv2.imwrite(str(role_paths["raw_input"]), load_bgr_image(raw_path))
-        cv2.imwrite(str(role_paths["pose_normalized"]), preprocessed.pose_normalized_gray)
-        cv2.imwrite(str(role_paths["pose_mask"]), preprocessed.pose_normalized_mask)
-        cv2.imwrite(str(role_paths["preprocessed_input"]), preprocessed.preprocessed_gray)
+        _write_image(role_paths["raw_input"], load_bgr_image(raw_path))
+        _write_image(role_paths["pose_normalized"], preprocessed.pose_normalized_gray)
+        _write_image(role_paths["pose_mask"], preprocessed.pose_normalized_mask)
+        _write_image(role_paths["preprocessed_input"], preprocessed.preprocessed_gray)
         debug_view_paths[role] = {name: str(path.resolve()) for name, path in role_paths.items()}
 
     np.save(reconstruction_dir / "depth_front.npy", depth_front)
@@ -3146,7 +3309,7 @@ def _reconstruct_multiview_acquisition_from_segmented(
             "x_crit": x_crit.astype(np.float32),
         },
     )
-    cv2.imwrite(str(reconstruction_dir / "support_mask.png"), support_mask)
+    _write_image(reconstruction_dir / "support_mask.png", support_mask)
     front_gradient = depth_gradient_labels["gradient_front"]
     unwarp = run_center_unwarping(
         image=preprocessed_views["front"].pose_normalized_gray,
@@ -3158,7 +3321,7 @@ def _reconstruct_multiview_acquisition_from_segmented(
     center_unwarped_mask_path = reconstruction_dir / "center_unwarped_mask.png"
     center_unwarp_maps_path = reconstruction_dir / "center_unwarp_maps.npz"
     _save_uint8_png(center_unwarped_image_path, unwarp["unwarped_image"])
-    cv2.imwrite(str(center_unwarped_mask_path), _to_uint8_mask(unwarp["unwarped_mask"]))
+    _write_image(center_unwarped_mask_path, _to_uint8_mask(unwarp["unwarped_mask"]))
     inverse_unwarp = _build_inverse_unwarp_maps(
         unwarp["x_out"],
         unwarp["y_out"],
@@ -3877,11 +4040,12 @@ def _extract_unwrapped_label_minutiae(
     output_dir: Path,
     fingerflow_model_dir: Path,
     fingerflow_backend: FingerflowBackendConfig,
+    source_tag: str = "unwrapped_label",
 ) -> tuple[list[dict[str, Any]], str, dict[str, Any]]:
     enhanced_path.parent.mkdir(parents=True, exist_ok=True)
     enhanced = _enhance_for_minutiae(label_gray)
     _save_uint8_png(enhanced_path, enhanced)
-    minutiae_source = f"fingerflow_{fingerflow_backend.backend}_reconstruction_unwrapped"
+    minutiae_source = f"fingerflow_{fingerflow_backend.backend}_{source_tag}"
     try:
         if fingerflow_backend.backend == "wsl":
             minutiae = _extract_fingerflow_minutiae_wsl(
@@ -3910,8 +4074,9 @@ def _extract_unwrapped_label_minutiae(
     fallback_started_at = time.perf_counter()
     minutiae = _extract_pyfing_minutiae(enhanced)
     _record_stage_time("pyfing_fallback", time.perf_counter() - fallback_started_at)
-    return minutiae, "pyfing_fallback_reconstruction_unwrapped", {
-        "label_minutiae_extractor": "pyfing_fallback_reconstruction_unwrapped",
+    fallback_source = f"pyfing_fallback_{source_tag}"
+    return minutiae, fallback_source, {
+        "label_minutiae_extractor": fallback_source,
         "label_minutiae_enhanced_path": str(enhanced_path.resolve()),
         "label_minutiae_count": len(minutiae),
     }
@@ -3994,75 +4159,6 @@ def _label_frame_for_reconstruction_sample(
         "gradient_path": side_dir / f"{role}_gradient.npy",
         "side_unwrap_v4_report_path": reconstruction_dir / "side_depth_unwrap_v4" / "algorithm1_side_depth_unwrap_report.json",
     }
-
-
-def _build_unwrapped_direct_targets_cpu(
-    prepared: PreparedBundleArtifacts,
-    label_frame: dict[str, Any],
-    minutiae: list[dict[str, Any]],
-    minutiae_source: str,
-    minutiae_ground_truth_details: dict[str, Any],
-    dpi: int,
-) -> BuiltBundleTargets:
-    before = _stage_totals_snapshot()
-    label_image_path = Path(label_frame["image_path"])
-    label_mask_path = Path(label_frame["mask_path"])
-    label_gray = _require_grayscale(label_image_path)
-    label_mask = _require_grayscale(label_mask_path)
-    label_mask = np.where(label_mask > 0, 255, 0).astype(np.uint8)
-    orientation = pyfing.orientation_field_estimation(label_gray, label_mask, dpi=dpi, method="SNFOE")
-    orientation = _normalize_angle_pi(orientation)
-    orientation[label_mask <= 0] = 0.0
-    ridge_period = pyfing.frequency_estimation(label_gray, orientation, label_mask, dpi=dpi, method="SNFFE")
-    ridge_period = np.nan_to_num(ridge_period.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
-    ridge_period = np.clip(ridge_period, 0.0, None)
-    ridge_period[label_mask <= 0] = 0.0
-    gradient = _label_frame_gradient_from_depth(
-        Path(label_frame["depth_path"]),
-        Path(label_frame["maps_path"]),
-        label_mask,
-    )
-    output_shape = _compute_output_shape(*prepared.gray_image.shape)
-    featurenet_targets = _build_featurenet_targets(
-        gray_image=label_gray,
-        mask=label_mask,
-        orientation=orientation,
-        ridge_period=ridge_period,
-        gradient=gradient,
-        minutiae=minutiae,
-        output_shape=output_shape,
-    )
-    rasterized_count = int(np.count_nonzero(featurenet_targets["minutia_valid_mask"]))
-    details = {
-        **dict(minutiae_ground_truth_details),
-        "mode": "reconstruction_unwrapped_direct",
-        "view_role": label_frame["role"],
-        "label_frame": label_frame["label_frame"],
-        "label_image_path": str(label_image_path.resolve()),
-        "label_mask_path": str(label_mask_path.resolve()),
-        "label_unwarp_maps_path": str(Path(label_frame["maps_path"]).resolve()),
-        "label_depth_path": str(Path(label_frame["depth_path"]).resolve()),
-        "label_source_shape": list(label_gray.shape),
-        "raw_training_image_shape": list(prepared.gray_image.shape),
-        "target_output_shape": list(output_shape),
-        "rasterized_minutiae_count": rasterized_count,
-    }
-    if label_frame.get("side_unwrap_v4_report_path") is not None:
-        details["side_unwrap_v4_report_path"] = str(Path(label_frame["side_unwrap_v4_report_path"]).resolve())
-        details["side_unwrap_v4_parameters"] = _side_unwrap_v4_parameters()
-    return BuiltBundleTargets(
-        minutiae=minutiae,
-        minutiae_source=minutiae_source,
-        featurenet_targets=featurenet_targets,
-        rasterized_count=rasterized_count,
-        minutiae_ground_truth_details=details,
-        stage_seconds=_stage_totals_delta(before),
-        dense_orientation=orientation.astype(np.float32),
-        dense_ridge_period=ridge_period.astype(np.float32),
-        dense_label_image=label_gray,
-        dense_label_mask=label_mask,
-        dense_label_gradient=gradient.astype(np.float32),
-    )
 
 
 def _rasterize_minutiae(
@@ -4247,7 +4343,7 @@ def _write_visualization(
     top = np.hstack([base_bgr, mask_panel, ridge_panel])
     bottom = np.hstack([grad_panel, orientation_overlay, minutiae_overlay])
     preview = np.vstack([top, bottom])
-    cv2.imwrite(str(bundle_dir / "preview.png"), preview)
+    _write_image(bundle_dir / "preview.png", preview)
 
 
 def _load_sample_input(
@@ -4372,8 +4468,6 @@ def _build_bundle_meta(
     output_shape = featurenet_targets["output_mask"].shape[-2:]
     point_mask = _downsample_mask_for_points(prepared.mask, output_shape)
     rasterized_minutiae_count = int(np.count_nonzero(featurenet_targets["minutia_valid_mask"]))
-    gt_mode = minutiae_ground_truth_details.get("mode") if minutiae_ground_truth_details else None
-    reconstruction_unwrapped = gt_mode == "reconstruction_unwrapped_direct"
     meta = {
         "sample_id": sample.sample_id,
         "subject_id": sample.subject_id,
@@ -4423,32 +4517,16 @@ def _build_bundle_meta(
         "methods": {
             "mask": "copied_main_segmentation_used as primary preprocessing and label mask",
             "geometry_mask": "pose_normalized_pre_scale_mask retained for multiview reconstruction",
-            "orientation": (
-                "pyfing.orientation_field_estimation(method='SNFOE') on reconstruction-unwrapped label frame"
-                if reconstruction_unwrapped
-                else "pyfing.orientation_field_estimation(method='SNFOE')"
-            ),
-            "ridge_period": (
-                "pyfing.frequency_estimation(method='SNFFE') on reconstruction-unwrapped label frame"
-                if reconstruction_unwrapped
-                else "pyfing.frequency_estimation(method='SNFFE')"
-            ),
-            "gradient": (
-                "reconstruction depth partial derivatives in the reconstruction-unwrapped label frame resized to the FeatureNet output grid"
-                if reconstruction_unwrapped
-                else "MLS-smoothed reconstruction depth partial derivatives resized to the FeatureNet output grid"
-            ),
+            "orientation": "pyfing.orientation_field_estimation(method='SNFOE')",
+            "ridge_period": "pyfing.frequency_estimation(method='SNFFE')",
+            "gradient": "reconstruction depth partial derivatives resized to the FeatureNet output grid; side views use Algorithm-1 v4 side depth gradients when reconstruction-backed",
             "gradient_visualization": "cv2.Sobel on masked grayscale preprocessed raw image for preview/debug only",
             "enhancement": "fingerprint_enhancer.enhance_fingerprint",
             "minutiae": minutiae_source,
             "minutiae_ground_truth_pipeline": (
-                "reconstruction_unwrapped_direct"
-                if reconstruction_unwrapped
-                else (
-                    "reconstruction_unwarp_reproject"
-                    if minutiae_ground_truth_details and minutiae_ground_truth_details.get("mode") == "reconstruction_backed"
-                    else "direct_per_sample_extraction"
-                )
+                "reconstruction_unwarp_reproject"
+                if minutiae_ground_truth_details and minutiae_ground_truth_details.get("mode") == "reconstruction_backed"
+                else "direct_per_sample_extraction"
             ),
             "featurenet_adapter": "dense orientation/ridge/gradient resize plus paper-style minutiae heatmap and precise subcell labels",
             "minutiae_targets": "binary score heatmap with continuous x/y offsets plus legacy 8-bin x/y labels, legacy 360-bin orientation labels, and optional cos/sin orientation vectors",
@@ -4503,15 +4581,15 @@ def _persist_bundle(payload: BundleWritePayload) -> None:
     started_at = time.perf_counter()
     bundle_dir = payload.bundle_dir
     bundle_dir.mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(str(bundle_dir / "minutiae_enhanced.png"), payload.enhanced_image)
-    cv2.imwrite(str(bundle_dir / "raw_input.png"), payload.preprocessed.raw_gray)
-    cv2.imwrite(str(bundle_dir / "preprocess_normalized.png"), payload.preprocessed.normalized_gray)
-    cv2.imwrite(str(bundle_dir / "preprocess_pose_normalized.png"), payload.preprocessed.pose_normalized_gray)
-    cv2.imwrite(str(bundle_dir / "preprocess_pose_mask.png"), payload.preprocessed.pose_normalized_mask)
-    cv2.imwrite(str(bundle_dir / "preprocessed_input.png"), payload.preprocessed.preprocessed_gray)
-    cv2.imwrite(str(bundle_dir / "preprocess_mask.png"), payload.preprocessed.final_mask)
-    cv2.imwrite(str(bundle_dir / "mask.png"), payload.mask)
-    cv2.imwrite(str(bundle_dir / "masked_image.png"), payload.masked_image)
+    _write_image(bundle_dir / "minutiae_enhanced.png", payload.enhanced_image)
+    _write_image(bundle_dir / "raw_input.png", payload.preprocessed.raw_gray)
+    _write_image(bundle_dir / "preprocess_normalized.png", payload.preprocessed.normalized_gray)
+    _write_image(bundle_dir / "preprocess_pose_normalized.png", payload.preprocessed.pose_normalized_gray)
+    _write_image(bundle_dir / "preprocess_pose_mask.png", payload.preprocessed.pose_normalized_mask)
+    _write_image(bundle_dir / "preprocessed_input.png", payload.preprocessed.preprocessed_gray)
+    _write_image(bundle_dir / "preprocess_mask.png", payload.preprocessed.final_mask)
+    _write_image(bundle_dir / "mask.png", payload.mask)
+    _write_image(bundle_dir / "masked_image.png", payload.masked_image)
     np.save(bundle_dir / "orientation.npy", payload.orientation.astype(np.float32))
     np.save(bundle_dir / "ridge_period.npy", payload.ridge_period.astype(np.float32))
     np.save(bundle_dir / "gradient_visualization.npy", payload.visualization_gradient.astype(np.float32))
@@ -4519,18 +4597,13 @@ def _persist_bundle(payload: BundleWritePayload) -> None:
     _save_npz(bundle_dir / "featurenet_targets.npz", payload.featurenet_targets)
     (bundle_dir / "meta.json").write_text(json.dumps(payload.meta, indent=2), encoding="utf-8")
     if payload.visualize:
-        preview_gray = payload.preview_gray_image if payload.preview_gray_image is not None else payload.gray_image
-        preview_mask = payload.preview_mask if payload.preview_mask is not None else payload.mask
-        preview_gradient = (
-            payload.preview_gradient if payload.preview_gradient is not None else payload.visualization_gradient
-        )
         _write_visualization(
             bundle_dir,
-            preview_gray,
-            preview_mask,
+            payload.gray_image,
+            payload.mask,
             payload.orientation,
             payload.ridge_period,
-            preview_gradient,
+            payload.visualization_gradient,
             payload.minutiae,
         )
     _record_stage_time("write_bundle", time.perf_counter() - started_at)
@@ -4585,6 +4658,64 @@ def _build_reprojected_targets_cpu(
     )
 
 
+def _build_side_v4_reprojected_targets_cpu(
+    prepared: PreparedBundleArtifacts,
+    side_minutiae: list[dict[str, Any]],
+    side_source: str,
+    extraction_details: dict[str, Any],
+) -> BuiltBundleTargets:
+    before = _stage_totals_snapshot()
+    reconstruction = prepared.reconstruction
+    role = _view_role_for_sample(prepared.sample)
+    if reconstruction is None or role not in {"left", "right"}:
+        raise RuntimeError("side v4 reprojected target build requires a side reconstruction-backed sample")
+    label_frame = _label_frame_for_reconstruction_sample(prepared)
+    if label_frame is None:
+        raise RuntimeError("missing side v4 label frame")
+
+    maps_path = Path(label_frame["maps_path"])
+    mask_path = Path(label_frame["mask_path"])
+    side_maps = _load_npz_arrays(maps_path)
+    side_unwrapped_mask = _require_grayscale(mask_path) > 0
+    reprojected_minutiae, remap_details = _remap_side_v4_unwrapped_minutiae_to_sample(
+        side_minutiae,
+        side_maps,
+        side_unwrapped_mask,
+        prepared.sample,
+        prepared.preprocessed,
+    )
+    featurenet_targets, rasterized_count = _build_targets_and_count_rasterized_minutiae(
+        prepared,
+        reprojected_minutiae,
+    )
+    minutiae_ground_truth_details = {
+        "mode": "reconstruction_backed",
+        "side_reprojection_source": "algorithm1_v4_side_unwrapped",
+        "canonical_source": side_source,
+        "view_role": role,
+        "side_unwrapped_minutiae_count": len(side_minutiae),
+        "reprojected_minutiae_count": len(reprojected_minutiae),
+        "rasterized_minutiae_count": rasterized_count,
+        "side_unwrapped_image_path": str(Path(label_frame["image_path"]).resolve()),
+        "side_unwrapped_mask_path": str(mask_path.resolve()),
+        "side_unwarp_maps_path": str(maps_path.resolve()),
+        "side_depth_path": str(Path(label_frame["depth_path"]).resolve()),
+        "side_gradient_path": str(Path(label_frame["gradient_path"]).resolve()),
+        "side_unwrap_v4_report_path": str(Path(label_frame["side_unwrap_v4_report_path"]).resolve()),
+        "side_unwrap_v4_parameters": _side_unwrap_v4_parameters(),
+        **extraction_details,
+        **remap_details,
+    }
+    return BuiltBundleTargets(
+        minutiae=reprojected_minutiae,
+        minutiae_source=f"{side_source}_reprojected_{role}",
+        featurenet_targets=featurenet_targets,
+        rasterized_count=rasterized_count,
+        minutiae_ground_truth_details=minutiae_ground_truth_details,
+        stage_seconds=_stage_totals_delta(before),
+    )
+
+
 def _build_direct_targets_cpu(
     prepared: PreparedBundleArtifacts,
     minutiae: list[dict[str, Any]],
@@ -4627,16 +4758,8 @@ def _finalize_bundle_from_targets(
         preprocessed=prepared.preprocessed,
         gray_image=prepared.gray_image,
         mask=prepared.mask,
-        orientation=(
-            built_targets.dense_orientation
-            if built_targets.dense_orientation is not None
-            else prepared.orientation
-        ),
-        ridge_period=(
-            built_targets.dense_ridge_period
-            if built_targets.dense_ridge_period is not None
-            else prepared.ridge_period
-        ),
+        orientation=prepared.orientation,
+        ridge_period=prepared.ridge_period,
         visualization_gradient=prepared.visualization_gradient,
         masked_image=prepared.masked_image,
         enhanced_image=prepared.enhanced_image,
@@ -4644,9 +4767,6 @@ def _finalize_bundle_from_targets(
         featurenet_targets=built_targets.featurenet_targets,
         meta=meta,
         visualize=prepared.visualize,
-        preview_gray_image=built_targets.dense_label_image,
-        preview_mask=built_targets.dense_label_mask,
-        preview_gradient=built_targets.dense_label_gradient,
     )
     return {
         "bundle_dir": str(prepared.bundle_dir.resolve()),
@@ -4659,8 +4779,7 @@ def _finalize_bundle_from_targets(
         "minutiae_gt_mode": built_targets.minutiae_ground_truth_details.get("mode"),
         "reconstruction_available": reconstruction is not None,
         "used_reconstruction_backed_final_labels": (
-            built_targets.minutiae_ground_truth_details.get("mode")
-            in {"reconstruction_backed", "reconstruction_unwrapped_direct"}
+            built_targets.minutiae_ground_truth_details.get("mode") == "reconstruction_backed"
         ),
         "used_direct_fallback": str(built_targets.minutiae_ground_truth_details.get("mode", "")).startswith(
             "direct_fallback"
@@ -4730,7 +4849,7 @@ def _generate_bundle_from_loaded(
     prepared = _prepare_bundle_from_loaded(loaded, dpi=dpi)
     minutiae_enhanced_path = prepared.bundle_dir / "minutiae_enhanced.png"
     prepared.bundle_dir.mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(str(minutiae_enhanced_path), prepared.enhanced_image)
+    _write_image(minutiae_enhanced_path, prepared.enhanced_image)
 
     minutiae_ground_truth_details: dict[str, Any] | None = None
     minutiae_source = f"fingerflow_{fingerflow_backend.backend}"
@@ -4743,32 +4862,79 @@ def _generate_bundle_from_loaded(
     postprocess_started_at = time.perf_counter()
     if reconstruction is not None and role is not None:
         try:
-            label_frame = _label_frame_for_reconstruction_sample(prepared)
-            if label_frame is None:
-                raise RuntimeError("missing reconstruction label frame")
-            label_gray = _require_grayscale(Path(label_frame["image_path"]))
-            label_enhanced_path = prepared.bundle_dir / f"{role}_unwrapped_minutiae_enhanced.png"
-            unwrapped_minutiae, unwrapped_source, extraction_details = _extract_unwrapped_label_minutiae(
-                Path(label_frame["image_path"]),
-                label_gray,
-                label_enhanced_path,
-                prepared.bundle_dir,
-                fingerflow_model_dir,
-                fingerflow_backend,
-            )
-            built_targets = _build_unwrapped_direct_targets_cpu(
-                prepared,
-                label_frame,
-                unwrapped_minutiae,
-                unwrapped_source,
-                extraction_details,
-                dpi=dpi,
-            )
-            minutiae = built_targets.minutiae
-            minutiae_source = built_targets.minutiae_source
-            featurenet_targets = built_targets.featurenet_targets
-            rasterized_count = built_targets.rasterized_count
-            minutiae_ground_truth_details = built_targets.minutiae_ground_truth_details
+            if role == "front":
+                canonical_minutiae, canonical_source, canonical_details = _load_or_extract_canonical_reconstruction_minutiae(
+                    reconstruction,
+                    fingerflow_model_dir,
+                    fingerflow_backend,
+                )
+                built_targets = _build_reprojected_targets_cpu(
+                    prepared,
+                    canonical_minutiae,
+                    canonical_source,
+                    canonical_details,
+                )
+            else:
+                label_frame = _label_frame_for_reconstruction_sample(prepared)
+                if label_frame is None:
+                    raise RuntimeError("missing side v4 label frame")
+                label_gray = _require_grayscale(Path(label_frame["image_path"]))
+                label_enhanced_path = prepared.bundle_dir / f"{role}_v4_unwrapped_minutiae_enhanced.png"
+                side_minutiae, side_source, extraction_details = _extract_unwrapped_label_minutiae(
+                    Path(label_frame["image_path"]),
+                    label_gray,
+                    label_enhanced_path,
+                    prepared.bundle_dir,
+                    fingerflow_model_dir,
+                    fingerflow_backend,
+                    source_tag=f"algorithm1_v4_{role}_side_unwrapped",
+                )
+                built_targets = _build_side_v4_reprojected_targets_cpu(
+                    prepared,
+                    side_minutiae,
+                    side_source,
+                    extraction_details,
+                )
+            if built_targets.rasterized_count >= MIN_RASTERIZED_MINUTIAE_FOR_RECONSTRUCTION:
+                minutiae = built_targets.minutiae
+                minutiae_source = built_targets.minutiae_source
+                featurenet_targets = built_targets.featurenet_targets
+                rasterized_count = built_targets.rasterized_count
+                minutiae_ground_truth_details = built_targets.minutiae_ground_truth_details
+            else:
+                fallback_minutiae, fallback_source = _extract_direct_sample_minutiae(
+                    prepared,
+                    minutiae_enhanced_path,
+                    fingerflow_model_dir,
+                    fingerflow_backend,
+                )
+                featurenet_targets, rasterized_count = _build_targets_and_count_rasterized_minutiae(
+                    prepared,
+                    fallback_minutiae,
+                )
+                fallback_reason = (
+                    "empty_reprojection"
+                    if not built_targets.minutiae
+                    else "zero_rasterized_minutiae_after_reprojection"
+                )
+                minutiae = fallback_minutiae
+                minutiae_source = fallback_source
+                minutiae_ground_truth_details = {
+                    "mode": (
+                        "direct_fallback_after_empty_reprojection"
+                        if not built_targets.minutiae
+                        else "direct_fallback_after_zero_rasterized_reprojection"
+                    ),
+                    "view_role": role,
+                    "fallback_reason": fallback_reason,
+                    "fallback_source": fallback_source,
+                    "fallback_minutiae_count": len(fallback_minutiae),
+                    "fallback_rasterized_minutiae_count": rasterized_count,
+                    "reprojected_minutiae_count_before_fallback": len(built_targets.minutiae),
+                    "rasterized_minutiae_count_before_fallback": built_targets.rasterized_count,
+                }
+                for key, value in built_targets.minutiae_ground_truth_details.items():
+                    minutiae_ground_truth_details.setdefault(key, value)
         except Exception as exc:
             fallback_minutiae, fallback_source = _extract_direct_sample_minutiae(
                 prepared,
@@ -4841,8 +5007,7 @@ def _generate_bundle_from_loaded(
         "reconstruction_available": reconstruction is not None,
         "used_reconstruction_backed_final_labels": (
             minutiae_ground_truth_details is not None
-            and minutiae_ground_truth_details.get("mode")
-            in {"reconstruction_backed", "reconstruction_unwrapped_direct"}
+            and minutiae_ground_truth_details.get("mode") == "reconstruction_backed"
         ),
         "used_direct_fallback": (
             minutiae_ground_truth_details is not None
@@ -5056,8 +5221,8 @@ def _write_patch_dataset(
                 key: _crop_target_array(value, x, y, config.patch_size, source_shape=mask.shape)
                 for key, value in targets.items()
             }
-            cv2.imwrite(str(patch_dir / "masked_image.png"), patch_masked_image)
-            cv2.imwrite(str(patch_dir / "mask.png"), patch_mask)
+            _write_image(patch_dir / "masked_image.png", patch_masked_image)
+            _write_image(patch_dir / "mask.png", patch_mask)
             _save_npz(patch_dir / "featurenet_targets.npz", patch_targets)
             patch_meta = {
                 **meta,
@@ -5577,10 +5742,11 @@ def _rewrite_merged_bundle_meta(
             if role in {"left", "right"}:
                 side_role_root = reconstruction_root / "side_depth_unwrap_v4" / role
                 for key, filename in (
-                    ("label_image_path", f"{role}_depth_unwrapped.png"),
-                    ("label_mask_path", f"{role}_depth_unwrapped_mask.png"),
-                    ("label_unwarp_maps_path", f"{role}_depth_unwarp_maps.npz"),
-                    ("label_depth_path", f"{role}_depth.npy"),
+                    ("side_unwrapped_image_path", f"{role}_depth_unwrapped.png"),
+                    ("side_unwrapped_mask_path", f"{role}_depth_unwrapped_mask.png"),
+                    ("side_unwarp_maps_path", f"{role}_depth_unwarp_maps.npz"),
+                    ("side_depth_path", f"{role}_depth.npy"),
+                    ("side_gradient_path", f"{role}_gradient.npy"),
                 ):
                     if key in minutiae_gt:
                         minutiae_gt[key] = str((side_role_root / filename).resolve())
@@ -5588,19 +5754,56 @@ def _rewrite_merged_bundle_meta(
                     minutiae_gt["side_unwrap_v4_report_path"] = str(
                         (reconstruction_root / "side_depth_unwrap_v4" / "algorithm1_side_depth_unwrap_report.json").resolve()
                     )
-            elif role == "front":
-                for key, filename in (
-                    ("label_image_path", "center_unwarped.png"),
-                    ("label_mask_path", "center_unwarped_mask.png"),
-                    ("label_unwarp_maps_path", "center_unwarp_maps.npz"),
-                    ("label_depth_path", "depth_front.npy"),
-                ):
-                    if key in minutiae_gt:
-                        minutiae_gt[key] = str((reconstruction_root / filename).resolve())
             meta["minutiae_ground_truth"] = minutiae_gt
 
     meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
     return meta
+
+
+def _find_generated_root_candidates(parent_root: Path) -> list[Path]:
+    if not parent_root.exists() or not parent_root.is_dir():
+        return []
+    return sorted(
+        [
+            child
+            for child in parent_root.iterdir()
+            if child.is_dir() and (child / "manifest.json").exists() and (child / "summary.json").exists()
+        ],
+        key=lambda path: path.name,
+    )
+
+
+def _format_generated_root_candidates(parent_root: Path) -> str:
+    candidates = _find_generated_root_candidates(parent_root)
+    if not candidates:
+        return ""
+    candidate_list = ", ".join(str(path) for path in candidates[:8])
+    if len(candidates) > 8:
+        candidate_list += f", ... ({len(candidates) - 8} more)"
+    return f" Available generated roots under {parent_root}: {candidate_list}"
+
+
+def _validate_generated_merge_root(source_root: Path) -> tuple[Path, Path]:
+    manifest_path = source_root / "manifest.json"
+    summary_path = source_root / "summary.json"
+    if not source_root.exists():
+        hint_parent = source_root.parent if source_root.parent.exists() else source_root.parent.parent
+        raise FileNotFoundError(
+            f"merge source root does not exist: {source_root}.{_format_generated_root_candidates(hint_parent)}"
+        )
+    if not source_root.is_dir():
+        raise NotADirectoryError(f"merge source root is not a directory: {source_root}")
+    if not manifest_path.exists():
+        raise FileNotFoundError(
+            f"missing manifest.json under merge source root {source_root}."
+            f"{_format_generated_root_candidates(source_root)}"
+        )
+    if not summary_path.exists():
+        raise FileNotFoundError(
+            f"missing summary.json under merge source root {source_root}. "
+            "This merge mode expects a completed generated ground-truth output root, not an older manifest-only export."
+        )
+    return manifest_path, summary_path
 
 
 def _merge_generated_ground_truth_roots(merge_sources: list[tuple[str, Path]], output_root: Path) -> dict[str, Any]:
@@ -5619,13 +5822,7 @@ def _merge_generated_ground_truth_roots(merge_sources: list[tuple[str, Path]], o
     copied_reconstruction_ids: set[str] = set()
 
     for source_label, source_root in merge_sources:
-        manifest_path = source_root / "manifest.json"
-        summary_path = source_root / "summary.json"
-        if not manifest_path.exists():
-            raise FileNotFoundError(f"missing manifest.json under {source_root}")
-        if not summary_path.exists():
-            raise FileNotFoundError(f"missing summary.json under {source_root}")
-
+        manifest_path, summary_path = _validate_generated_merge_root(source_root)
         source_samples = _load_manifest_samples(manifest_path)
         source_summary = json.loads(summary_path.read_text(encoding="utf-8"))
         source_subject_ids: set[int] = set()
@@ -5889,7 +6086,7 @@ def main() -> int:
     ) -> None:
         minutiae_enhanced_path = prepared.bundle_dir / "minutiae_enhanced.png"
         prepared.bundle_dir.mkdir(parents=True, exist_ok=True)
-        cv2.imwrite(str(minutiae_enhanced_path), prepared.enhanced_image)
+        _write_image(minutiae_enhanced_path, prepared.enhanced_image)
         minutiae, minutiae_source = _extract_direct_sample_minutiae(
             prepared,
             minutiae_enhanced_path,
@@ -5913,38 +6110,57 @@ def main() -> int:
             )
         ] = ("direct", prepared)
 
-    def submit_unwrapped_reconstruction_targets(
+    def submit_reconstruction_targets(
         prepared: PreparedBundleArtifacts,
         pending_targets: dict[Future[BuiltBundleTargets], tuple[str, PreparedBundleArtifacts]],
     ) -> None:
         role = _view_role_for_sample(prepared.sample)
+        if prepared.reconstruction is None or role is None:
+            raise RuntimeError("missing reconstruction-backed sample")
+        if role == "front":
+            canonical_minutiae, canonical_source, canonical_details = _load_or_extract_canonical_reconstruction_minutiae(
+                prepared.reconstruction,
+                args.fingerflow_model_dir.resolve(),
+                fingerflow_backend,
+            )
+            pending_targets[
+                _submit_cpu_task(
+                    cpu_executor,
+                    _build_reprojected_targets_cpu,
+                    prepared,
+                    canonical_minutiae,
+                    canonical_source,
+                    canonical_details,
+                )
+            ] = ("front_reprojected", prepared)
+            return
+
         label_frame = _label_frame_for_reconstruction_sample(prepared)
-        if role is None or label_frame is None:
-            raise RuntimeError("missing reconstruction unwrapped label frame")
+        if label_frame is None:
+            raise RuntimeError("missing side v4 label frame")
         label_image_path = Path(label_frame["image_path"])
         label_gray = _require_grayscale(label_image_path)
-        label_enhanced_path = prepared.bundle_dir / f"{role}_unwrapped_minutiae_enhanced.png"
+        label_enhanced_path = prepared.bundle_dir / f"{role}_v4_unwrapped_minutiae_enhanced.png"
         prepared.bundle_dir.mkdir(parents=True, exist_ok=True)
-        minutiae, minutiae_source, extraction_details = _extract_unwrapped_label_minutiae(
+        side_minutiae, side_source, extraction_details = _extract_unwrapped_label_minutiae(
             label_image_path,
             label_gray,
             label_enhanced_path,
             prepared.bundle_dir,
             args.fingerflow_model_dir.resolve(),
             fingerflow_backend,
+            source_tag=f"algorithm1_v4_{role}_side_unwrapped",
         )
         pending_targets[
             _submit_cpu_task(
                 cpu_executor,
-                _build_unwrapped_direct_targets_cpu,
+                _build_side_v4_reprojected_targets_cpu,
                 prepared,
-                label_frame,
-                minutiae,
-                minutiae_source,
+                side_minutiae,
+                side_source,
                 extraction_details,
-                args.dpi,
             )
-        ] = ("reconstruction_unwrapped", prepared)
+        ] = ("side_v4_reprojected", prepared)
 
     def finalize_targets(prepared: PreparedBundleArtifacts, built_targets: BuiltBundleTargets) -> None:
         nonlocal generated
@@ -5980,6 +6196,8 @@ def main() -> int:
                     )
                     pending_reconstructions[future] = (acquisition_key, sample)
                 except Exception as exc:
+                    if _is_no_space_error(exc):
+                        raise
                     reconstruction_errors.append(
                         {
                             "acquisition_id": _acquisition_name(*acquisition_key),
@@ -6001,6 +6219,8 @@ def main() -> int:
                         flush=True,
                     )
                 except Exception as exc:
+                    if _is_no_space_error(exc):
+                        raise
                     reconstruction_errors.append(
                         {
                             "acquisition_id": _acquisition_name(*acquisition_key),
@@ -6045,6 +6265,8 @@ def main() -> int:
                     )
                     pending_prepared[future] = (index, sample)
                 except Exception as exc:
+                    if _is_no_space_error(exc):
+                        raise
                     errors.append({"sample_id": sample.sample_id, "error": str(exc)})
                     emit_progress("error", sample.sample_id)
 
@@ -6063,10 +6285,10 @@ def main() -> int:
                         prepared = timed_prepared.prepared
                         minutiae_enhanced_path = prepared.bundle_dir / "minutiae_enhanced.png"
                         prepared.bundle_dir.mkdir(parents=True, exist_ok=True)
-                        cv2.imwrite(str(minutiae_enhanced_path), prepared.enhanced_image)
+                        _write_image(minutiae_enhanced_path, prepared.enhanced_image)
                         role = _view_role_for_sample(prepared.sample)
                         if prepared.reconstruction is not None and role is not None:
-                            submit_unwrapped_reconstruction_targets(prepared, pending_targets)
+                            submit_reconstruction_targets(prepared, pending_targets)
                         else:
                             submit_direct_targets(
                                 prepared,
@@ -6077,6 +6299,8 @@ def main() -> int:
                                 pending_targets,
                             )
                     except Exception as exc:
+                        if _is_no_space_error(exc):
+                            raise
                         errors.append({"sample_id": sample.sample_id, "error": str(exc)})
                         emit_progress("error", sample.sample_id)
                     continue
@@ -6084,10 +6308,58 @@ def main() -> int:
                 kind, prepared = pending_targets.pop(future)
                 try:
                     built_targets = future.result()
-                    finalize_targets(prepared, built_targets)
+                    if (
+                        kind in {"front_reprojected", "side_v4_reprojected"}
+                        and built_targets.rasterized_count < MIN_RASTERIZED_MINUTIAE_FOR_RECONSTRUCTION
+                    ):
+                        _merge_stage_seconds(built_targets.stage_seconds)
+                        fallback_reason = (
+                            "empty_reprojection"
+                            if not built_targets.minutiae
+                            else "zero_rasterized_minutiae_after_reprojection"
+                        )
+                        fallback_details = {
+                            "mode": (
+                                "direct_fallback_after_empty_reprojection"
+                                if not built_targets.minutiae
+                                else "direct_fallback_after_zero_rasterized_reprojection"
+                            ),
+                            "view_role": _view_role_for_sample(prepared.sample),
+                            "fallback_reason": fallback_reason,
+                            "fallback_source": f"fingerflow_{fingerflow_backend.backend}",
+                            "reprojected_minutiae_count_before_fallback": len(built_targets.minutiae),
+                            "rasterized_minutiae_count_before_fallback": built_targets.rasterized_count,
+                        }
+                        for key, value in built_targets.minutiae_ground_truth_details.items():
+                            fallback_details.setdefault(key, value)
+                        submit_direct_targets(prepared, fallback_details, pending_targets)
+                    else:
+                        finalize_targets(prepared, built_targets)
                 except Exception as exc:
-                    errors.append({"sample_id": prepared.sample.sample_id, "error": str(exc)})
-                    emit_progress("error", prepared.sample.sample_id)
+                    if _is_no_space_error(exc):
+                        raise
+                    if kind in {"front_reprojected", "side_v4_reprojected"}:
+                        try:
+                            submit_direct_targets(
+                                prepared,
+                                {
+                                    "mode": "direct_fallback_after_reconstruction_failure",
+                                    "view_role": _view_role_for_sample(prepared.sample),
+                                    "fallback_reason": "reconstruction_exception",
+                                    "reason": str(exc),
+                                    "fallback_source": f"fingerflow_{fingerflow_backend.backend}",
+                                    "fallback_minutiae_count": 0,
+                                },
+                                pending_targets,
+                            )
+                        except Exception as fallback_exc:
+                            if _is_no_space_error(fallback_exc):
+                                raise
+                            errors.append({"sample_id": prepared.sample.sample_id, "error": str(fallback_exc)})
+                            emit_progress("error", prepared.sample.sample_id)
+                    else:
+                        errors.append({"sample_id": prepared.sample.sample_id, "error": str(exc)})
+                        emit_progress("error", prepared.sample.sample_id)
 
         for future in pending_writes:
             future.result()
