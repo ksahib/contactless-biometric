@@ -79,3 +79,20 @@ def test_minutia_subweights_accept_zero_for_orientation_only():
     losses = criterion(*_dummy_step())
 
     assert torch.allclose(losses["total"], losses["m4"])
+
+
+def test_default_loss_runs_xy_offset_heads():
+    criterion = FeatureNetLoss(
+        orientation_weight=0.0,
+        ridge_weight=0.0,
+        gradient_weight=0.0,
+        mu_score=0.0,
+        mu_x=1.0,
+        mu_y=1.0,
+        mu_ori=0.0,
+    )
+    losses = criterion(*_dummy_step())
+
+    assert torch.isfinite(losses["m2"])
+    assert torch.isfinite(losses["m3"])
+    assert torch.allclose(losses["total"], losses["m2"] + losses["m3"])

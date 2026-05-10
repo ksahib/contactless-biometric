@@ -119,6 +119,10 @@ class FeatureNetLoss(nn.Module):
         m1_hard_neg_fraction=0.00,
         m1_neg_weight=2.0,
         m1_side_pos_weight=2.0,
+        xy_beta=0.05,
+        xy_center_margin=0.02,
+        xy_offcenter_weight=2.0,
+        xy_anti_center_weight=1.0,
     ):
         super().__init__()
         if m1_side_pos_weight <= 0.0:
@@ -127,6 +131,12 @@ class FeatureNetLoss(nn.Module):
             raise ValueError("orientation_weight, ridge_weight, and gradient_weight must be non-negative")
         if mu_score < 0.0 or mu_x < 0.0 or mu_y < 0.0 or mu_ori < 0.0:
             raise ValueError("mu_score, mu_x, mu_y, and mu_ori must be non-negative")
+        if xy_beta <= 0.0:
+            raise ValueError("xy_beta must be positive")
+        if xy_center_margin < 0.0 or xy_offcenter_weight < 0.0 or xy_anti_center_weight < 0.0:
+            raise ValueError(
+                "xy_center_margin, xy_offcenter_weight, and xy_anti_center_weight must be non-negative"
+            )
 
         # sub-losses
         self.orientation_loss = OrientationLoss(alpha=alpha)
@@ -149,6 +159,10 @@ class FeatureNetLoss(nn.Module):
         self.m1_hard_neg_fraction = float(m1_hard_neg_fraction)
         self.m1_neg_weight = float(m1_neg_weight)
         self.m1_side_pos_weight = float(m1_side_pos_weight)
+        self.xy_beta = float(xy_beta)
+        self.xy_center_margin = float(xy_center_margin)
+        self.xy_offcenter_weight = float(xy_offcenter_weight)
+        self.xy_anti_center_weight = float(xy_anti_center_weight)
 
 
     def _resolve_center_minutia_mask(self, targets, fallback_minutia_mask):
