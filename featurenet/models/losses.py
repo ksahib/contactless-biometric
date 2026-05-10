@@ -353,8 +353,19 @@ class FeatureNetLoss(nn.Module):
             raise ValueError(
                 f"expected {head_name} logits with shape [B,1,H,W], got {tuple(logits.shape)}"
             )
-        target_offsets = self._resolve_offset_target(target_offsets, output_like=logits, head_name=head_name)
+
+        target_offsets = self._resolve_offset_target(
+            target_offsets,
+            output_like=logits,
+            head_name=head_name,
+        )
+
+        if minutia_mask.dim() == 3:
+            minutia_mask = minutia_mask.unsqueeze(1)
+        minutia_mask = minutia_mask.float().to(logits.device)
+
         active_mask = minutia_mask > 0.5
+
         invalid = ((target_offsets < 0.0) | (target_offsets > 1.0)) & active_mask
         if bool(invalid.any().item()):
             invalid_values = target_offsets[invalid]
@@ -364,9 +375,43 @@ class FeatureNetLoss(nn.Module):
                 f"{head_name} offsets contain out-of-range values on active cells; expected [0,1], "
                 f"got min={min_invalid:.6f}, max={max_invalid:.6f}"
             )
+
+        # Keep continuous offset semantics unchanged:
+        # raw logit -> sigmoid -> offset in [0, 1]
         pred_offsets = torch.sigmoid(logits)
-        loss_map = F.smooth_l1_loss(pred_offsets, target_offsets, reduction="none")
-        return (loss_map * minutia_mask).sum() / (minutia_mask.sum() + 1e-8)
+
+        # 1. Sharper continuous localization loss.
+        # Default SmoothL1 is too forgiving for 0.20-0.25 cell errors.
+        base_loss = F.smooth_l1_loss(
+            pred_offsets,
+            target_offsets,
+            reduction="none",
+            beta=self.xy_beta,
+        )
+
+        # 2. Explicit anti-center term.
+        # If pred is not better than the center baseline, penalize it.
+        pred_err = torch.abs(pred_offsets - target_offsets)
+        center_err = torch.abs(target_offsets - 0.5)
+
+        anti_center_loss = F.relu(
+            pred_err - center_err + self.xy_center_margin
+        )
+
+        # 3. Weight off-center targets more.
+        # Center prediction is especially bad for targets far from 0.5.
+        offcenter_weight = 1.0 + self.xy_offcenter_weight * center_err.detach()
+
+        loss_map = (
+            base_loss
+            + self.xy_anti_center_weight * anti_center_loss
+        ) * offcenter_weight
+
+        denom = minutia_mask.sum()
+        if float(denom.item()) <= 0.0:
+            return logits.new_tensor(0.0)
+
+        return (loss_map * minutia_mask).sum() / (denom + 1e-8)
 
     def forward(self, outputs, targets):
         mask = targets["mask"]
