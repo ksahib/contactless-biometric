@@ -119,10 +119,15 @@ class FeatureNetLoss(nn.Module):
         m1_hard_neg_fraction=0.00,
         m1_neg_weight=2.0,
         m1_side_pos_weight=2.0,
+        m1_fp_margin=0.60,
+        m1_fp_penalty_weight=10.0,
+        m1_ignore_radius=1,
         xy_beta=0.05,
         xy_center_margin=0.02,
         xy_offcenter_weight=2.0,
         xy_anti_center_weight=1.0,
+        minutia_ori_tolerance_deg=10.0,
+        minutia_ori_angle_penalty_weight=1.0,
     ):
         super().__init__()
         if m1_side_pos_weight <= 0.0:
@@ -159,10 +164,16 @@ class FeatureNetLoss(nn.Module):
         self.m1_hard_neg_fraction = float(m1_hard_neg_fraction)
         self.m1_neg_weight = float(m1_neg_weight)
         self.m1_side_pos_weight = float(m1_side_pos_weight)
+        self.m1_neg_weight = float(m1_neg_weight)
+        self.m1_fp_margin = float(m1_fp_margin)
+        self.m1_fp_penalty_weight = float(m1_fp_penalty_weight)
+        self.m1_ignore_radius = int(m1_ignore_radius)
         self.xy_beta = float(xy_beta)
         self.xy_center_margin = float(xy_center_margin)
         self.xy_offcenter_weight = float(xy_offcenter_weight)
         self.xy_anti_center_weight = float(xy_anti_center_weight)
+        self.minutia_ori_tolerance_deg = float(minutia_ori_tolerance_deg)
+        self.minutia_ori_angle_penalty_weight = float(minutia_ori_angle_penalty_weight)
 
 
     def _resolve_center_minutia_mask(self, targets, fallback_minutia_mask):
@@ -296,15 +307,29 @@ class FeatureNetLoss(nn.Module):
 
         valid = score_mask > 0.5
 
-        # If your target_score is a binary mask, this is fine.
-        # If it is a soft heatmap, use the ignore-band version below.
         positive_mask = (target_score > 0.5) & valid
-        negative_mask = (target_score <= 0.0) & valid
+
+        positive_float = positive_mask.float()
+
+        ignore_radius = getattr(self, "m1_ignore_radius", 1)
+
+        if ignore_radius > 0:
+            kernel_size = 2 * ignore_radius + 1
+            dilated_positive = F.max_pool2d(
+                positive_float,
+                kernel_size=kernel_size,
+                stride=1,
+                padding=ignore_radius,
+            ) > 0.5
+        else:
+            dilated_positive = positive_mask
+
+        ignore_band = dilated_positive & (~positive_mask) & valid
+        negative_mask = (target_score <= 0.0) & valid & (~ignore_band)
 
         positive_count = positive_mask.float().sum()
         negative_count = negative_mask.float().sum()
 
-        # Keep pos_weight moderate. This helps positives survive when negatives are many.
         pos_weight = torch.sqrt(negative_count / (positive_count + eps)).clamp(
             min=1.0,
             max=self.m1_pos_weight_max,
@@ -317,11 +342,9 @@ class FeatureNetLoss(nn.Module):
             pos_weight=pos_weight,
         )
 
-        # Focal term: punishes hard/confident mistakes more than easy ones.
         pt = torch.exp(-bce_map)
         focal_map = torch.pow((1.0 - pt).clamp(min=0.0), self.m1_focal_gamma) * bce_map
 
-        # Select hard negatives only from true background.
         selected_negative_mask = self._select_m1_hard_negative_mask(
             focal_map,
             positive_mask,
@@ -329,13 +352,34 @@ class FeatureNetLoss(nn.Module):
         )
 
         side_weight_map = self._m1_side_positive_weight_map(focal_map, raw_view_index)
-        pos_loss = (focal_map * positive_mask.float() * side_weight_map).sum() / (positive_count + eps)
-        neg_loss = focal_map[selected_negative_mask].mean() if selected_negative_mask.any() else logits.new_tensor(0.0)
 
-        # Tune this. Start with 2.0, maybe 4.0 later.
+        pos_loss = (
+            focal_map * positive_mask.float() * side_weight_map
+        ).sum() / (positive_count + eps)
+
+        neg_loss = (
+            focal_map[selected_negative_mask].mean()
+            if selected_negative_mask.any()
+            else logits.new_tensor(0.0)
+        )
+
         neg_weight = getattr(self, "m1_neg_weight", 2.0)
 
-        return pos_loss + neg_weight * neg_loss
+        # Extra high-confidence false-positive penalty.
+        # This specifically attacks negative cells with predicted score above margin.
+        score_prob = torch.sigmoid(logits)
+
+        fp_margin = getattr(self, "m1_fp_margin", 0.60)
+        fp_penalty_weight = getattr(self, "m1_fp_penalty_weight", 10.0)
+
+        fp_penalty_map = torch.relu(score_prob - fp_margin).pow(2)
+
+        if selected_negative_mask.any():
+            fp_penalty = fp_penalty_map[selected_negative_mask].mean()
+        else:
+            fp_penalty = logits.new_tensor(0.0)
+
+        return pos_loss + neg_weight * neg_loss + fp_penalty_weight * fp_penalty
 
     def _resolve_offset_target(
         self,
@@ -494,20 +538,45 @@ class FeatureNetLoss(nn.Module):
             head_name="minutia_y",
         )
 
-        # --- M4: orientation (continuous cos/sin)
+        # --- M4: minutia orientation circular loss
         pred_ori = outputs["minutia_orientation"]
         if pred_ori.dim() != 4 or pred_ori.shape[1] != 2:
             raise ValueError(
                 f"expected minutia_orientation output with shape [B,2,H,W], got {tuple(pred_ori.shape)}"
             )
-        pred_ori = F.normalize(pred_ori, dim=1, eps=1e-8)
+
+        pred_ori = F.normalize(pred_ori.float(), dim=1, eps=1e-8)
         target_ori = self._resolve_minutia_orientation_target_vectors(targets).to(pred_ori.device)
+
         if target_ori.shape != pred_ori.shape:
             raise ValueError(
                 f"target minutia orientation vector shape {tuple(target_ori.shape)} "
                 f"does not match prediction shape {tuple(pred_ori.shape)}"
             )
-        ori_loss_map = (pred_ori - target_ori).pow(2).sum(dim=1, keepdim=True)
+
+        target_ori = F.normalize(target_ori.float(), dim=1, eps=1e-8)
+
+        # dot = cos(theta_pred - theta_gt), safely clamped
+        dot = (pred_ori * target_ori).sum(dim=1, keepdim=True).clamp(-1.0 + 1e-6, 1.0 - 1e-6)
+
+        # Main circular loss.
+        # 0 when aligned, 1 when 90 deg wrong, 2 when 180 deg wrong.
+        cosine_loss = 1.0 - dot
+
+        # Optional: explicitly punish angular error above tolerance.
+        # This makes "kind of close" not enough if you want high orientation accuracy.
+        angle_err = torch.acos(dot)  # radians, range [0, pi]
+
+        ori_tolerance = self.minutia_ori_tolerance_deg * torch.pi / 180.0
+
+        angle_penalty = F.relu(angle_err - ori_tolerance)
+
+        # Combine.
+        # Start with 1.0; increase to 2.0 if orientation MAE refuses to move.
+        angle_penalty_weight = self.minutia_ori_angle_penalty_weight
+
+        ori_loss_map = cosine_loss + angle_penalty_weight * angle_penalty
+
         L_m4 = (ori_loss_map * minutia_center_mask).sum() / (minutia_center_mask.sum() + 1e-8)
 
         # combine minutiae

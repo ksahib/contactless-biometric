@@ -2751,7 +2751,7 @@ def _cylinder_similarity_from_vectors(
 
     a_masked = value_a[matchable_mask]
     b_masked = value_b[matchable_mask]
-    denominator = np.linalg.norm(a_masked + b_masked)
+    denominator = np.linalg.norm(a_masked) + np.linalg.norm(b_masked)
     if denominator == 0.0:
         return 0.0
 
@@ -3001,17 +3001,15 @@ def _relax_pairs_with_details(
     for iteration in range(MCC_NREL):
         previous = relaxed.copy()
         support_values = []
+
         for t, (row_t, col_t, _) in enumerate(pairs):
             weights = compatibility_matrix[t]
-            weight_sum = float(np.sum(weights))
-            support_values.append(weight_sum)
-            if weight_sum > 1e-12:
-                compatible_average = float(np.dot(weights, previous) / weight_sum)
-            else:
-                compatible_average = float(previous[t])
+            support_values.append(float(np.sum(weights)))
+
+            support = float(np.dot(weights, previous)) / max(1, len(pairs) - 1)
 
             relaxed[t] = (MCC_W_R * previous[t]) + (
-                (1.0 - MCC_W_R) * compatible_average
+                (1.0 - MCC_W_R) * support
             )
 
         iteration_summaries.append(
@@ -3023,6 +3021,7 @@ def _relax_pairs_with_details(
                 "mean": float(np.mean(relaxed)),
             }
         )
+
         support_summaries.append(
             {
                 "iteration": iteration + 1,
