@@ -122,6 +122,10 @@ class FeatureNetLoss(nn.Module):
         m1_fp_margin=0.60,
         m1_fp_penalty_weight=10.0,
         m1_ignore_radius=1,
+        m1_candidate_loss_weight=1.0,
+        m1_candidate_topk=512,
+        m1_candidate_match_radius=1,
+        m1_candidate_focal_gamma=2.0,
         xy_beta=0.05,
         xy_center_margin=0.02,
         xy_offcenter_weight=2.0,
@@ -168,6 +172,10 @@ class FeatureNetLoss(nn.Module):
         self.m1_fp_margin = float(m1_fp_margin)
         self.m1_fp_penalty_weight = float(m1_fp_penalty_weight)
         self.m1_ignore_radius = int(m1_ignore_radius)
+        self.m1_candidate_loss_weight = float(m1_candidate_loss_weight)
+        self.m1_candidate_topk = int(m1_candidate_topk)
+        self.m1_candidate_match_radius = int(m1_candidate_match_radius)
+        self.m1_candidate_focal_gamma = float(m1_candidate_focal_gamma)
         self.xy_beta = float(xy_beta)
         self.xy_center_margin = float(xy_center_margin)
         self.xy_offcenter_weight = float(xy_offcenter_weight)
@@ -237,6 +245,116 @@ class FeatureNetLoss(nn.Module):
         if minutia_mask.dim() == 3:
             minutia_mask = minutia_mask.unsqueeze(1)
         return minutia_mask.float()
+
+    def _compute_m1_candidate_score_loss(
+        self,
+        logits: torch.Tensor,
+        target_score: torch.Tensor,
+        score_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Candidate-level score loss.
+
+        Dense M1 loss asks:
+            Is every cell positive/negative?
+
+        Candidate M1 loss asks:
+            Among the cells the model itself scores highest,
+            are those cells actually near GT minutiae?
+
+        This directly attacks high-score false positives.
+        """
+        eps = 1e-8
+
+        if target_score.dim() == 3:
+            target_score = target_score.unsqueeze(1)
+        if score_mask.dim() == 3:
+            score_mask = score_mask.unsqueeze(1)
+
+        logits = logits.float()
+        target_score = target_score.float().to(logits.device)
+        score_mask = score_mask.float().to(logits.device)
+
+        valid = score_mask > 0.5
+        positive_mask = (target_score > 0.5) & valid
+
+        batch_size = logits.shape[0]
+        losses = []
+
+        # A candidate is considered positive if it falls within this radius
+        # of a GT positive cell. Radius is in output-grid cells, not pixels.
+        match_radius = getattr(self, "m1_candidate_match_radius", 1)
+
+        if match_radius > 0:
+            kernel_size = 2 * match_radius + 1
+            positive_region = F.max_pool2d(
+                positive_mask.float(),
+                kernel_size=kernel_size,
+                stride=1,
+                padding=match_radius,
+            ) > 0.5
+        else:
+            positive_region = positive_mask
+
+        topk = getattr(self, "m1_candidate_topk", 512)
+        gamma = getattr(self, "m1_candidate_focal_gamma", 2.0)
+
+        for b in range(batch_size):
+            valid_b = valid[b, 0]
+            if not bool(valid_b.any().item()):
+                continue
+
+            logits_b = logits[b, 0]
+            labels_b = positive_region[b, 0].float()
+
+            valid_logits = logits_b[valid_b]
+            valid_labels = labels_b[valid_b]
+
+            num_valid = valid_logits.numel()
+            if num_valid <= 0:
+                continue
+
+            k = min(topk, num_valid)
+
+            # Decode candidates by model confidence.
+            # This is the important part: train on the model's own top predictions.
+            topk_indices = torch.topk(
+                valid_logits,
+                k=k,
+                sorted=False,
+            ).indices
+
+            cand_logits = valid_logits[topk_indices]
+            cand_labels = valid_labels[topk_indices]
+
+            # BCE on decoded candidates.
+            bce = F.binary_cross_entropy_with_logits(
+                cand_logits,
+                cand_labels,
+                reduction="none",
+            )
+
+            # Focal weighting so confident wrong candidates matter more.
+            pt = torch.exp(-bce)
+            focal = torch.pow((1.0 - pt).clamp(min=0.0), gamma) * bce
+
+            # Balance positives/negatives inside candidate set.
+            pos = cand_labels > 0.5
+            neg = ~pos
+
+            if bool(pos.any().item()) and bool(neg.any().item()):
+                pos_loss = focal[pos].mean()
+                neg_loss = focal[neg].mean()
+                loss_b = pos_loss + neg_loss
+            else:
+                loss_b = focal.mean()
+
+            losses.append(loss_b)
+
+        if len(losses) == 0:
+            return logits.new_tensor(0.0)
+
+        return torch.stack(losses).mean()
 
     def _select_m1_hard_negative_mask(self, focal_map, positive_mask, negative_mask):
         selected_negative_mask = torch.zeros_like(negative_mask, dtype=torch.bool)
@@ -522,6 +640,16 @@ class FeatureNetLoss(nn.Module):
             raw_view_index=targets.get("raw_view_index"),
         )
 
+        # --- M1 candidate-level hard false positive loss
+        L_m1_candidate = self._compute_m1_candidate_score_loss(
+            outputs["minutia_score"],
+            targets["minutia_score"],
+            minutia_score_mask,
+        )
+
+        candidate_weight = getattr(self, "m1_candidate_loss_weight", 1.0)
+        L_m1 = L_m1 + candidate_weight * L_m1_candidate
+
         # --- M2: x offset regression (continuous within-cell target)
         L_m2 = self._compute_xy_offset_loss(
             outputs["minutia_x"],
@@ -604,8 +732,9 @@ class FeatureNetLoss(nn.Module):
             "gradient": L_grad,
             "minutia": L_minu,
             "m1": L_m1,
+            "m1_candidate": L_m1_candidate,
             "m2": L_m2,
             "m3": L_m3,
-            "m4": L_m4
+            "m4": L_m4,
         }
         
