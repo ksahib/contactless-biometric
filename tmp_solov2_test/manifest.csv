@@ -1,0 +1,18 @@
+output_filename,split,category,dataset_id,subject_id,finger_id,acquisition_id,view_index,source_path,source_extension,bright_transform_applied
+img_000001.jpg,train,right_side,DS3,120,7,1,2,D:\contactless biome\contactless-biometric\dataset\DS3\120\raw\120_7_1_2.jpg,.jpg,false
+img_000002.jpg,train,right_side,DS1,24,6,2,2,D:\contactless biome\contactless-biometric\dataset\DS1\24\raw\24_6_2_2.jpg,.jpg,false
+img_000003.jpg,train,front,DS1,32,6,1,0,D:\contactless biome\contactless-biometric\dataset\DS1\32\raw\32_6_1_0.jpg,.jpg,false
+img_000001.jpg,val,left_side,DS1,16,6,1,1,D:\contactless biome\contactless-biometric\dataset\DS1\16\raw\16_6_1_1.jpg,.jpg,false
+img_000004.jpg,train,right_side,DS3,104,10,1,2,D:\contactless biome\contactless-biometric\dataset\DS3\104\raw\104_10_1_2.jpg,.jpg,false
+img_000005.jpg,train,left_side,DS2,65,3,2,1,D:\contactless biome\contactless-biometric\dataset\DS2\65\raw\65_3_2_1.jpg,.jpg,false
+img_000006.jpg,train,right_side,DS3,114,6,2,2,D:\contactless biome\contactless-biometric\dataset\DS3\114\raw\114_6_2_2.jpg,.jpg,false
+img_000007.jpg,train,dark_low_contrast,DS3,111,1,2,4,D:\contactless biome\contactless-biometric\dataset\DS3\111\raw\111_1_2_4.jpg,.jpg,false
+img_000008.jpg,train,front,DS3,139,4,1,0,D:\contactless biome\contactless-biometric\dataset\DS3\139\raw\139_4_1_0.jpg,.jpg,false
+img_000009.jpg,train,front,DS3,131,6,2,0,D:\contactless biome\contactless-biometric\dataset\DS3\131\raw\131_6_2_0.jpg,.jpg,false
+img_000010.jpg,train,dark_low_contrast,DS3,118,6,2,5,D:\contactless biome\contactless-biometric\dataset\DS3\118\raw\118_6_2_5.jpg,.jpg,false
+img_000011.jpg,train,front,DS2,85,10,1,0,D:\contactless biome\contactless-biometric\dataset\DS2\85\raw\85_10_1_0.jpg,.jpg,false
+img_000012.jpg,train,left_side,DS3,115,10,1,1,D:\contactless biome\contactless-biometric\dataset\DS3\115\raw\115_10_1_1.jpg,.jpg,false
+img_000013.jpg,train,right_side,DS2,83,3,2,2,D:\contactless biome\contactless-biometric\dataset\DS2\83\raw\83_3_2_2.jpg,.jpg,false
+img_000002.jpg,val,front,DS3,122,10,2,0,D:\contactless biome\contactless-biometric\dataset\DS3\122\raw\122_10_2_0.jpg,.jpg,false
+img_000014.jpg,train,bright_overexposed,DS3,117,9,1,0,D:\contactless biome\contactless-biometric\dataset\DS3\117\raw\117_9_1_0.jpg,.jpg,true
+img_000015.jpg,train,right_side,DS3,102,7,1,2,D:\contactless biome\contactless-biometric\dataset\DS3\102\raw\102_7_1_2.jpg,.jpg,false

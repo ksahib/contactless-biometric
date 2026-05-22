@@ -1,0 +1,80 @@
+{
+  "dataset_root": "/mnt/d/contactless biome/contactless-biometric/dataset/DS1",
+  "output_root": "/mnt/d/contactless biome/contactless-biometric/solov2_mask_sweep",
+  "thresholds": [
+    0.05,
+    0.1,
+    0.2,
+    0.25
+  ],
+  "samples": [
+    {
+      "path": "/mnt/d/contactless biome/contactless-biometric/dataset/DS1/1/raw/1_10_1_0.jpg",
+      "subject": 1,
+      "finger": 10,
+      "acquisition": 1,
+      "view": 0,
+      "role": "front"
+    },
+    {
+      "path": "/mnt/d/contactless biome/contactless-biometric/dataset/DS1/1/raw/1_10_1_1.jpg",
+      "subject": 1,
+      "finger": 10,
+      "acquisition": 1,
+      "view": 1,
+      "role": "side_left"
+    },
+    {
+      "path": "/mnt/d/contactless biome/contactless-biometric/dataset/DS1/1/raw/1_10_1_2.jpg",
+      "subject": 1,
+      "finger": 10,
+      "acquisition": 1,
+      "view": 2,
+      "role": "side_right"
+    },
+    {
+      "path": "/mnt/d/contactless biome/contactless-biometric/dataset/DS1/1/raw/1_10_2_0.jpg",
+      "subject": 1,
+      "finger": 10,
+      "acquisition": 2,
+      "view": 0,
+      "role": "front"
+    },
+    {
+      "path": "/mnt/d/contactless biome/contactless-biometric/dataset/DS1/1/raw/1_10_2_1.jpg",
+      "subject": 1,
+      "finger": 10,
+      "acquisition": 2,
+      "view": 1,
+      "role": "side_left"
+    },
+    {
+      "path": "/mnt/d/contactless biome/contactless-biometric/dataset/DS1/1/raw/1_1_1_0.jpg",
+      "subject": 1,
+      "finger": 1,
+      "acquisition": 1,
+      "view": 0,
+      "role": "front"
+    }
+  ],
+  "threshold_0.05": {
+    "summary_path": "/mnt/d/contactless biome/contactless-biometric/solov2_mask_sweep/threshold_0.05/summary.json",
+    "success_count": 6,
+    "failure_count": 0
+  },
+  "threshold_0.10": {
+    "summary_path": "/mnt/d/contactless biome/contactless-biometric/solov2_mask_sweep/threshold_0.10/summary.json",
+    "success_count": 6,
+    "failure_count": 0
+  },
+  "threshold_0.20": {
+    "summary_path": "/mnt/d/contactless biome/contactless-biometric/solov2_mask_sweep/threshold_0.20/summary.json",
+    "success_count": 6,
+    "failure_count": 0
+  },
+  "threshold_0.25": {
+    "summary_path": "/mnt/d/contactless biome/contactless-biometric/solov2_mask_sweep/threshold_0.25/summary.json",
+    "success_count": 6,
+    "failure_count": 0
+  }
+}

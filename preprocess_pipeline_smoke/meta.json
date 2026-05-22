@@ -1,0 +1,23 @@
+{
+  "input": "/mnt/d/contactless biome/contactless-biometric/finger.jpeg",
+  "score_thr": 0.05,
+  "device": "cpu",
+  "config": "/mnt/d/contactless biome/contactless-biometric/solov2_assets/solov2_distal_phalanx_infer.py",
+  "checkpoint": "/mnt/d/contactless biome/contactless-biometric/weights/solov2_distal_phalanx_best.pth",
+  "target_period": 10.0,
+  "ridge_period": 15.361801147460938,
+  "scale": 0.6509653330366695,
+  "yaw_angle": 5.267929064680686,
+  "enhanced_shape": [
+    1520,
+    1227
+  ],
+  "scaled_shape": [
+    989,
+    799
+  ],
+  "rotated_shape": [
+    989,
+    799
+  ]
+}

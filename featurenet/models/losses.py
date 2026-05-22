@@ -4,13 +4,52 @@ import torch.nn.functional as F
 
 MINUTIA_ORIENTATION_BINS = 360
 
+
+def soft_bce_logits_loss(
+    score_logits: torch.Tensor,
+    score_target: torch.Tensor,
+    score_weight: torch.Tensor | None = None,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Weighted BCEWithLogitsLoss for soft Gaussian minutiae targets."""
+    if score_logits.ndim == 4 and score_logits.shape[1] == 1 and score_target.ndim == 3:
+        score_target = score_target.unsqueeze(1)
+    if score_logits.ndim == 4 and score_logits.shape[1] == 1 and score_weight is not None and score_weight.ndim == 3:
+        score_weight = score_weight.unsqueeze(1)
+
+    if score_logits.shape != score_target.shape:
+        raise ValueError(
+            "score_logits and score_target shape mismatch: "
+            f"{tuple(score_logits.shape)} vs {tuple(score_target.shape)}"
+        )
+
+    score_target = score_target.to(device=score_logits.device, dtype=score_logits.dtype)
+    score_target = torch.clamp(score_target, 0.0, 1.0)
+
+    if score_weight is None:
+        score_weight = torch.ones_like(score_target)
+    else:
+        if score_weight.shape != score_target.shape:
+            raise ValueError(
+                "score_weight and score_target shape mismatch: "
+                f"{tuple(score_weight.shape)} vs {tuple(score_target.shape)}"
+            )
+        score_weight = score_weight.to(device=score_logits.device, dtype=score_logits.dtype)
+        score_weight = torch.clamp(score_weight, min=0.0)
+
+    criterion = nn.BCEWithLogitsLoss(reduction="none")
+    per_cell = criterion(score_logits, score_target)
+    weighted = per_cell * score_weight
+    denom = torch.clamp(score_weight.sum(), min=eps)
+    return weighted.sum() / denom
+
+
 class OrientationLoss(nn.Module):
-    def __init__(self, num_bins=180, alpha=1.0, eps=1e-8, m1_neg_weight=2.0):
+    def __init__(self, num_bins=180, alpha=1.0, eps=1e-8):
         super().__init__()
-        self.num_bins = num_bins
-        self.alpha = alpha
-        self.eps = eps
-        self.m1_neg_weight = float(m1_neg_weight)
+        self.num_bins = int(num_bins)
+        self.alpha = float(alpha)
+        self.eps = float(eps)
 
         kernel = torch.ones(1, 1, 3, 3) / 9.0
         self.register_buffer("smooth_kernel", kernel)
@@ -18,26 +57,53 @@ class OrientationLoss(nn.Module):
     def forward(self, pred, target, mask):
         pred = pred.float()
         target = target.float()
+
         if mask.dim() == 3:
             mask = mask.unsqueeze(1)
         mask = mask.float()
 
-        pred_prob = torch.softmax(pred, dim=1)
+        if pred.dim() != 4:
+            raise ValueError(f"expected pred with shape [B,C,H,W], got {tuple(pred.shape)}")
 
-        ce = -(
-            target * torch.log(pred_prob + self.eps) +
-            (1 - target) * torch.log(1 - pred_prob + self.eps)
+        if pred.shape[1] != self.num_bins:
+            raise ValueError(
+                f"pred has {pred.shape[1]} orientation bins, "
+                f"but OrientationLoss was initialized with num_bins={self.num_bins}"
+            )
+
+        if target.shape != pred.shape:
+            raise ValueError(
+                f"target shape {tuple(target.shape)} must match pred shape {tuple(pred.shape)}"
+            )
+
+        # Paper-style BCE over the 180 orientation bins.
+        class_loss_map = F.binary_cross_entropy_with_logits(
+            pred,
+            target,
+            reduction="none",
         ).sum(dim=1, keepdim=True)
 
-        ce = (ce * mask).sum() / (mask.sum() + self.eps)
+        L_class = (class_loss_map * mask).sum() / (mask.sum() + self.eps)
 
-        # angles
-        angles = torch.arange(self.num_bins, device=pred.device, dtype=pred.dtype) * (360.0 / self.num_bins)
+        # Paper-style probability estimate.
+        pred_prob = torch.sigmoid(pred)
+
+        # The paper uses N = 180 orientation bins.
+        # These bins represent 0..180 degrees.
+        angles = torch.arange(
+            self.num_bins,
+            device=pred.device,
+            dtype=pred.dtype,
+        ) * (180.0 / self.num_bins)
+
         rads = angles * torch.pi / 180.0
 
-        cosine = torch.cos(2 * rads).view(1, self.num_bins, 1, 1)
-        sine   = torch.sin(2 * rads).view(1, self.num_bins, 1, 1)
+        # Paper formula: cos(360 * i / N), sin(360 * i / N).
+        # With bins over 0..180, this is exactly doubled-angle encoding.
+        cosine = torch.cos(2.0 * rads).view(1, self.num_bins, 1, 1)
+        sine = torch.sin(2.0 * rads).view(1, self.num_bins, 1, 1)
 
+        # With sigmoid probabilities, /num_bins is a real average.
         dcos = (pred_prob * cosine).sum(dim=1, keepdim=True) / self.num_bins
         dsin = (pred_prob * sine).sum(dim=1, keepdim=True) / self.num_bins
 
@@ -46,10 +112,11 @@ class OrientationLoss(nn.Module):
 
         magnitude = torch.sqrt(dcos_s.pow(2) + dsin_s.pow(2) + self.eps)
 
-        coh = ((magnitude - 1.0) * mask).sum() / (mask.sum() + self.eps)
+        # Correct sign: coherent field -> magnitude high -> loss low.
+        L_coh_map = (1.0 - magnitude).clamp_min(0.0)
+        L_coh = (L_coh_map * mask).sum() / (mask.sum() + self.eps)
 
-        loss = ce + self.alpha * coh
-        return loss
+        return L_class + self.alpha * L_coh
 
 class RidgePeriodLoss(nn.Module):
     def __init__(self, beta):
@@ -188,13 +255,16 @@ class FeatureNetLoss(nn.Module):
         """
         Use only true positive / center minutia cells for x/y regression.
 
-        Prefer minutia_score because it marks the actual rasterized minutia cell.
-        Fall back to minutia_valid_mask for older bundles.
+        Prefer the explicit diagnostic center map for Gaussian bundles.
+        Fall back to old binary score/valid masks for older bundles.
         """
-        if "minutia_score" not in targets:
+        center_source = targets.get("minutia_score_center_map")
+        if center_source is None:
+            center_source = targets.get("minutia_score")
+        if center_source is None:
             return fallback_minutia_mask.float()
 
-        center_mask = targets["minutia_score"]
+        center_mask = center_source
         if center_mask.dim() == 3:
             center_mask = center_mask.unsqueeze(1)
 
@@ -417,87 +487,23 @@ class FeatureNetLoss(nn.Module):
             side_weight_map[side, :, :, :] = self.m1_side_pos_weight
         return side_weight_map
 
-    def _compute_m1_score_loss(self, logits, target_score, score_mask, raw_view_index=None):
-        eps = 1e-8
-
+    def _compute_m1_score_loss(self, logits, target_score, score_mask, raw_view_index=None, score_weight=None):
         if target_score.dim() == 3:
             target_score = target_score.unsqueeze(1)
+        if score_mask.dim() == 3:
+            score_mask = score_mask.unsqueeze(1)
 
-        valid = score_mask > 0.5
+        effective_weight = score_mask.float().to(logits.device)
+        if score_weight is not None:
+            if score_weight.dim() == 3:
+                score_weight = score_weight.unsqueeze(1)
+            effective_weight = effective_weight * score_weight.float().to(logits.device).clamp_min(0.0)
 
-        positive_mask = (target_score > 0.5) & valid
-
-        positive_float = positive_mask.float()
-
-        ignore_radius = getattr(self, "m1_ignore_radius", 1)
-
-        if ignore_radius > 0:
-            kernel_size = 2 * ignore_radius + 1
-            dilated_positive = F.max_pool2d(
-                positive_float,
-                kernel_size=kernel_size,
-                stride=1,
-                padding=ignore_radius,
-            ) > 0.5
-        else:
-            dilated_positive = positive_mask
-
-        ignore_band = dilated_positive & (~positive_mask) & valid
-        negative_mask = (target_score <= 0.0) & valid & (~ignore_band)
-
-        positive_count = positive_mask.float().sum()
-        negative_count = negative_mask.float().sum()
-
-        pos_weight = torch.sqrt(negative_count / (positive_count + eps)).clamp(
-            min=1.0,
-            max=self.m1_pos_weight_max,
+        return soft_bce_logits_loss(
+            score_logits=logits,
+            score_target=target_score,
+            score_weight=effective_weight,
         )
-
-        bce_map = F.binary_cross_entropy_with_logits(
-            logits,
-            target_score,
-            reduction="none",
-            pos_weight=pos_weight,
-        )
-
-        pt = torch.exp(-bce_map)
-        focal_map = torch.pow((1.0 - pt).clamp(min=0.0), self.m1_focal_gamma) * bce_map
-
-        selected_negative_mask = self._select_m1_hard_negative_mask(
-            focal_map,
-            positive_mask,
-            negative_mask,
-        )
-
-        side_weight_map = self._m1_side_positive_weight_map(focal_map, raw_view_index)
-
-        pos_loss = (
-            focal_map * positive_mask.float() * side_weight_map
-        ).sum() / (positive_count + eps)
-
-        neg_loss = (
-            focal_map[selected_negative_mask].mean()
-            if selected_negative_mask.any()
-            else logits.new_tensor(0.0)
-        )
-
-        neg_weight = getattr(self, "m1_neg_weight", 2.0)
-
-        # Extra high-confidence false-positive penalty.
-        # This specifically attacks negative cells with predicted score above margin.
-        score_prob = torch.sigmoid(logits)
-
-        fp_margin = getattr(self, "m1_fp_margin", 0.60)
-        fp_penalty_weight = getattr(self, "m1_fp_penalty_weight", 10.0)
-
-        fp_penalty_map = torch.relu(score_prob - fp_margin).pow(2)
-
-        if selected_negative_mask.any():
-            fp_penalty = fp_penalty_map[selected_negative_mask].mean()
-        else:
-            fp_penalty = logits.new_tensor(0.0)
-
-        return pos_loss + neg_weight * neg_loss + fp_penalty_weight * fp_penalty
 
     def _resolve_offset_target(
         self,
@@ -632,23 +638,16 @@ class FeatureNetLoss(nn.Module):
         # 4. Minutiae losses
         # ---------------------------
 
-        # --- M1: score (binary)
+        # --- M1: score (soft BCE over logits)
         L_m1 = self._compute_m1_score_loss(
             outputs["minutia_score"],
             targets["minutia_score"],
             minutia_score_mask,
             raw_view_index=targets.get("raw_view_index"),
+            score_weight=targets.get("minutia_score_weight_map"),
         )
 
-        # --- M1 candidate-level hard false positive loss
-        L_m1_candidate = self._compute_m1_candidate_score_loss(
-            outputs["minutia_score"],
-            targets["minutia_score"],
-            minutia_score_mask,
-        )
-
-        candidate_weight = getattr(self, "m1_candidate_loss_weight", 1.0)
-        L_m1 = L_m1 + candidate_weight * L_m1_candidate
+        L_m1_candidate = outputs["minutia_score"].new_tensor(0.0)
 
         # --- M2: x offset regression (continuous within-cell target)
         L_m2 = self._compute_xy_offset_loss(

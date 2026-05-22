@@ -1,0 +1,97 @@
+{
+  "threshold": 0.05,
+  "success_count": 6,
+  "failure_count": 0,
+  "results": [
+    {
+      "sample_id": "1_10_1_0",
+      "image_path": "/mnt/d/contactless biome/contactless-biometric/dataset/DS1/1/raw/1_10_1_0.jpg",
+      "view": 0,
+      "view_role": "front",
+      "threshold": 0.05,
+      "success": true,
+      "mask_area_ratio": 0.1427001953125,
+      "bbox_xyxy": [
+        339,
+        279,
+        913,
+        700
+      ]
+    },
+    {
+      "sample_id": "1_10_1_1",
+      "image_path": "/mnt/d/contactless biome/contactless-biometric/dataset/DS1/1/raw/1_10_1_1.jpg",
+      "view": 1,
+      "view_role": "side_left",
+      "threshold": 0.05,
+      "success": true,
+      "mask_area_ratio": 0.15037460327148439,
+      "bbox_xyxy": [
+        340,
+        302,
+        959,
+        688
+      ]
+    },
+    {
+      "sample_id": "1_10_1_2",
+      "image_path": "/mnt/d/contactless biome/contactless-biometric/dataset/DS1/1/raw/1_10_1_2.jpg",
+      "view": 2,
+      "view_role": "side_right",
+      "threshold": 0.05,
+      "success": true,
+      "mask_area_ratio": 0.14157943725585936,
+      "bbox_xyxy": [
+        320,
+        330,
+        913,
+        755
+      ]
+    },
+    {
+      "sample_id": "1_10_2_0",
+      "image_path": "/mnt/d/contactless biome/contactless-biometric/dataset/DS1/1/raw/1_10_2_0.jpg",
+      "view": 0,
+      "view_role": "front",
+      "threshold": 0.05,
+      "success": true,
+      "mask_area_ratio": 0.1531951904296875,
+      "bbox_xyxy": [
+        327,
+        260,
+        919,
+        659
+      ]
+    },
+    {
+      "sample_id": "1_10_2_1",
+      "image_path": "/mnt/d/contactless biome/contactless-biometric/dataset/DS1/1/raw/1_10_2_1.jpg",
+      "view": 1,
+      "view_role": "side_left",
+      "threshold": 0.05,
+      "success": true,
+      "mask_area_ratio": 0.1793670654296875,
+      "bbox_xyxy": [
+        320,
+        310,
+        1032,
+        718
+      ]
+    },
+    {
+      "sample_id": "1_1_1_0",
+      "image_path": "/mnt/d/contactless biome/contactless-biometric/dataset/DS1/1/raw/1_1_1_0.jpg",
+      "view": 0,
+      "view_role": "front",
+      "threshold": 0.05,
+      "success": true,
+      "mask_area_ratio": 0.34308013916015623,
+      "bbox_xyxy": [
+        348,
+        191,
+        1216,
+        822
+      ]
+    }
+  ]
+}

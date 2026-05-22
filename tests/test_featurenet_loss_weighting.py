@@ -1,6 +1,11 @@
+from pathlib import Path
+import sys
+
 import torch
 
-from featurenet.models.losses import FeatureNetLoss
+sys.path.append(str(Path(__file__).resolve().parents[1]))
+
+from featurenet.models.losses import FeatureNetLoss, soft_bce_logits_loss
 
 
 def _dummy_step():
@@ -96,3 +101,49 @@ def test_default_loss_runs_xy_offset_heads():
     assert torch.isfinite(losses["m2"])
     assert torch.isfinite(losses["m3"])
     assert torch.allclose(losses["total"], losses["m2"] + losses["m3"])
+
+
+def test_soft_bce_logits_loss_accepts_soft_targets_and_backward():
+    logits = torch.zeros((2, 1, 4, 4), requires_grad=True)
+    target = torch.full((2, 1, 4, 4), 0.25)
+    weight = torch.ones((2, 1, 4, 4))
+
+    loss = soft_bce_logits_loss(logits, target, weight)
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert logits.grad is not None
+    assert torch.isfinite(logits.grad).all()
+
+
+def test_soft_bce_logits_loss_zero_weights_ignores_cells():
+    logits = torch.zeros((1, 1, 2, 2), requires_grad=True)
+    target = torch.tensor([[[[0.0, 1.0], [0.25, 0.75]]]])
+    weight = torch.zeros_like(target)
+
+    loss = soft_bce_logits_loss(logits, target, weight)
+    loss.backward()
+
+    assert torch.allclose(loss, torch.tensor(0.0))
+    assert logits.grad is not None
+    assert torch.allclose(logits.grad, torch.zeros_like(logits.grad))
+
+
+def test_feature_loss_uses_score_weight_map():
+    outputs, targets = _dummy_step()
+    targets["minutia_score"] = torch.full_like(targets["minutia_score"], 0.25)
+    targets["minutia_score_weight_map"] = torch.zeros_like(targets["minutia_score"])
+    criterion = FeatureNetLoss(
+        orientation_weight=0.0,
+        ridge_weight=0.0,
+        gradient_weight=0.0,
+        mu_score=1.0,
+        mu_x=0.0,
+        mu_y=0.0,
+        mu_ori=0.0,
+    )
+
+    losses = criterion(outputs, targets)
+
+    assert torch.allclose(losses["m1"], torch.tensor(0.0))
+    assert torch.allclose(losses["total"], torch.tensor(0.0))

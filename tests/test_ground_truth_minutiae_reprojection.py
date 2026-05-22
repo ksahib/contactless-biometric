@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import sys
 import tempfile
@@ -14,6 +15,35 @@ import generate_ground_truth as gt
 
 
 class GroundTruthMinutiaeReprojectionTests(unittest.TestCase):
+    def _make_reconstruction(self, tmp_path: Path) -> gt.AcquisitionReconstructionResult:
+        return gt.AcquisitionReconstructionResult(
+            acquisition_id="s01_f01_a01",
+            reconstruction_dir=str(tmp_path),
+            depth_front_path="",
+            depth_left_path="",
+            depth_right_path="",
+            depth_gradient_labels_path="",
+            reconstruction_maps_path=str(tmp_path / "reconstruction_maps.npz"),
+            support_mask_path="",
+            row_measurements_path="",
+            meta_path="",
+            preview_path="",
+            algorithm1_depth_then_algorithm3_unwarp_dir=str(tmp_path / "algorithm1_depth_then_algorithm3_unwarp"),
+            center_unwarp_maps_path=str(tmp_path / "center_unwarp_maps.npz"),
+            center_unwarped_image_path="center_unwarped.png",
+            center_unwarped_mask_path="center_unwarped_mask.png",
+            surface_front_3d_html_path="",
+            surface_front_3d_png_path="",
+            surface_all_branches_3d_html_path="",
+            surface_all_branches_3d_png_path="",
+            reprojection_report_path="",
+            reprojection_preview_path="",
+            valid_row_count=1,
+            support_pixel_count=1,
+            input_view_paths={},
+            debug_view_paths={},
+        )
+
     def test_downsample_mask_for_points_keeps_any_foreground_pixel(self):
         mask = np.zeros((16, 16), dtype=np.uint8)
         mask[1, 1] = 255
@@ -113,12 +143,134 @@ class GroundTruthMinutiaeReprojectionTests(unittest.TestCase):
         raw = np.tile(np.arange(64, dtype=np.uint8), (64, 1))
         mask = np.zeros((64, 64), dtype=np.uint8)
         mask[8:56, 16:48] = 255
+        final_image = np.full((40, 32), 90, dtype=np.uint8)
+        final_mask = np.ones((40, 32), dtype=np.uint8) * 255
+
+        fake_preprocess = gt.SimpleNamespace(
+            _masked_clahe=mock.Mock(return_value=np.full_like(raw, 80)),
+            circular_mask=mock.Mock(return_value=np.where(mask > 0, 255, 0).astype(np.uint8)),
+            scale_to_paper_ridge_period=mock.Mock(
+                return_value=(
+                    np.full((40, 32), 85, dtype=np.uint8),
+                    final_mask.copy(),
+                    12.5,
+                    0.8,
+                )
+            ),
+            rotate_to_vertical_centerline=mock.Mock(return_value=(final_image, final_mask, -6.0)),
+        )
 
         with mock.patch.object(gt, "rembg_mask_from_bgr", side_effect=AssertionError("rembg should stay main-process")):
-            preprocessed = gt._preprocess_contactless_segment_cpu(raw, mask, "test_mask")
+            with (
+                mock.patch.object(gt, "solov2_preprocess", fake_preprocess),
+                mock.patch.object(gt, "normalise_brightness_array", side_effect=AssertionError("old brightness preprocessing should not run")),
+                mock.patch.object(gt, "_estimate_pose_rotation", side_effect=AssertionError("old pose preprocessing should not run")),
+                mock.patch.object(gt, "_normalize_ridge_frequency", side_effect=AssertionError("old ridge preprocessing should not run")),
+            ):
+                preprocessed = gt._preprocess_contactless_segment_cpu(raw, mask, "test_mask")
 
-        self.assertEqual(preprocessed.mask_source, "test_mask")
-        self.assertGreater(int(np.count_nonzero(preprocessed.final_mask)), 0)
+        self.assertEqual(preprocessed.mask_source, "test_mask_canonical_preprocess")
+        self.assertTrue(np.array_equal(preprocessed.normalized_gray, np.full_like(raw, 80)))
+        self.assertTrue(np.array_equal(preprocessed.preprocessed_gray, final_image))
+        self.assertTrue(np.array_equal(preprocessed.pose_normalized_gray, final_image))
+        self.assertTrue(np.array_equal(preprocessed.final_mask, final_mask))
+        self.assertTrue(np.array_equal(preprocessed.pose_normalized_mask, final_mask))
+        self.assertAlmostEqual(preprocessed.pose_rotation_degrees, -6.0)
+        self.assertAlmostEqual(preprocessed.ridge_scale_factor, 0.8)
+
+    def test_bundle_write_uses_canonical_final_image_for_training_inputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bundle_dir = Path(directory) / "bundle"
+            final_image = np.arange(16, dtype=np.uint8).reshape(4, 4)
+            final_mask = np.zeros((4, 4), dtype=np.uint8)
+            final_mask[1:3, 1:3] = 255
+            masked_image = final_image.copy()
+            masked_image[final_mask <= 0] = 0
+            payload = gt.BundleWritePayload(
+                bundle_dir=bundle_dir,
+                preprocessed=gt.PreprocessedContactlessImage(
+                    raw_gray=np.zeros((4, 4), dtype=np.uint8),
+                    normalized_gray=np.full((4, 4), 10, dtype=np.uint8),
+                    pose_normalized_gray=final_image,
+                    pose_normalized_mask=final_mask,
+                    preprocessed_gray=final_image,
+                    final_mask=final_mask,
+                    mask_source="solov2_canonical_preprocess",
+                    pose_rotation_degrees=3.0,
+                    ridge_scale_factor=1.2,
+                ),
+                gray_image=final_image,
+                mask=final_mask,
+                orientation=np.zeros((4, 4), dtype=np.float32),
+                ridge_period=np.zeros((4, 4), dtype=np.float32),
+                visualization_gradient=np.zeros((4, 4, 2), dtype=np.float32),
+                masked_image=masked_image,
+                enhanced_image=np.full((4, 4), 20, dtype=np.uint8),
+                minutiae=[],
+                featurenet_targets={"output_mask": np.ones((1, 1), dtype=np.float32)},
+                meta={"sample_id": "test"},
+                visualize=False,
+            )
+
+            gt._persist_bundle(payload)
+
+            self.assertTrue(np.array_equal(gt._require_grayscale(bundle_dir / "preprocessed_input.png"), final_image))
+            self.assertTrue(np.array_equal(gt._require_grayscale(bundle_dir / "mask.png"), final_mask))
+            self.assertTrue(np.array_equal(gt._require_grayscale(bundle_dir / "masked_image.png"), masked_image))
+
+    def test_main_segmentation_uses_solov2_by_default(self):
+        full_bgr = np.zeros((32, 32, 3), dtype=np.uint8)
+        mask = np.zeros((32, 32), dtype=np.uint8)
+        mask[4:28, 8:24] = 255
+
+        old_runtime = gt._GENERATOR_RUNTIME
+        gt._GENERATOR_RUNTIME = gt.GeneratorRuntimeConfig(
+            execution_target="local",
+            gpu_only=False,
+            gpu_batch_size=1,
+            cpu_workers=1,
+            prefetch_samples=1,
+            skip_existing=False,
+        )
+        try:
+            with (
+                mock.patch.object(gt, "solov2_mask_from_bgr", return_value=(mask, "solov2")) as solov2_mock,
+                mock.patch.object(gt, "rembg_mask_from_bgr", side_effect=AssertionError("rembg should not run")),
+            ):
+                segmented = gt._segment_contactless_bgr_main(full_bgr, Path("sample.jpg"))
+        finally:
+            gt._GENERATOR_RUNTIME = old_runtime
+
+        solov2_mock.assert_called_once()
+        self.assertEqual(segmented.mask_source, "solov2")
+        self.assertEqual(int(np.count_nonzero(segmented.initial_mask)), int(np.count_nonzero(mask)))
+
+    def test_main_segmentation_can_explicitly_use_rembg(self):
+        full_bgr = np.zeros((32, 32, 3), dtype=np.uint8)
+        mask = np.zeros((32, 32), dtype=np.uint8)
+        mask[4:28, 8:24] = 255
+
+        old_runtime = gt._GENERATOR_RUNTIME
+        gt._GENERATOR_RUNTIME = gt.GeneratorRuntimeConfig(
+            execution_target="local",
+            gpu_only=False,
+            gpu_batch_size=1,
+            cpu_workers=1,
+            prefetch_samples=1,
+            skip_existing=False,
+            mask_extractor="rembg",
+        )
+        try:
+            with (
+                mock.patch.object(gt, "rembg_mask_from_bgr", return_value=(mask, "rembg")) as rembg_mock,
+                mock.patch.object(gt, "solov2_mask_from_bgr", side_effect=AssertionError("solov2 should not run")),
+            ):
+                segmented = gt._segment_contactless_bgr_main(full_bgr, Path("sample.jpg"))
+        finally:
+            gt._GENERATOR_RUNTIME = old_runtime
+
+        rembg_mock.assert_called_once()
+        self.assertEqual(segmented.mask_source, "rembg")
 
     def test_reconstruction_geometry_can_use_presegmented_view(self):
         segmented = gt.SegmentedContactlessInput(
@@ -207,6 +359,7 @@ class GroundTruthMinutiaeReprojectionTests(unittest.TestCase):
                 row_measurements_path="",
                 meta_path="",
                 preview_path="",
+                algorithm1_depth_then_algorithm3_unwarp_dir=str(tmp_path / "algorithm1_depth_then_algorithm3_unwarp"),
                 center_unwarp_maps_path=str(unwarp_maps_path),
                 center_unwarped_image_path="center_unwarped.png",
                 center_unwarped_mask_path="center_unwarped_mask.png",
@@ -283,32 +436,210 @@ class GroundTruthMinutiaeReprojectionTests(unittest.TestCase):
                 ),
                 mock.patch.object(
                     gt,
-                    "_remap_unwarped_minutiae_to_sample",
-                    return_value=(
-                        [{"x": 1.0, "y": 1.0, "theta": 0.0, "source": "reprojected"}],
-                        {"view_role": "front", "scale_x": 1.0, "scale_y": 1.0, "reprojected_minutiae_count": 1},
+                    "_build_reprojected_targets_cpu",
+                    return_value=gt.BuiltBundleTargets(
+                        minutiae=[{"x": 1.0, "y": 1.0, "theta": 0.0, "source": "reprojected"}],
+                        minutiae_source="canonical_test_reprojected_front",
+                        featurenet_targets=fake_targets(minutiae=[]),
+                        rasterized_count=0,
+                        minutiae_ground_truth_details={
+                            "mode": "reconstruction_backed",
+                            "reprojected_minutiae_count": 1,
+                            "rasterized_minutiae_count": 0,
+                        },
+                        stage_seconds={},
                     ),
                 ),
                 mock.patch.object(
                     gt,
                     "_extract_direct_sample_minutiae",
                     return_value=([{"x": 1.0, "y": 1.0, "theta": 0.0, "source": "direct"}], "direct_test"),
-                ),
+                ) as direct_mock,
                 mock.patch.object(gt, "_build_featurenet_targets", side_effect=fake_targets),
             ):
-                result, payload = gt._generate_bundle_from_loaded(
-                    loaded,
-                    fingerflow_model_dir=tmp_path,
-                    dpi=gt.DEFAULT_DPI,
-                    fingerflow_backend=gt.FingerflowBackendConfig("local", "Ubuntu", ""),
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "consensus reconstruction-backed minutiae produced fewer than 1 rasterized minutiae",
+                ):
+                    gt._generate_bundle_from_loaded(
+                        loaded,
+                        fingerflow_model_dir=tmp_path,
+                        dpi=gt.DEFAULT_DPI,
+                        fingerflow_backend=gt.FingerflowBackendConfig("local", "Ubuntu", ""),
+                        minutiae_extractor_config=gt.MinutiaeExtractorConfig(),
+                    )
+
+            direct_mock.assert_not_called()
+
+    def test_default_minutiae_extractor_args_use_r20_consensus(self):
+        with mock.patch.object(sys, "argv", ["generate_ground_truth.py"]):
+            args = gt.parse_args()
+
+        self.assertEqual(args.minutiae_extractor, "consensus")
+        self.assertEqual(args.minutiae_score_target, "gaussian")
+        self.assertEqual(args.mindtct_bin, "mindtct")
+        self.assertEqual(args.fingerflow_bin, "fingerflow")
+        self.assertEqual(args.consensus_overlap_radius_px, 20.0)
+        self.assertEqual(args.min_consensus_sources, 2)
+        self.assertEqual(args.mask_extractor, "solov2")
+        self.assertEqual(args.solov2_score_thr, 0.3)
+
+    def test_load_consensus_role_minutiae_reads_consensus_json(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            reconstruction = self._make_reconstruction(tmp_path)
+            consensus_path = tmp_path / "algorithm1_depth_then_algorithm3_unwarp" / "front" / "consensus_minutiae.json"
+            consensus_path.parent.mkdir(parents=True, exist_ok=True)
+            consensus_path.write_text(
+                json.dumps(
+                    {
+                        "angle_units": "degrees",
+                        "minutiae": [
+                            {
+                                "x": 7.0,
+                                "y": 9.0,
+                                "theta": 90.0,
+                                "score": 0.9,
+                                "type": "E",
+                                "matched_nbis_x": 8.0,
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            report_path = tmp_path / "algorithm1_depth_then_algorithm3_unwarp" / "consensus_minutiae_r20" / "consensus_minutiae_report.json"
+            report = {
+                "report_path": str(report_path),
+                "output_dir": str(report_path.parent),
+                "overlap_radius_px": 20.0,
+                "roles": {
+                    "front": {
+                        "pyfing_count": 4,
+                        "nbis_count": 10,
+                        "consensus_survivor_count": 1,
+                        "pyfing_discarded_count": 3,
+                        "nbis_unmatched_count": 9,
+                        "artifacts": {"consensus_minutiae_json": str(consensus_path)},
+                    }
+                },
+            }
+
+            gt._RECONSTRUCTION_CONSENSUS_CACHE.clear()
+            with mock.patch.object(gt, "_run_or_load_reconstruction_consensus", return_value=report):
+                minutiae, source, details = gt._load_consensus_role_minutiae(
+                    reconstruction,
+                    "front",
+                    gt.MinutiaeExtractorConfig(consensus_overlap_radius_px=20.0),
                 )
 
-            self.assertTrue(result["used_direct_fallback"])
-            self.assertEqual(result["rasterized_minutiae_count"], 1)
-            self.assertEqual(
-                payload.meta["minutiae_ground_truth"]["fallback_reason"],
-                "zero_rasterized_minutiae_after_reprojection",
+        self.assertEqual(source, "pyfing_nbis_fingerflow_consensus")
+        self.assertEqual(len(minutiae), 1)
+        self.assertAlmostEqual(minutiae[0]["theta"], np.pi / 2.0)
+        self.assertEqual(minutiae[0]["matched_nbis_x"], 8.0)
+        self.assertEqual(details["label_minutiae_extractor"], "pyfing_nbis_fingerflow_consensus")
+        self.assertEqual(details["consensus_counts"]["consensus_survivor_count"], 1)
+        self.assertEqual(details["consensus_overlap_radius_px"], 20.0)
+
+    def test_consensus_canonical_extraction_writes_canonical_json(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            reconstruction = self._make_reconstruction(tmp_path)
+            with mock.patch.object(
+                gt,
+                "_load_consensus_role_minutiae",
+                return_value=(
+                    [{"x": 1.0, "y": 2.0, "theta": 0.0, "source": "pyfing_nbis_fingerflow_consensus", "matched_nbis_x": 1.5}],
+                    "pyfing_nbis_fingerflow_consensus",
+                    {"label_minutiae_count": 1},
+                ),
+            ):
+                minutiae, source, details = gt._load_or_extract_canonical_reconstruction_minutiae(
+                    reconstruction,
+                    tmp_path,
+                    gt.FingerflowBackendConfig("local", "Ubuntu", ""),
+                    gt.MinutiaeExtractorConfig(),
+                )
+
+            written = json.loads((tmp_path / "canonical_unwarped_minutiae.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(source, "pyfing_nbis_fingerflow_consensus")
+        self.assertEqual(len(minutiae), 1)
+        self.assertEqual(written[0]["matched_nbis_x"], 1.5)
+        self.assertEqual(details["canonical_minutiae_count"], 1)
+
+    def test_consensus_reconstruction_failure_propagates_without_direct_fallback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            sample = gt.RawViewSample(
+                sample_id="s01_f01_a01_v00",
+                subject_id=1,
+                subject_index=0,
+                finger_id=1,
+                acquisition_id=1,
+                finger_class_id=0,
+                raw_image_path=str(tmp_path / "raw.png"),
+                raw_view_index=0,
+                sire_path=None,
+                raw_view_paths=[str(tmp_path / f"raw_{idx}.png") for idx in range(3)],
+                variant_paths={},
+                is_extra_acquisition=False,
             )
+            reconstruction = self._make_reconstruction(tmp_path)
+            prepared = gt.PreparedBundleArtifacts(
+                sample=sample,
+                bundle_dir=tmp_path / "bundle",
+                image_path=tmp_path / "raw.png",
+                preprocessed=gt.PreprocessedContactlessImage(
+                    raw_gray=np.zeros((16, 16), dtype=np.uint8),
+                    normalized_gray=np.zeros((16, 16), dtype=np.uint8),
+                    pose_normalized_gray=np.zeros((16, 16), dtype=np.uint8),
+                    pose_normalized_mask=np.ones((16, 16), dtype=np.uint8),
+                    preprocessed_gray=np.zeros((16, 16), dtype=np.uint8),
+                    final_mask=np.ones((16, 16), dtype=np.uint8),
+                    mask_source="test",
+                    pose_rotation_degrees=0.0,
+                    ridge_scale_factor=1.0,
+                ),
+                gray_image=np.zeros((16, 16), dtype=np.uint8),
+                mask=np.ones((16, 16), dtype=np.uint8),
+                orientation=np.zeros((16, 16), dtype=np.float32),
+                ridge_period=np.zeros((16, 16), dtype=np.float32),
+                visualization_gradient=np.zeros((16, 16, 2), dtype=np.float32),
+                reconstruction_gradient=None,
+                masked_image=np.zeros((16, 16), dtype=np.uint8),
+                enhanced_image=np.zeros((16, 16), dtype=np.uint8),
+                visualize=False,
+                reconstruction=reconstruction,
+            )
+            loaded = gt.LoadedSampleInput(
+                sample=sample,
+                image_path=tmp_path / "raw.png",
+                full_bgr=np.zeros((16, 16, 3), dtype=np.uint8),
+                visualize=False,
+                bundle_dir=prepared.bundle_dir,
+                reconstruction=reconstruction,
+            )
+
+            with (
+                mock.patch.object(gt, "_prepare_bundle_from_loaded", return_value=prepared),
+                mock.patch.object(
+                    gt,
+                    "_load_or_extract_canonical_reconstruction_minutiae",
+                    side_effect=RuntimeError("mindtct missing"),
+                ),
+                mock.patch.object(gt, "_extract_direct_sample_minutiae") as direct_mock,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "mindtct missing"):
+                    gt._generate_bundle_from_loaded(
+                        loaded,
+                        fingerflow_model_dir=tmp_path,
+                        dpi=gt.DEFAULT_DPI,
+                        fingerflow_backend=gt.FingerflowBackendConfig("local", "Ubuntu", ""),
+                        minutiae_extractor_config=gt.MinutiaeExtractorConfig(),
+                    )
+
+            direct_mock.assert_not_called()
 
 
 if __name__ == "__main__":

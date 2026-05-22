@@ -15,9 +15,16 @@ class ConvBlock(nn.Module):
         self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding)
         self.norm = nn.GroupNorm(_resolve_group_count(out_channels), out_channels)
         self.relu = nn.ReLU(inplace=True)
+        # Project residual if channels or stride change
+        self.residual_proj = (
+            nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False)
+            if (in_channels != out_channels or stride != 1)
+            else nn.Identity()
+        )
 
     def forward(self, x):
+        residual = self.residual_proj(x)
         x = self.conv(x)
         x = self.norm(x)
-        x = self.relu(x)
+        x = self.relu(x + residual)
         return x

@@ -5,6 +5,8 @@ __pycache__/
 .fingerflow_models/
 match_outputs/
 .venv/
+.venv-wsl/
+.venv-wsl311/
 ground_truth/
 dataset/
 tmp/

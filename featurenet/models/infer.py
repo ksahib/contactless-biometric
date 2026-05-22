@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import importlib.util
+import json
 import pathlib
 import sys
 import sysconfig
@@ -27,13 +28,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from generate_ground_truth import (
-    _normalize_ridge_frequency,
-    load_bgr_image,
-    normalise_brightness_array,
-    rembg_mask_from_bgr,
-    validate_foreground_area,
-)
+import preprocess as solov2_preprocess
+from generate_ground_truth import load_bgr_image
 
 from .feature_extractor import FeatureExtractor
 
@@ -96,19 +92,23 @@ def load_checkpoint_model(weights_path: Path, device: torch.device) -> FeatureEx
 def preprocess_input_bgr(
     full_bgr: np.ndarray,
     save_preprocess_dir: Path | None = None,
+    *,
+    solov2_config: Path | None = None,
+    solov2_checkpoint: Path | None = None,
+    solov2_device: str | None = None,
+    solov2_score_thr: float = 0.3,
 ) -> tuple[torch.Tensor, torch.Tensor, tuple[int, int]]:
     raw_gray = cv2.cvtColor(full_bgr, cv2.COLOR_BGR2GRAY)
-    initial_mask, _mask_source = rembg_mask_from_bgr(full_bgr)
-    validate_foreground_area(initial_mask, minimum_ratio=0.03)
-    normalized_gray = normalise_brightness_array(raw_gray, initial_mask)
-    preprocessed_gray, final_mask, _ridge_scale_factor = _normalize_ridge_frequency(
-        normalized_gray,
-        initial_mask,
-        target_spacing=10.0,
+    result = solov2_preprocess.run_preprocess_pipeline(
+        full_bgr,
+        score_thr=solov2_score_thr,
+        device=solov2_device,
+        model_config=solov2_config,
+        checkpoint=solov2_checkpoint,
+        target_period=10.0,
     )
-
-    gray_image = preprocessed_gray
-    mask = final_mask
+    gray_image = result.rotated_image
+    mask = result.rotated_mask
     masked_image = gray_image.copy()
     masked_image[mask <= 0] = 0
 
@@ -123,11 +123,25 @@ def preprocess_input_bgr(
     if save_preprocess_dir is not None:
         save_preprocess_dir.mkdir(parents=True, exist_ok=True)
         cv2.imwrite(str(save_preprocess_dir / "raw_gray.png"), raw_gray)
-        cv2.imwrite(str(save_preprocess_dir / "normalized_gray.png"), normalized_gray)
-        cv2.imwrite(str(save_preprocess_dir / "initial_mask.png"), initial_mask)
-        cv2.imwrite(str(save_preprocess_dir / "preprocessed_gray.png"), preprocessed_gray)
-        cv2.imwrite(str(save_preprocess_dir / "final_mask.png"), final_mask)
+        cv2.imwrite(str(save_preprocess_dir / "enhanced.png"), result.enhanced)
+        cv2.imwrite(str(save_preprocess_dir / "full_mask.png"), result.full_mask)
+        cv2.imwrite(str(save_preprocess_dir / "center_mask.png"), result.center_mask)
+        cv2.imwrite(str(save_preprocess_dir / "scaled_image.png"), result.scaled_image)
+        cv2.imwrite(str(save_preprocess_dir / "scaled_mask.png"), result.scaled_mask)
+        cv2.imwrite(str(save_preprocess_dir / "preprocessed_gray.png"), gray_image)
+        cv2.imwrite(str(save_preprocess_dir / "final_mask.png"), mask)
         cv2.imwrite(str(save_preprocess_dir / "masked_image.png"), masked_image)
+        meta = {
+            "canonical_preprocess": "preprocess.py",
+            "ridge_period": float(result.ridge_period),
+            "scale": float(result.scale),
+            "yaw_angle": float(result.yaw_angle),
+            "solov2_score_thr": float(solov2_score_thr),
+            "solov2_device": solov2_device,
+            "solov2_config": str(solov2_config) if solov2_config is not None else None,
+            "solov2_checkpoint": str(solov2_checkpoint) if solov2_checkpoint is not None else None,
+        }
+        (save_preprocess_dir / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
     return image_tensor, mask_tensor, (int(masked_image.shape[0]), int(masked_image.shape[1]))
 
@@ -135,9 +149,21 @@ def preprocess_input_bgr(
 def preprocess_input_image(
     image_path: Path,
     save_preprocess_dir: Path | None = None,
+    *,
+    solov2_config: Path | None = None,
+    solov2_checkpoint: Path | None = None,
+    solov2_device: str | None = None,
+    solov2_score_thr: float = 0.3,
 ) -> tuple[torch.Tensor, torch.Tensor, tuple[int, int]]:
     full_bgr = load_bgr_image(image_path)
-    return preprocess_input_bgr(full_bgr, save_preprocess_dir=save_preprocess_dir)
+    return preprocess_input_bgr(
+        full_bgr,
+        save_preprocess_dir=save_preprocess_dir,
+        solov2_config=solov2_config,
+        solov2_checkpoint=solov2_checkpoint,
+        solov2_device=solov2_device,
+        solov2_score_thr=solov2_score_thr,
+    )
 
 
 @torch.no_grad()
@@ -315,6 +341,10 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional directory to save intermediate preprocessing images.",
     )
+    parser.add_argument("--solov2-config", type=Path, default=None, help="SOLOv2 MMDetection config path.")
+    parser.add_argument("--solov2-checkpoint", type=Path, default=None, help="SOLOv2 checkpoint path.")
+    parser.add_argument("--solov2-device", default=None, help="SOLOv2 inference device, e.g. cpu or cuda:0.")
+    parser.add_argument("--solov2-score-thr", type=float, default=0.3, help="Minimum SOLOv2 distal phalanx detection score.")
     parser.add_argument(
         "--output-minutiae-csv",
         type=Path,
@@ -356,6 +386,10 @@ def main() -> None:
     image_tensor, mask_tensor, input_shape_hw = preprocess_input_image(
         image_path,
         save_preprocess_dir=args.save_preprocess_dir,
+        solov2_config=args.solov2_config,
+        solov2_checkpoint=args.solov2_checkpoint,
+        solov2_device=args.solov2_device,
+        solov2_score_thr=float(args.solov2_score_thr),
     )
     outputs = run_inference(model, image_tensor, mask_tensor, device)
     print_output_stats(outputs)

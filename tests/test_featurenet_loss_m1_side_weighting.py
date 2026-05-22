@@ -1,7 +1,11 @@
 import math
+from pathlib import Path
+import sys
 
 import torch
 import torch.nn.functional as F
+
+sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from featurenet.models.losses import FeatureNetLoss
 
@@ -51,7 +55,7 @@ def test_m1_missing_raw_view_index_matches_front():
     assert torch.allclose(missing_loss, front_loss)
 
 
-def test_m1_side_view_weights_positive_loss_only():
+def test_m1_side_view_uses_same_soft_bce_weighting():
     side_weight = 3.0
     criterion = _criterion(side_weight=side_weight)
     logits, target, mask = _single_sample_inputs()
@@ -68,10 +72,7 @@ def test_m1_side_view_weights_positive_loss_only():
         mask,
         raw_view_index=torch.tensor([1]),
     )
-    pos_loss = _positive_bce_for_inputs(logits, target)
-
-    expected_delta = (side_weight - 1.0) * pos_loss
-    assert torch.allclose(side_loss - front_loss, expected_delta, atol=1e-6)
+    assert torch.allclose(side_loss, front_loss, atol=1e-6)
 
 
 def test_m1_right_side_view_uses_same_positive_weight():
@@ -95,7 +96,7 @@ def test_m1_right_side_view_uses_same_positive_weight():
     assert torch.allclose(left_loss, right_loss)
 
 
-def test_m1_mixed_batch_weights_only_side_sample_positives():
+def test_m1_mixed_batch_matches_front_batch_with_soft_bce():
     side_weight = 4.0
     criterion = _criterion(side_weight=side_weight)
     logits_one, target_one, mask_one = _single_sample_inputs()
@@ -115,10 +116,7 @@ def test_m1_mixed_batch_weights_only_side_sample_positives():
         mask,
         raw_view_index=torch.tensor([0, 1]),
     )
-    pos_loss = _positive_bce_for_inputs(logits, target)
-
-    expected_delta = ((side_weight - 1.0) / 2.0) * pos_loss
-    assert torch.allclose(mixed_batch_loss - front_batch_loss, expected_delta, atol=1e-6)
+    assert torch.allclose(mixed_batch_loss, front_batch_loss, atol=1e-6)
 
 
 def test_m1_side_weight_does_not_change_negative_only_loss():
