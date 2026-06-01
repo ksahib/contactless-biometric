@@ -446,6 +446,7 @@ def _get_detector(
         return cached
 
     init_detector, _ = _load_mmdet_apis()
+    os.environ.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
     detector = init_detector(str(config_path), str(checkpoint_path), device=resolved_device)
     _MODEL_CACHE[cache_key] = detector
     return detector

@@ -167,6 +167,25 @@ def prepare_targets(targets: Mapping[str, Any], mask_tensor: torch.Tensor) -> di
     return prepared
 
 
+def _materialize_sample_targets(sample: Mapping[str, Any]) -> dict[str, Any]:
+    if "targets" in sample:
+        targets = dict(sample.get("targets", {}))
+    else:
+        targets_path = sample.get("targets_path")
+        if targets_path is None:
+            targets = {}
+        else:
+            targets = _load_npz_targets(Path(targets_path))
+
+    if "raw_view_index" in sample:
+        targets["raw_view_index"] = np.int64(sample["raw_view_index"])
+    if "input_shape_hw" in sample:
+        targets["input_shape_hw"] = np.asarray(sample["input_shape_hw"], dtype=np.int64)
+    if "output_shape_hw" in sample:
+        targets["output_shape_hw"] = np.asarray(sample["output_shape_hw"], dtype=np.int64)
+    return targets
+
+
 class FeatureNetDataset(Dataset):
     def __init__(self, samples: list[Mapping[str, Any]]):
         self.samples = samples
@@ -181,7 +200,7 @@ class FeatureNetDataset(Dataset):
             sample["mask"],
         )
 
-        targets = prepare_targets(sample.get("targets", {}), mask_tensor)
+        targets = prepare_targets(_materialize_sample_targets(sample), mask_tensor)
         targets["_sample_index"] = torch.tensor(index, dtype=torch.long)
         return input_tensor, targets
 
@@ -865,9 +884,6 @@ def load_bundle_samples(
         if input_shape_hw is None:
             image_height, image_width = _read_grayscale_image(masked_image_path).shape[-2:]
             input_shape_hw = (int(image_height), int(image_width))
-        targets["raw_view_index"] = np.int64(meta.get("raw_view_index", -1))
-        targets["input_shape_hw"] = np.asarray(input_shape_hw, dtype=np.int64)
-        targets["output_shape_hw"] = np.asarray(output_shape_hw, dtype=np.int64)
         samples.append(
             {
                 "sample_id": meta["sample_id"],
@@ -878,7 +894,10 @@ def load_bundle_samples(
                 "acquisition_id": meta.get("acquisition_id"),
                 "masked_image": masked_image_path,
                 "mask": mask_path,
-                "targets": targets,
+                "targets_path": targets_path,
+                "raw_view_index": int(meta.get("raw_view_index", -1)),
+                "input_shape_hw": tuple(int(value) for value in input_shape_hw),
+                "output_shape_hw": tuple(int(value) for value in output_shape_hw),
             }
         )
 
@@ -1037,7 +1056,7 @@ def _compute_extended_validation_metrics(
         dataloader=dataloader,
         device=device,
         score_thresholds=_default_thresholds(),
-        target_threshold=0.0,
+        target_threshold=0.5,
         amp=amp,
         amp_dtype=amp_dtype,
         channels_last=channels_last,

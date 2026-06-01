@@ -211,6 +211,15 @@ def _resolve_target_offsets(targets: dict[str, torch.Tensor]) -> tuple[torch.Ten
     return x_offset, y_offset
 
 
+def _resolve_target_score_map(targets: dict[str, torch.Tensor]) -> torch.Tensor:
+    score_map = targets.get("minutia_score_center_map")
+    if score_map is None:
+        score_map = targets["minutia_score"]
+    if score_map.dim() == 4:
+        score_map = score_map.squeeze(1)
+    return score_map
+
+
 def _max_bipartite_match_count(adjacency: list[list[int]], right_size: int) -> int:
     if not adjacency or right_size <= 0:
         return 0
@@ -317,9 +326,7 @@ def compute_validation_metrics(
         eval_mask = targets["mask"] > 0.5
         if eval_mask.dim() == 4:
             eval_mask = eval_mask.squeeze(1)
-        gt_score = targets["minutia_score"]
-        if gt_score.dim() == 4:
-            gt_score = gt_score.squeeze(1)
+        gt_score = _resolve_target_score_map(targets)
         pred_score = torch.sigmoid(outputs["minutia_score"])
         if pred_score.dim() == 4:
             pred_score = pred_score.squeeze(1)
@@ -513,7 +520,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--val-fraction", type=float, default=None)
     parser.add_argument("--limit", type=int, default=None)
-    parser.add_argument("--target-threshold", type=float, default=0.0)
+    parser.add_argument("--target-threshold", type=float, default=0.5)
     parser.add_argument("--output-json", type=Path, default=None)
     return parser.parse_args()
 

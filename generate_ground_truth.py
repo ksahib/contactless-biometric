@@ -44,13 +44,22 @@ def ensure_stdlib_copy_module() -> None:
 
 ensure_stdlib_copy_module()
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 
 import cv2
 import numpy as np
 import pyfing
 
 from scripts.minutiae_gaussian_heatmap import rasterize_consensus_gaussian_heatmap
+
+
+def _install_numpy_scalar_aliases_compat() -> None:
+    for name, scalar_type in {"bool": bool, "int": int}.items():
+        if name not in np.__dict__:
+            setattr(np, name, scalar_type)
+
+
+_install_numpy_scalar_aliases_compat()
 
 try:
     import preprocess as solov2_preprocess
@@ -80,6 +89,7 @@ VARIANT_SUFFIXES = ("HT1", "HT2", "HT4", "HT6", "R414")
 DEFAULT_DPI = 500
 MINUTIA_SCORE_THRESHOLD = 0.15
 MIN_RASTERIZED_MINUTIAE_FOR_RECONSTRUCTION = 1
+QUALITY_SKIP_LOAD_BEARING_FILES = ("meta.json", "featurenet_targets.npz", "minutiae.json")
 DEFAULT_CONSENSUS_OVERLAP_RADIUS_PX = 20.0
 DEFAULT_SIDE_UNWRAP_ROW_PARAM_SMOOTH_WINDOW = 31
 DEFAULT_SIDE_UNWRAP_MAP_SMOOTH_SIGMA_X = 2.0
@@ -238,6 +248,7 @@ class AcquisitionReconstructionResult:
     support_pixel_count: int
     input_view_paths: dict[str, str]
     debug_view_paths: dict[str, dict[str, str]]
+    triplet_preprocess: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -1051,6 +1062,40 @@ def _canonical_preprocess_from_segment(
     )
 
 
+def _pad_to_multiple(
+    image: np.ndarray,
+    mask: np.ndarray,
+    *,
+    multiple: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    height, width = image.shape[:2]
+    target_height = int(math.ceil(height / float(multiple)) * multiple)
+    target_width = int(math.ceil(width / float(multiple)) * multiple)
+    pad_bottom = max(0, target_height - height)
+    pad_right = max(0, target_width - width)
+    if pad_bottom == 0 and pad_right == 0:
+        return image, mask
+    padded_image = cv2.copyMakeBorder(
+        image,
+        0,
+        pad_bottom,
+        0,
+        pad_right,
+        borderType=cv2.BORDER_CONSTANT,
+        value=0,
+    )
+    padded_mask = cv2.copyMakeBorder(
+        mask,
+        0,
+        pad_bottom,
+        0,
+        pad_right,
+        borderType=cv2.BORDER_CONSTANT,
+        value=0,
+    )
+    return padded_image, padded_mask
+
+
 def _preprocess_contactless_segment_cpu(
     raw_gray: np.ndarray,
     initial_mask: np.ndarray,
@@ -1058,19 +1103,234 @@ def _preprocess_contactless_segment_cpu(
 ) -> PreprocessedContactlessImage:
     cpu_started_at = time.perf_counter()
     canonical = _canonical_preprocess_from_segment(raw_gray, initial_mask)
-    final_mask = np.where(canonical.rotated_mask > 0, 255, 0).astype(np.uint8)
+    pose_gray, pose_mask = _pad_to_multiple(
+        canonical.rotated_image,
+        canonical.rotated_mask,
+        multiple=8,
+    )
+    final_mask = np.where(pose_mask > 0, 255, 0).astype(np.uint8)
     validate_foreground_area(final_mask, minimum_ratio=0.02)
     _record_stage_time("cpu_preprocess", time.perf_counter() - cpu_started_at)
     return PreprocessedContactlessImage(
         raw_gray=raw_gray,
         normalized_gray=canonical.enhanced,
-        pose_normalized_gray=canonical.rotated_image,
+        pose_normalized_gray=pose_gray,
         pose_normalized_mask=final_mask,
-        preprocessed_gray=canonical.rotated_image,
+        preprocessed_gray=pose_gray,
         final_mask=final_mask,
         mask_source=f"{mask_source}_canonical_preprocess",
         pose_rotation_degrees=canonical.yaw_angle,
         ridge_scale_factor=canonical.scale,
+    )
+
+
+def _require_mask_bbox_center(mask: np.ndarray, *, role: str) -> tuple[float, float]:
+    rows, cols = np.nonzero(mask > 0)
+    if rows.size == 0 or cols.size == 0:
+        raise RuntimeError(f"{role} mask is empty after triplet preprocessing")
+    return float(0.5 * (cols.min() + cols.max())), float(0.5 * (rows.min() + rows.max()))
+
+
+def _resize_with_shared_scale(image: np.ndarray, mask: np.ndarray, scale: float) -> tuple[np.ndarray, np.ndarray]:
+    if not math.isfinite(float(scale)) or float(scale) <= 0.0:
+        raise RuntimeError(f"invalid shared ridge scale {scale!r}")
+    resized_image = cv2.resize(image, None, fx=float(scale), fy=float(scale), interpolation=cv2.INTER_LINEAR)
+    resized_mask = cv2.resize(mask, None, fx=float(scale), fy=float(scale), interpolation=cv2.INTER_NEAREST)
+    return resized_image.astype(np.uint8), np.where(resized_mask > 0, 255, 0).astype(np.uint8)
+
+
+def _place_in_shared_canvas(
+    image: np.ndarray,
+    mask: np.ndarray,
+    *,
+    canvas_shape: tuple[int, int],
+    canvas_center: tuple[float, float],
+    bbox_center: tuple[float, float],
+) -> tuple[np.ndarray, np.ndarray, tuple[int, int]]:
+    canvas_h, canvas_w = canvas_shape
+    offset_x = int(round(float(canvas_center[0]) - float(bbox_center[0])))
+    offset_y = int(round(float(canvas_center[1]) - float(bbox_center[1])))
+    placed_image = np.zeros((canvas_h, canvas_w), dtype=np.uint8)
+    placed_mask = np.zeros((canvas_h, canvas_w), dtype=np.uint8)
+
+    src_h, src_w = image.shape[:2]
+    dst_x0 = max(0, offset_x)
+    dst_y0 = max(0, offset_y)
+    src_x0 = max(0, -offset_x)
+    src_y0 = max(0, -offset_y)
+    copy_w = min(src_w - src_x0, canvas_w - dst_x0)
+    copy_h = min(src_h - src_y0, canvas_h - dst_y0)
+    if copy_w <= 0 or copy_h <= 0:
+        raise RuntimeError("triplet preprocessed view does not intersect shared canvas")
+
+    placed_image[dst_y0 : dst_y0 + copy_h, dst_x0 : dst_x0 + copy_w] = image[
+        src_y0 : src_y0 + copy_h,
+        src_x0 : src_x0 + copy_w,
+    ]
+    placed_mask[dst_y0 : dst_y0 + copy_h, dst_x0 : dst_x0 + copy_w] = mask[
+        src_y0 : src_y0 + copy_h,
+        src_x0 : src_x0 + copy_w,
+    ]
+    return placed_image, np.where(placed_mask > 0, 255, 0).astype(np.uint8), (offset_x, offset_y)
+
+
+def _preprocess_reconstruction_triplet_from_segments(
+    triplet_paths: dict[str, Path],
+    segmented_views: dict[str, SegmentedContactlessInput] | None = None,
+) -> tuple[dict[str, PreprocessedContactlessImage], dict[str, ReconstructionViewGeometry], dict[str, Any]]:
+    if solov2_preprocess is None:
+        raise RuntimeError(
+            "canonical preprocessing is unavailable because preprocess.py could not be imported"
+        )
+    required_names = (
+        "_masked_clahe",
+        "circular_mask",
+        "scale_to_paper_ridge_period",
+        "rotate_to_vertical_centerline",
+    )
+    missing = [name for name in required_names if not hasattr(solov2_preprocess, name)]
+    if missing:
+        raise RuntimeError(f"preprocess.py is missing canonical preprocessing functions: {', '.join(missing)}")
+
+    segmented_by_role: dict[str, SegmentedContactlessInput] = {}
+    for role, raw_view_path in triplet_paths.items():
+        if segmented_views is not None and role in segmented_views:
+            segmented_by_role[role] = segmented_views[role]
+            continue
+        full_bgr = load_bgr_image(raw_view_path)
+        segmented_by_role[role] = _segment_contactless_bgr_main(full_bgr, raw_view_path)
+
+    raw_parts: dict[str, SimpleNamespace] = {}
+    for role, segmented in segmented_by_role.items():
+        full_mask = np.where(segmented.initial_mask > 0, 255, 0).astype(np.uint8)
+        enhanced = solov2_preprocess._masked_clahe(segmented.raw_gray, full_mask)
+        raw_parts[role] = SimpleNamespace(
+            segmented=segmented,
+            full_mask=full_mask,
+            enhanced=enhanced.astype(np.uint8),
+        )
+
+    front_part = raw_parts["front"]
+    front_center_mask = solov2_preprocess.circular_mask(front_part.full_mask)
+    front_scaled_image, front_scaled_mask, front_ridge_period, shared_scale = solov2_preprocess.scale_to_paper_ridge_period(
+        front_part.enhanced,
+        front_part.full_mask,
+        target_period=10.0,
+        center_mask=front_center_mask,
+    )
+    shared_scale = float(shared_scale)
+    front_ridge_period = float(front_ridge_period)
+
+    rotated_parts: dict[str, SimpleNamespace] = {}
+    for role in ("front", "left", "right"):
+        part = raw_parts[role]
+        if role == "front":
+            scaled_image = front_scaled_image.astype(np.uint8)
+            scaled_mask = np.where(front_scaled_mask > 0, 255, 0).astype(np.uint8)
+        else:
+            scaled_image, scaled_mask = _resize_with_shared_scale(part.enhanced, part.full_mask, shared_scale)
+        rotated_image, rotated_mask, yaw_angle = solov2_preprocess.rotate_to_vertical_centerline(
+            scaled_image,
+            scaled_mask,
+        )
+        rotated_mask = np.where(rotated_mask > 0, 255, 0).astype(np.uint8)
+        validate_foreground_area(rotated_mask, minimum_ratio=0.02)
+        bbox_center = _require_mask_bbox_center(rotated_mask, role=role)
+        rotated_parts[role] = SimpleNamespace(
+            image=rotated_image.astype(np.uint8),
+            mask=rotated_mask,
+            yaw_angle=float(yaw_angle),
+            bbox_center=bbox_center,
+        )
+
+    max_left = max(float(part.bbox_center[0]) for part in rotated_parts.values())
+    max_right = max(float(part.image.shape[1]) - float(part.bbox_center[0]) for part in rotated_parts.values())
+    max_top = max(float(part.bbox_center[1]) for part in rotated_parts.values())
+    max_bottom = max(float(part.image.shape[0]) - float(part.bbox_center[1]) for part in rotated_parts.values())
+    canvas_w = int(math.ceil(max_left + max_right))
+    canvas_h = int(math.ceil(max_top + max_bottom))
+    canvas_h = int(math.ceil(canvas_h / 8.0) * 8)
+    canvas_w = int(math.ceil(canvas_w / 8.0) * 8)
+    canvas_center = (canvas_w / 2.0, canvas_h / 2.0)
+
+    preprocessed_views: dict[str, PreprocessedContactlessImage] = {}
+    view_geometries: dict[str, ReconstructionViewGeometry] = {}
+    role_meta: dict[str, Any] = {}
+    for role in ("front", "left", "right"):
+        segmented = raw_parts[role].segmented
+        rotated = rotated_parts[role]
+        pose_gray, pose_mask, placement_offset = _place_in_shared_canvas(
+            rotated.image,
+            rotated.mask,
+            canvas_shape=(canvas_h, canvas_w),
+            canvas_center=canvas_center,
+            bbox_center=rotated.bbox_center,
+        )
+        raw_path = triplet_paths[role]
+        preprocessed = PreprocessedContactlessImage(
+            raw_gray=segmented.raw_gray,
+            normalized_gray=raw_parts[role].enhanced,
+            pose_normalized_gray=pose_gray,
+            pose_normalized_mask=pose_mask,
+            preprocessed_gray=pose_gray,
+            final_mask=pose_mask,
+            mask_source=f"{segmented.mask_source}_triplet_shared_preprocess",
+            pose_rotation_degrees=rotated.yaw_angle,
+            ridge_scale_factor=shared_scale,
+        )
+        preprocessed_views[role] = preprocessed
+        view_geometries[role] = _build_reconstruction_view_geometry(role, raw_path, preprocessed)
+        role_meta[role] = {
+            "yaw_angle": float(rotated.yaw_angle),
+            "placement_offset_xy": [int(placement_offset[0]), int(placement_offset[1])],
+            "bbox_center_xy_before_placement": [float(rotated.bbox_center[0]), float(rotated.bbox_center[1])],
+            "scaled_rotated_shape_hw": [int(rotated.image.shape[0]), int(rotated.image.shape[1])],
+            "mask_source": preprocessed.mask_source,
+        }
+
+    meta = {
+        "front_ridge_period": front_ridge_period,
+        "shared_scale": shared_scale,
+        "canvas_shape_hw": [int(canvas_h), int(canvas_w)],
+        "canvas_center_xy": [float(canvas_center[0]), float(canvas_center[1])],
+        "roles": role_meta,
+    }
+    return preprocessed_views, view_geometries, meta
+
+
+def _load_triplet_preprocessed_for_sample(
+    sample: RawViewSample,
+    raw_gray: np.ndarray,
+    reconstruction: AcquisitionReconstructionResult | None,
+) -> PreprocessedContactlessImage | None:
+    if reconstruction is None:
+        return None
+    role = _view_role_for_sample(sample)
+    if role is None:
+        return None
+    role_paths = reconstruction.debug_view_paths.get(role, {})
+    pose_path = role_paths.get("preprocessed_input") or role_paths.get("pose_normalized")
+    mask_path = role_paths.get("pose_mask")
+    normalized_path = role_paths.get("normalized_input")
+    if not pose_path or not mask_path:
+        return None
+    pose_gray = _require_grayscale(Path(pose_path))
+    pose_mask = np.where(_require_grayscale(Path(mask_path)) > 0, 255, 0).astype(np.uint8)
+    normalized_gray = _require_grayscale(Path(normalized_path)) if normalized_path else raw_gray
+    preprocess_meta = getattr(reconstruction, "triplet_preprocess", {}) or {}
+    role_meta = (preprocess_meta.get("roles") or {}).get(role, {})
+    shared_scale = float(preprocess_meta.get("shared_scale", 1.0))
+    yaw_angle = float(role_meta.get("yaw_angle", 0.0))
+    return PreprocessedContactlessImage(
+        raw_gray=raw_gray,
+        normalized_gray=normalized_gray,
+        pose_normalized_gray=pose_gray,
+        pose_normalized_mask=pose_mask,
+        preprocessed_gray=pose_gray,
+        final_mask=pose_mask,
+        mask_source=f"{role_meta.get('mask_source', 'triplet_shared_preprocess')}_training_frame",
+        pose_rotation_degrees=yaw_angle,
+        ridge_scale_factor=shared_scale,
     )
 
 
@@ -3511,21 +3771,14 @@ def _reconstruct_multiview_acquisition_from_segmented(
     if triplet_paths is None:
         raise RuntimeError("missing one or more required reconstruction views 0/1/2")
 
-    preprocessed_views: dict[str, PreprocessedContactlessImage] = {}
-    view_geometries: dict[str, ReconstructionViewGeometry] = {}
-    for role, raw_view_path in triplet_paths.items():
-        if segmented_views is not None and role in segmented_views:
-            preprocessed, geometry = _extract_reconstruction_view_geometry_from_segment(role, segmented_views[role])
-        else:
-            preprocessed, geometry = _extract_reconstruction_view_geometry(role, raw_view_path)
-        preprocessed_views[role] = preprocessed
-        view_geometries[role] = geometry
+    preprocessed_views, view_geometries, triplet_preprocess_meta = _preprocess_reconstruction_triplet_from_segments(
+        triplet_paths,
+        segmented_views=segmented_views,
+    )
 
     front_geometry = view_geometries["front"]
     left_geometry = view_geometries["left"]
     right_geometry = view_geometries["right"]
-    if left_geometry.image_shape != front_geometry.image_shape or right_geometry.image_shape != front_geometry.image_shape:
-        raise RuntimeError("pose-normalized masks do not share a common image shape")
 
     height, width = front_geometry.image_shape
     valid_rows = front_geometry.valid_rows & left_geometry.valid_rows & right_geometry.valid_rows
@@ -3626,11 +3879,13 @@ def _reconstruct_multiview_acquisition_from_segmented(
         preprocessed = preprocessed_views[role]
         role_paths = {
             "raw_input": debug_views_dir / f"{role}_raw_input.png",
+            "normalized_input": debug_views_dir / f"{role}_normalized_input.png",
             "pose_normalized": debug_views_dir / f"{role}_pose_normalized.png",
             "pose_mask": debug_views_dir / f"{role}_pose_mask.png",
             "preprocessed_input": debug_views_dir / f"{role}_preprocessed_input.png",
         }
         _write_image(role_paths["raw_input"], load_bgr_image(raw_path))
+        _write_image(role_paths["normalized_input"], preprocessed.normalized_gray)
         _write_image(role_paths["pose_normalized"], preprocessed.pose_normalized_gray)
         _write_image(role_paths["pose_mask"], preprocessed.pose_normalized_mask)
         _write_image(role_paths["preprocessed_input"], preprocessed.preprocessed_gray)
@@ -3764,7 +4019,8 @@ def _reconstruct_multiview_acquisition_from_segmented(
         "acquisition_index": sample.acquisition_id,
         "input_views": {role: str(path.resolve()) for role, path in triplet_paths.items()},
         "view_roles": {"0": "front", "1": "left", "2": "right"},
-        "geometry_space": "pose_normalized_pre_scale_mask",
+        "geometry_space": "triplet_shared_canvas_pose_normalized_mask",
+        "triplet_preprocess": triplet_preprocess_meta,
         "algorithm": {
             "name": "multiview_ellipse_reconstruction",
             "front_formula": "z_up = (b/a)*sqrt(max(a^2 - x^2, 0)) + c_z",
@@ -3878,6 +4134,7 @@ def _reconstruct_multiview_acquisition_from_segmented(
         support_pixel_count=int(np.count_nonzero(support_mask)),
         input_view_paths={role: str(path.resolve()) for role, path in triplet_paths.items()},
         debug_view_paths=debug_view_paths,
+        triplet_preprocess=triplet_preprocess_meta,
     )
 
 
@@ -4890,7 +5147,9 @@ def _prepare_bundle_from_segmented(
     reconstruction: AcquisitionReconstructionResult | None,
     dpi: int,
 ) -> PreparedBundleArtifacts:
-    preprocessed = _preprocess_contactless_segment_cpu(raw_gray, initial_mask, mask_source)
+    preprocessed = _load_triplet_preprocessed_for_sample(sample, raw_gray, reconstruction)
+    if preprocessed is None:
+        preprocessed = _preprocess_contactless_segment_cpu(raw_gray, initial_mask, mask_source)
     gray_image = preprocessed.preprocessed_gray
     mask = preprocessed.final_mask.copy()
     cpu_started_at = time.perf_counter()
@@ -5111,6 +5370,7 @@ def _build_bundle_meta(
             "surface_all_branches_3d_png_path": prepared.reconstruction.surface_all_branches_3d_png_path,
             "reprojection_report_path": prepared.reconstruction.reprojection_report_path,
             "reprojection_preview_path": prepared.reconstruction.reprojection_preview_path,
+            "triplet_preprocess": prepared.reconstruction.triplet_preprocess,
         }
     if minutiae_ground_truth_details is not None:
         minutiae_details = dict(minutiae_ground_truth_details)
@@ -5166,6 +5426,79 @@ def _persist_bundle(payload: BundleWritePayload) -> None:
             payload.minutiae,
         )
     _record_stage_time("write_bundle", time.perf_counter() - started_at)
+
+
+def _quality_skip_record(
+    prepared: PreparedBundleArtifacts,
+    built_targets: BuiltBundleTargets,
+) -> dict[str, Any]:
+    sample = prepared.sample
+    role = _view_role_for_sample(sample)
+    details = dict(built_targets.minutiae_ground_truth_details or {})
+    acquisition_id = (
+        prepared.reconstruction.acquisition_id
+        if prepared.reconstruction is not None
+        else _acquisition_name(sample.subject_id, sample.finger_id, sample.acquisition_id)
+    )
+    record: dict[str, Any] = {
+        "sample_id": sample.sample_id,
+        "raw_view_index": sample.raw_view_index,
+        "view_role": role,
+        "acquisition_id": acquisition_id,
+        "reason": "insufficient_reconstruction_minutiae",
+        "minimum_rasterized_minutiae": int(MIN_RASTERIZED_MINUTIAE_FOR_RECONSTRUCTION),
+        "rasterized_minutiae_count": int(built_targets.rasterized_count),
+        "minutiae_count": int(len(built_targets.minutiae)),
+        "minutiae_source": built_targets.minutiae_source,
+        "minutiae_gt_mode": details.get("mode"),
+        "bundle_dir": str(prepared.bundle_dir.resolve()),
+    }
+    for key in (
+        "canonical_minutiae_count",
+        "canonical_unwrapped_minutiae_count",
+        "canonical_single_source_candidate_count",
+        "canonical_unwrapped_single_source_candidate_count",
+        "reprojected_minutiae_count",
+        "reprojected_single_source_candidate_count",
+        "single_source_candidate_count",
+    ):
+        if key in details:
+            try:
+                record[key] = int(details[key])
+            except (TypeError, ValueError):
+                record[key] = details[key]
+    if isinstance(details.get("consensus_counts"), dict):
+        record["consensus_counts"] = {
+            str(key): int(value)
+            for key, value in details["consensus_counts"].items()
+            if isinstance(value, (int, float, np.integer, np.floating))
+        }
+    return record
+
+
+def _persist_quality_skip_marker(
+    prepared: PreparedBundleArtifacts,
+    built_targets: BuiltBundleTargets,
+) -> dict[str, Any]:
+    bundle_dir = prepared.bundle_dir
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+    for name in QUALITY_SKIP_LOAD_BEARING_FILES:
+        path = bundle_dir / name
+        if path.exists():
+            path.unlink()
+    record = _quality_skip_record(prepared, built_targets)
+    (bundle_dir / "quality_skip.json").write_text(json.dumps(record, indent=2), encoding="utf-8")
+    return record
+
+
+def _record_quality_skip(
+    prepared: PreparedBundleArtifacts,
+    built_targets: BuiltBundleTargets,
+    quality_skips: list[dict[str, Any]],
+) -> dict[str, Any]:
+    record = _persist_quality_skip_marker(prepared, built_targets)
+    quality_skips.append(record)
+    return record
 
 
 def _build_reprojected_targets_cpu(
@@ -5954,11 +6287,17 @@ def _run_smoke_test(output_root: Path, sample_count: int) -> dict[str, Any] | No
     }
 
 
-def _summarize_minutiae_generation_results(generation_results: dict[str, dict[str, Any]]) -> dict[str, Any]:
+def _summarize_minutiae_generation_results(
+    generation_results: dict[str, dict[str, Any]],
+    quality_skips: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     """Aggregate final minutiae supervision quality by view role and mode."""
+    quality_skips = quality_skips or []
     summary: dict[str, Any] = {
         "total_samples": 0,
         "zero_rasterized_minutiae_samples": 0,
+        "quality_skipped_samples": 0,
+        "by_quality_skip_reason": {},
         "by_view_role": {},
         "by_raw_view_index": {},
         "by_mode": {},
@@ -5975,6 +6314,7 @@ def _summarize_minutiae_generation_results(generation_results: dict[str, dict[st
                 "rasterized_minutiae_count_max": None,
                 "used_reconstruction_backed_final_labels": 0,
                 "used_direct_fallback": 0,
+                "quality_skipped_samples": 0,
             }
         return container[key]
 
@@ -6006,6 +6346,15 @@ def _summarize_minutiae_generation_results(generation_results: dict[str, dict[st
         update_bucket(ensure_bucket(summary["by_view_role"], role), result, rasterized)
         update_bucket(ensure_bucket(summary["by_raw_view_index"], raw_view), result, rasterized)
         update_bucket(ensure_bucket(summary["by_mode"], mode), result, rasterized)
+
+    for skip in quality_skips:
+        summary["quality_skipped_samples"] += 1
+        role = str(skip.get("view_role") or "none")
+        raw_view = str(skip.get("raw_view_index"))
+        reason = str(skip.get("reason") or "unknown")
+        ensure_bucket(summary["by_view_role"], role)["quality_skipped_samples"] += 1
+        ensure_bucket(summary["by_raw_view_index"], raw_view)["quality_skipped_samples"] += 1
+        summary["by_quality_skip_reason"][reason] = int(summary["by_quality_skip_reason"].get(reason, 0)) + 1
 
     for container_name in ("by_view_role", "by_raw_view_index", "by_mode"):
         for bucket in summary[container_name].values():
@@ -6420,9 +6769,40 @@ def _validate_generated_merge_root(source_root: Path) -> tuple[Path, Path]:
     return manifest_path, summary_path
 
 
-def _merge_generated_ground_truth_roots(merge_sources: list[tuple[str, Path]], output_root: Path) -> dict[str, Any]:
+def _symlink_copy_function(src: str, dst: str) -> None:
+    os.symlink(Path(src).resolve(), dst)
+
+
+def _linktree_with_writable_meta(source_dir: Path, destination_dir: Path) -> None:
+    shutil.copytree(source_dir, destination_dir, copy_function=_symlink_copy_function)
+    source_meta_path = source_dir / "meta.json"
+    destination_meta_path = destination_dir / "meta.json"
+    if source_meta_path.exists():
+        if destination_meta_path.exists() or destination_meta_path.is_symlink():
+            destination_meta_path.unlink()
+        shutil.copy2(source_meta_path, destination_meta_path)
+
+
+def _merge_tree(source_dir: Path, destination_dir: Path, *, link_mode: str) -> None:
+    if link_mode == "copy":
+        shutil.copytree(source_dir, destination_dir)
+    elif link_mode == "symlink":
+        _linktree_with_writable_meta(source_dir, destination_dir)
+    else:
+        raise ValueError(f"unsupported merge link mode: {link_mode}")
+
+
+def _merge_generated_ground_truth_roots(
+    merge_sources: list[tuple[str, Path]],
+    output_root: Path,
+    *,
+    link_mode: str = "copy",
+) -> dict[str, Any]:
     if output_root.exists() and any(output_root.iterdir()):
         raise RuntimeError(f"refusing to merge into non-empty output root {output_root}")
+
+    if link_mode not in {"copy", "symlink"}:
+        raise ValueError(f"--merge-link-mode must be one of copy, symlink; got {link_mode!r}")
 
     output_root.mkdir(parents=True, exist_ok=True)
     merged_samples_dir = output_root / "samples"
@@ -6480,7 +6860,7 @@ def _merge_generated_ground_truth_roots(merge_sources: list[tuple[str, Path]], o
             destination_sample_dir = merged_samples_dir / merged_sample_id
             if destination_sample_dir.exists():
                 raise RuntimeError(f"duplicate merged sample bundle directory: {destination_sample_dir.name}")
-            shutil.copytree(source_sample_dir, destination_sample_dir)
+            _merge_tree(source_sample_dir, destination_sample_dir, link_mode=link_mode)
             copied_bundle_count += 1
 
             updated_meta = _rewrite_merged_bundle_meta(
@@ -6511,7 +6891,7 @@ def _merge_generated_ground_truth_roots(merge_sources: list[tuple[str, Path]], o
                 continue
 
             destination_reconstruction_dir = merged_recon_dir / merged_reconstruction_id
-            shutil.copytree(source_reconstruction_dir, destination_reconstruction_dir)
+            _merge_tree(source_reconstruction_dir, destination_reconstruction_dir, link_mode=link_mode)
             _rewrite_merged_reconstruction_meta(
                 destination_reconstruction_dir / "meta.json",
                 merged_acquisition_id=merged_reconstruction_id,
@@ -6544,6 +6924,7 @@ def _merge_generated_ground_truth_roots(merge_sources: list[tuple[str, Path]], o
     _write_manifest(merged_samples, output_root)
     summary = {
         "merge_strategy": "merge_generated_roots_with_global_identity_remap",
+        "merge_link_mode": link_mode,
         "output_root": str(output_root.resolve()),
         "merged_bundle_count": sum(item["copied_bundle_count"] for item in merged_source_summaries),
         "merged_reconstruction_count": len(copied_reconstruction_ids),
@@ -6566,6 +6947,12 @@ def parse_args() -> argparse.Namespace:
         action="append",
         default=None,
         help="Merge separately generated ground-truth roots into --output-root. Pass LABEL=PATH, or PATH to infer LABEL from the folder name.",
+    )
+    parser.add_argument(
+        "--merge-link-mode",
+        choices=("copy", "symlink"),
+        default="copy",
+        help="Storage mode for --merge-generated-root bundles. 'copy' duplicates files; 'symlink' links payload files and writes fresh merged metadata.",
     )
     parser.add_argument("--execution-target", choices=("local", "kaggle"), default="local")
     parser.add_argument("--gpu-only", action="store_true", help="Require GPU-backed providers for model-backed stages.")
@@ -6632,6 +7019,7 @@ def main() -> int:
         merged_summary = _merge_generated_ground_truth_roots(
             _parse_merge_generated_roots(args.merge_generated_root),
             args.output_root.resolve(),
+            link_mode=args.merge_link_mode,
         )
         print(json.dumps(merged_summary, indent=2))
         return 0
@@ -6733,6 +7121,7 @@ def main() -> int:
     generated = 0
     skipped_existing = 0
     errors: list[dict[str, str]] = []
+    quality_skips: list[dict[str, Any]] = []
     reconstruction_results: dict[tuple[int, int, int], AcquisitionReconstructionResult] = {}
     reconstruction_errors: list[dict[str, str]] = []
     cpu_executor = _make_cpu_executor(runtime_config.cpu_workers)
@@ -6740,12 +7129,13 @@ def main() -> int:
     pending_writes: list[Future[None]] = []
 
     def emit_progress(status: str, sample_id: str | None = None) -> None:
-        finalized = generated + skipped_existing + len(errors)
+        finalized = generated + skipped_existing + len(errors) + len(quality_skips)
         left = max(total_requested - finalized, 0)
         sample_suffix = f" sample={sample_id}" if sample_id else ""
         print(
             f"[progress] status={status}{sample_suffix} completed={finalized}/{total_requested} "
-            f"left={left} generated={generated} skipped={skipped_existing} errors={len(errors)}",
+            f"left={left} generated={generated} skipped={skipped_existing} "
+            f"quality_skipped={len(quality_skips)} errors={len(errors)}",
             flush=True,
         )
 
@@ -6849,6 +7239,11 @@ def main() -> int:
         pending_writes.append(write_executor.submit(_persist_bundle, write_payload))
         generated += 1
         emit_progress("generated", prepared.sample.sample_id)
+
+    def quality_skip_targets(prepared: PreparedBundleArtifacts, built_targets: BuiltBundleTargets) -> None:
+        _merge_stage_seconds(built_targets.stage_seconds)
+        _record_quality_skip(prepared, built_targets, quality_skips)
+        emit_progress("skipped_quality", prepared.sample.sample_id)
 
     try:
         print(f"[progress] starting total={total_requested}", flush=True)
@@ -6994,10 +7389,7 @@ def main() -> int:
                 try:
                     built_targets = future.result()
                     if kind in {"front_reprojected", "canonical_reprojected"} and built_targets.rasterized_count < MIN_RASTERIZED_MINUTIAE_FOR_RECONSTRUCTION:
-                        raise RuntimeError(
-                            "consensus reconstruction-backed minutiae produced fewer than "
-                            f"{MIN_RASTERIZED_MINUTIAE_FOR_RECONSTRUCTION} rasterized minutiae"
-                        )
+                        quality_skip_targets(prepared, built_targets)
                     else:
                         finalize_targets(prepared, built_targets)
                 except Exception as exc:
@@ -7015,7 +7407,7 @@ def main() -> int:
             cpu_executor.shutdown(wait=True)
         write_executor.shutdown(wait=True)
 
-    minutiae_audit = _summarize_minutiae_generation_results(generation_results)
+    minutiae_audit = _summarize_minutiae_generation_results(generation_results, quality_skips)
     (output_root / "minutiae_audit.json").write_text(json.dumps(minutiae_audit, indent=2), encoding="utf-8")
     smoke = _run_smoke_test(output_root, args.smoke_samples)
     summary = {
@@ -7026,6 +7418,8 @@ def main() -> int:
         "verification": verification,
         "generated_bundle_count": generated,
         "skipped_existing_bundle_count": skipped_existing,
+        "quality_skipped_bundle_count": len(quality_skips),
+        "quality_skips": quality_skips,
         "requested_limit": args.limit,
         "visualize_count": args.visualize_count,
         "runtime": runtime_summary,

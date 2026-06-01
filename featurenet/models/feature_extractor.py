@@ -1,4 +1,110 @@
-def forward(self, x, mask=None):
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from .blocks import ConvBlock
+
+
+class FeatureExtractor(nn.Module):
+    def __init__(self):
+        super().__init__()
+        # branch 1
+        self.branch1 = nn.Sequential(
+            ConvBlock(2, 64, kernel_size=3, stride=1, padding=1),
+            ConvBlock(64, 64, kernel_size=3, stride=1, padding=1),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            ConvBlock(64, 128, kernel_size=3, stride=1, padding=1),
+            ConvBlock(128, 128, kernel_size=3, stride=1, padding=1),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            ConvBlock(128, 256, kernel_size=3, stride=1, padding=1),
+            ConvBlock(256, 256, kernel_size=3, stride=1, padding=1),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+        )
+
+        # Ridge branch stems
+        self.branch_stem_ridge = nn.Sequential(
+            ConvBlock(256, 256, kernel_size=3, stride=1, padding=1),
+            ConvBlock(256, 256, kernel_size=3, stride=1, padding=1),
+            ConvBlock(256, 256, kernel_size=3, stride=1, padding=1),
+        )
+
+        self.branch_stem_orient = nn.Sequential(
+            ConvBlock(256, 256, kernel_size=3, stride=1, padding=1),
+            ConvBlock(256, 256, kernel_size=3, stride=1, padding=1),
+            ConvBlock(256, 256, kernel_size=3, stride=1, padding=1),
+        )
+
+        # branch 2 (minutiae branch), exposed stages for /4 and /8 localization features
+        self.branch2_conv1 = ConvBlock(2, 64, kernel_size=9, stride=1, padding=4)
+        self.branch2_pool1 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.branch2_conv2 = ConvBlock(64, 128, kernel_size=5, stride=1, padding=2)
+        self.branch2_pool2 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.branch2_conv3 = ConvBlock(128, 256, kernel_size=3, stride=1, padding=1)
+        self.branch2_pool3 = nn.MaxPool2d(kernel_size=2, stride=2)
+
+        self.ridge_conv = nn.Conv2d(256, 1, kernel_size=1, stride=1, padding=0)
+        self.gradient_conv = nn.Sequential(
+            ConvBlock(256, 256, kernel_size=3, stride=1, padding=1),
+            ConvBlock(256, 256, kernel_size=3, stride=1, padding=1),
+            ConvBlock(256, 256, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(256, 2, kernel_size=1, stride=1, padding=0),
+        )
+        self.orientation_conv = nn.Conv2d(256, 180, kernel_size=1, stride=1, padding=0)
+
+        self.minuiae_orient_head = nn.Sequential(
+            ConvBlock(384, 256, kernel_size=1, stride=1, padding=0),
+            nn.Conv2d(256, 2, kernel_size=1, stride=1, padding=0),
+        )
+
+        # score head uses fused /8 minutiae features plus pooled /4 context.
+        self.minutiae_score_head = nn.Sequential(
+            ConvBlock(384, 256, kernel_size=3, stride=1, padding=1),
+            ConvBlock(256, 256, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(256, 1, kernel_size=1, stride=1, padding=0),
+        )
+
+        # x/y localization fusion path: /4 shallow + upsampled /8 deep -> /4 refine
+        self.xy_fuse_conv1 = ConvBlock(384, 256, kernel_size=3, stride=1, padding=1)
+        self.xy_fuse_conv2 = ConvBlock(256, 256, kernel_size=3, stride=1, padding=1)
+
+        # Patch-aware /8 descriptor: preserve each 2x2 /4 neighborhood per /8 cell via pixel_unshuffle.
+        self.xy_patch_refine1 = ConvBlock(1024, 256, kernel_size=1, stride=1, padding=0)
+        self.xy_patch_refine2 = ConvBlock(256, 256, kernel_size=3, stride=1, padding=1)
+
+        # x/y context refinement: fused patch-local feature + deep minutiae/orientation/ridge context
+        self.xy_context_refine = nn.Sequential(
+            ConvBlock(1024, 256, kernel_size=3, stride=1, padding=1),
+            ConvBlock(256, 256, kernel_size=3, stride=1, padding=1),
+        )
+
+        # continuous x/y offsets: one raw logit per /8 score cell
+        self.minutia_head_x = nn.Sequential(
+            ConvBlock(256, 256, kernel_size=1, stride=1, padding=0),
+            nn.Conv2d(256, 1, kernel_size=1, stride=1, padding=0),
+        )
+        self.minutia_head_y = nn.Sequential(
+            ConvBlock(256, 256, kernel_size=1, stride=1, padding=0),
+            nn.Conv2d(256, 1, kernel_size=1, stride=1, padding=0),
+        )
+
+    @staticmethod
+    def _pad_bottom_right_to_even(x: torch.Tensor) -> torch.Tensor:
+        pad_h = x.shape[-2] % 2
+        pad_w = x.shape[-1] % 2
+        if pad_h == 0 and pad_w == 0:
+            return x
+        return F.pad(x, (0, pad_w, 0, pad_h))
+
+    @staticmethod
+    def _crop_to_spatial_shape(x: torch.Tensor, shape: tuple[int, int]) -> torch.Tensor:
+        target_h, target_w = int(shape[0]), int(shape[1])
+        if x.shape[-2] < target_h or x.shape[-1] < target_w:
+            raise ValueError(
+                f"cannot crop tensor with shape {tuple(x.shape[-2:])} to larger target {(target_h, target_w)}"
+            )
+        return x[:, :, :target_h, :target_w]
+
+    def forward(self, x, mask=None):
         if mask is not None:
             image = x * mask
             x = torch.cat([image, mask], dim=1)
@@ -27,24 +133,23 @@ def forward(self, x, mask=None):
         grad = self.gradient_conv(ridge_interim)
         orient = self.orientation_conv(orient_interim)
 
-        # In forward(), replace the minu_orient section:
         orient_at_4x = F.interpolate(
-            orient_interim, 
+            orient_interim,
             size=branch2_feat_4x.shape[-2:],
-            mode="bilinear", 
+            mode="bilinear",
             align_corners=False,
         )
-        minu_orient_input = torch.cat([branch2_feat_4x, orient_at_4x], dim=1)  # 128+256=384ch
+        minu_orient_input = torch.cat([branch2_feat_4x, orient_at_4x], dim=1)
         minu_orient = self.minuiae_orient_head(minu_orient_input)
         # minu_orient is now at /4 resolution; downsample to /8 to match score head
         minu_orient = F.avg_pool2d(minu_orient, kernel_size=2, stride=2)
         minu_orient = self._crop_to_spatial_shape(minu_orient, branch2_feat_8x.shape[-2:])
 
         # score remains on deep /8 features
-        score_4x = F.avg_pool2d(branch2_feat_4x, kernel_size=2, stride=2)  # /4 → /8
+        score_4x = F.avg_pool2d(branch2_feat_4x, kernel_size=2, stride=2)
         score_4x = self._crop_to_spatial_shape(score_4x, branch2_feat_8x.shape[-2:])
 
-        score_input = torch.cat([branch2_feat_8x, score_4x], dim=1)  # 256+128=384ch
+        score_input = torch.cat([branch2_feat_8x, score_4x], dim=1)
         minu_score = self.minutiae_score_head(score_input)
 
         # x/y localization from fused /4 + /8 context.

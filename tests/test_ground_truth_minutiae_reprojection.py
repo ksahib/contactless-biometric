@@ -44,6 +44,57 @@ class GroundTruthMinutiaeReprojectionTests(unittest.TestCase):
             debug_view_paths={},
         )
 
+    def _make_sample(self, tmp_path: Path, *, raw_view_index: int = 0) -> gt.RawViewSample:
+        return gt.RawViewSample(
+            sample_id=f"s01_f01_a01_v{raw_view_index:02d}",
+            subject_id=1,
+            subject_index=0,
+            finger_id=1,
+            acquisition_id=1,
+            finger_class_id=0,
+            raw_image_path=str(tmp_path / f"raw_{raw_view_index}.png"),
+            raw_view_index=raw_view_index,
+            sire_path=None,
+            raw_view_paths=[str(tmp_path / f"raw_{idx}.png") for idx in range(3)],
+            variant_paths={},
+            is_extra_acquisition=False,
+        )
+
+    def _make_prepared(
+        self,
+        tmp_path: Path,
+        *,
+        raw_view_index: int = 0,
+        reconstruction: gt.AcquisitionReconstructionResult | None = None,
+    ) -> gt.PreparedBundleArtifacts:
+        sample = self._make_sample(tmp_path, raw_view_index=raw_view_index)
+        return gt.PreparedBundleArtifacts(
+            sample=sample,
+            bundle_dir=tmp_path / "bundle",
+            image_path=Path(sample.raw_image_path),
+            preprocessed=gt.PreprocessedContactlessImage(
+                raw_gray=np.zeros((16, 16), dtype=np.uint8),
+                normalized_gray=np.zeros((16, 16), dtype=np.uint8),
+                pose_normalized_gray=np.zeros((16, 16), dtype=np.uint8),
+                pose_normalized_mask=np.ones((16, 16), dtype=np.uint8),
+                preprocessed_gray=np.zeros((16, 16), dtype=np.uint8),
+                final_mask=np.ones((16, 16), dtype=np.uint8),
+                mask_source="test",
+                pose_rotation_degrees=0.0,
+                ridge_scale_factor=1.0,
+            ),
+            gray_image=np.zeros((16, 16), dtype=np.uint8),
+            mask=np.ones((16, 16), dtype=np.uint8),
+            orientation=np.zeros((16, 16), dtype=np.float32),
+            ridge_period=np.zeros((16, 16), dtype=np.float32),
+            visualization_gradient=np.zeros((16, 16, 2), dtype=np.float32),
+            reconstruction_gradient=None,
+            masked_image=np.zeros((16, 16), dtype=np.uint8),
+            enhanced_image=np.zeros((16, 16), dtype=np.uint8),
+            visualize=False,
+            reconstruction=reconstruction,
+        )
+
     def test_downsample_mask_for_points_keeps_any_foreground_pixel(self):
         mask = np.zeros((16, 16), dtype=np.uint8)
         mask[1, 1] = 255
@@ -301,6 +352,136 @@ class GroundTruthMinutiaeReprojectionTests(unittest.TestCase):
         self.assertEqual(geometry.image_shape, (8, 8))
         self.assertTrue(np.all(geometry.valid_rows))
 
+    def test_triplet_preprocessing_uses_front_scale_and_shared_canvas(self):
+        triplet_paths = {
+            "front": Path("front.jpg"),
+            "left": Path("left.jpg"),
+            "right": Path("right.jpg"),
+        }
+        segmented = {
+            "front": gt.SegmentedContactlessInput(
+                raw_image_path=str(triplet_paths["front"].resolve()),
+                raw_gray=np.full((20, 12), 20, dtype=np.uint8),
+                initial_mask=np.ones((20, 12), dtype=np.uint8) * 255,
+                mask_source="front_mask",
+            ),
+            "left": gt.SegmentedContactlessInput(
+                raw_image_path=str(triplet_paths["left"].resolve()),
+                raw_gray=np.full((16, 10), 40, dtype=np.uint8),
+                initial_mask=np.ones((16, 10), dtype=np.uint8) * 255,
+                mask_source="left_mask",
+            ),
+            "right": gt.SegmentedContactlessInput(
+                raw_image_path=str(triplet_paths["right"].resolve()),
+                raw_gray=np.full((24, 14), 60, dtype=np.uint8),
+                initial_mask=np.ones((24, 14), dtype=np.uint8) * 255,
+                mask_source="right_mask",
+            ),
+        }
+
+        def fake_scale(image, mask, **_kwargs):
+            return image.copy(), mask.copy(), 8.0, 1.25
+
+        fake_preprocess = gt.SimpleNamespace(
+            _masked_clahe=mock.Mock(side_effect=lambda image, _mask: image.copy()),
+            circular_mask=mock.Mock(side_effect=lambda mask: mask.copy()),
+            scale_to_paper_ridge_period=mock.Mock(side_effect=fake_scale),
+            rotate_to_vertical_centerline=mock.Mock(side_effect=lambda image, mask: (image.copy(), mask.copy(), 0.0)),
+        )
+
+        with mock.patch.object(gt, "solov2_preprocess", fake_preprocess):
+            preprocessed, geometries, meta = gt._preprocess_reconstruction_triplet_from_segments(
+                triplet_paths,
+                segmented_views=segmented,
+            )
+
+        shapes = {role: item.pose_normalized_gray.shape for role, item in preprocessed.items()}
+        self.assertEqual(len(set(shapes.values())), 1)
+        height, width = next(iter(shapes.values()))
+        self.assertEqual(height % 8, 0)
+        self.assertEqual(width % 8, 0)
+        self.assertEqual(meta["front_ridge_period"], 8.0)
+        self.assertEqual(meta["shared_scale"], 1.25)
+        for role in ("front", "left", "right"):
+            self.assertEqual(preprocessed[role].ridge_scale_factor, 1.25)
+            self.assertEqual(geometries[role].image_shape, (height, width))
+            self.assertTrue(np.any(geometries[role].valid_rows))
+
+    def test_reconstructed_bundle_uses_shared_triplet_training_frame(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            shared_image = np.arange(64, dtype=np.uint8).reshape(8, 8)
+            shared_mask = np.zeros((8, 8), dtype=np.uint8)
+            shared_mask[2:6, 2:6] = 255
+            normalized = np.full((4, 4), 33, dtype=np.uint8)
+            pose_path = tmp_path / "front_preprocessed_input.png"
+            mask_path = tmp_path / "front_pose_mask.png"
+            normalized_path = tmp_path / "front_normalized_input.png"
+            gt._write_image(pose_path, shared_image)
+            gt._write_image(mask_path, shared_mask)
+            gt._write_image(normalized_path, normalized)
+            gradient_path = tmp_path / "depth_gradient_labels.npz"
+            np.savez(
+                gradient_path,
+                gradient_front=np.zeros((2, 8, 8), dtype=np.float32),
+                gradient_left=np.zeros((2, 8, 8), dtype=np.float32),
+                gradient_right=np.zeros((2, 8, 8), dtype=np.float32),
+            )
+            reconstruction = self._make_reconstruction(tmp_path)
+            reconstruction.depth_gradient_labels_path = str(gradient_path)
+            reconstruction.debug_view_paths = {
+                "front": {
+                    "preprocessed_input": str(pose_path),
+                    "pose_mask": str(mask_path),
+                    "normalized_input": str(normalized_path),
+                }
+            }
+            reconstruction.triplet_preprocess = {
+                "shared_scale": 1.25,
+                "roles": {"front": {"yaw_angle": -3.0, "mask_source": "solov2_triplet_shared_preprocess"}},
+            }
+            sample = gt.RawViewSample(
+                sample_id="s01_f01_a01_v00",
+                subject_id=1,
+                subject_index=0,
+                finger_id=1,
+                acquisition_id=1,
+                finger_class_id=0,
+                raw_image_path=str(tmp_path / "raw.png"),
+                raw_view_index=0,
+                sire_path=None,
+                raw_view_paths=[str(tmp_path / f"raw_{idx}.png") for idx in range(3)],
+                variant_paths={},
+                is_extra_acquisition=False,
+            )
+
+            with (
+                mock.patch.object(
+                    gt,
+                    "_preprocess_contactless_segment_cpu",
+                    side_effect=AssertionError("direct preprocessing should not run"),
+                ),
+                mock.patch.object(gt.pyfing, "orientation_field_estimation", return_value=np.zeros((8, 8), dtype=np.float32)),
+                mock.patch.object(gt.pyfing, "frequency_estimation", return_value=np.ones((8, 8), dtype=np.float32)),
+                mock.patch.object(gt, "_enhance_for_minutiae", side_effect=lambda image: image.copy()),
+            ):
+                prepared = gt._prepare_bundle_from_segmented(
+                    sample=sample,
+                    image_path=tmp_path / "raw.png",
+                    raw_gray=np.zeros((4, 4), dtype=np.uint8),
+                    initial_mask=np.ones((4, 4), dtype=np.uint8) * 255,
+                    mask_source="solov2",
+                    visualize=False,
+                    bundle_dir=tmp_path / "bundle",
+                    reconstruction=reconstruction,
+                    dpi=gt.DEFAULT_DPI,
+                )
+
+        self.assertTrue(np.array_equal(prepared.gray_image, shared_image))
+        self.assertTrue(np.array_equal(prepared.mask, shared_mask))
+        self.assertEqual(prepared.preprocessed.ridge_scale_factor, 1.25)
+        self.assertEqual(prepared.preprocessed.pose_rotation_degrees, -3.0)
+
     def test_collect_reconstruction_candidates_keeps_one_sample_per_acquisition(self):
         raw_views = [str(Path(f"1_1_1_{idx}.jpg").resolve()) for idx in range(3)]
         samples = [
@@ -325,6 +506,72 @@ class GroundTruthMinutiaeReprojectionTests(unittest.TestCase):
 
         self.assertEqual(list(candidates.keys()), [(1, 1, 1)])
         self.assertEqual(candidates[(1, 1, 1)].raw_view_index, 0)
+
+    def test_quality_skip_marker_removes_load_bearing_bundle_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            reconstruction = self._make_reconstruction(tmp_path)
+            prepared = self._make_prepared(tmp_path, raw_view_index=1, reconstruction=reconstruction)
+            prepared.bundle_dir.mkdir(parents=True)
+            for name in gt.QUALITY_SKIP_LOAD_BEARING_FILES:
+                (prepared.bundle_dir / name).write_text("stale", encoding="utf-8")
+            built_targets = gt.BuiltBundleTargets(
+                minutiae=[],
+                minutiae_source="pyfing_nbis_fingerflow_consensus_reprojected_left",
+                featurenet_targets={},
+                rasterized_count=0,
+                minutiae_ground_truth_details={
+                    "mode": "reconstruction_backed",
+                    "canonical_unwrapped_minutiae_count": 0,
+                    "reprojected_minutiae_count": 0,
+                    "single_source_candidate_count": 85,
+                    "consensus_counts": {"pyfing_count": 0, "mindtct_count": 85, "fingerflow_count": 0},
+                },
+                stage_seconds={},
+            )
+
+            record = gt._persist_quality_skip_marker(prepared, built_targets)
+            marker = json.loads((prepared.bundle_dir / "quality_skip.json").read_text(encoding="utf-8"))
+
+            for name in gt.QUALITY_SKIP_LOAD_BEARING_FILES:
+                self.assertFalse((prepared.bundle_dir / name).exists(), name)
+            self.assertEqual(record["sample_id"], "s01_f01_a01_v01")
+            self.assertEqual(marker["reason"], "insufficient_reconstruction_minutiae")
+            self.assertEqual(marker["view_role"], "left")
+            self.assertEqual(marker["minimum_rasterized_minutiae"], 1)
+            self.assertEqual(marker["rasterized_minutiae_count"], 0)
+            self.assertEqual(marker["single_source_candidate_count"], 85)
+
+    def test_quality_skip_is_reported_without_direct_fallback_or_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            prepared = self._make_prepared(
+                tmp_path,
+                raw_view_index=1,
+                reconstruction=self._make_reconstruction(tmp_path),
+            )
+            built_targets = gt.BuiltBundleTargets(
+                minutiae=[],
+                minutiae_source="pyfing_nbis_fingerflow_consensus_reprojected_left",
+                featurenet_targets={},
+                rasterized_count=0,
+                minutiae_ground_truth_details={"mode": "reconstruction_backed"},
+                stage_seconds={},
+            )
+            quality_skips: list[dict[str, object]] = []
+            errors: list[dict[str, str]] = []
+
+            with mock.patch.object(gt, "_extract_direct_sample_minutiae") as direct_mock:
+                gt._record_quality_skip(prepared, built_targets, quality_skips)
+
+            direct_mock.assert_not_called()
+            self.assertEqual(errors, [])
+            self.assertEqual(len(quality_skips), 1)
+            audit = gt._summarize_minutiae_generation_results({}, quality_skips)
+            self.assertEqual(audit["quality_skipped_samples"], 1)
+            self.assertEqual(audit["by_view_role"]["left"]["quality_skipped_samples"], 1)
+            self.assertEqual(audit["by_raw_view_index"]["1"]["quality_skipped_samples"], 1)
+            self.assertEqual(audit["by_quality_skip_reason"]["insufficient_reconstruction_minutiae"], 1)
 
     def test_post_rasterization_fallback_after_zero_reconstruction_cells(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -640,6 +887,58 @@ class GroundTruthMinutiaeReprojectionTests(unittest.TestCase):
                     )
 
             direct_mock.assert_not_called()
+
+    def test_generated_root_symlink_merge_links_payload_and_rewrites_meta(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            source_root = tmp_path / "DSX"
+            output_root = tmp_path / "merged"
+            sample = self._make_sample(tmp_path)
+
+            source_sample_dir = source_root / "samples" / sample.sample_id
+            source_sample_dir.mkdir(parents=True)
+            (source_sample_dir / "meta.json").write_text(
+                json.dumps(
+                    {
+                        "sample_id": sample.sample_id,
+                        "subject_id": sample.subject_id,
+                        "subject_index": sample.subject_index,
+                        "finger_class_id": sample.finger_class_id,
+                        "multiview_reconstruction": {"acquisition_id": sample.acquisition_id},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (source_sample_dir / "featurenet_targets.npz").write_bytes(b"payload")
+
+            source_reconstruction_dir = source_root / "reconstructions" / "s01_f01_a01"
+            source_reconstruction_dir.mkdir(parents=True)
+            (source_reconstruction_dir / "meta.json").write_text(
+                json.dumps({"acquisition_id": "s01_f01_a01", "subject_id": sample.subject_id}),
+                encoding="utf-8",
+            )
+            (source_reconstruction_dir / "depth_front.npy").write_bytes(b"depth")
+
+            gt._write_manifest([sample], source_root)
+            gt._write_summary(source_root, {"generated_bundle_count": 1, "errors": []})
+
+            summary = gt._merge_generated_ground_truth_roots(
+                [("dsx", source_root)],
+                output_root,
+                link_mode="symlink",
+            )
+
+            merged_sample_dir = output_root / "samples" / "dsx_s01_f01_a01_v00"
+            merged_reconstruction_dir = output_root / "reconstructions" / "dsx_s01_f01_a01"
+            self.assertEqual(summary["merge_link_mode"], "symlink")
+            self.assertFalse((merged_sample_dir / "meta.json").is_symlink())
+            self.assertTrue((merged_sample_dir / "featurenet_targets.npz").is_symlink())
+            self.assertFalse((merged_reconstruction_dir / "meta.json").is_symlink())
+            self.assertTrue((merged_reconstruction_dir / "depth_front.npy").is_symlink())
+
+            merged_meta = json.loads((merged_sample_dir / "meta.json").read_text(encoding="utf-8"))
+            self.assertEqual(merged_meta["sample_id"], "dsx_s01_f01_a01_v00")
+            self.assertEqual(merged_meta["multiview_reconstruction"]["acquisition_id"], "dsx_s01_f01_a01")
 
 
 if __name__ == "__main__":

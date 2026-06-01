@@ -43,8 +43,15 @@ except Exception:
     _HAS_REMBG = False
 
 
+_FINGERFLOW_ALLOW_CPU_ENV = os.environ.get("FINGERFLOW_ALLOW_CPU", "").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "0")
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1" if _FINGERFLOW_ALLOW_CPU_ENV else "0")
 os.environ.setdefault("TF_FORCE_GPU_ALLOW_GROWTH", "true")
 os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
 
@@ -287,8 +294,9 @@ def _install_numpy_scalar_aliases_compat() -> None:
     except Exception:
         return
 
-    if not hasattr(np, "int"):
-        setattr(np, "int", int)
+    for name, scalar_type in {"bool": bool, "int": int}.items():
+        if name not in np.__dict__:
+            setattr(np, name, scalar_type)
 
 
 def _install_skimage_gaussian_compat() -> None:

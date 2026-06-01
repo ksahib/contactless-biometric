@@ -473,6 +473,23 @@ def _resolve_bridge_command(
     ]
 
 
+def _fingerflow_subprocess_env() -> dict[str, str]:
+    env = os.environ.copy()
+    use_gpu = env.get("FINGERFLOW_USE_GPU", "").lower() in {"1", "true", "yes", "on"}
+    if use_gpu:
+        env.setdefault("FINGERFLOW_ALLOW_CPU", "0")
+        env.setdefault("TF_FORCE_GPU_ALLOW_GROWTH", "true")
+        env.setdefault("TF_GPU_ALLOCATOR", "cuda_malloc_async")
+    else:
+        env["CUDA_VISIBLE_DEVICES"] = "-1"
+        env["NVIDIA_VISIBLE_DEVICES"] = ""
+        env["FINGERFLOW_ALLOW_CPU"] = "1"
+        env["TF_FORCE_GPU_ALLOW_GROWTH"] = "false"
+    env.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+    env.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
+    return env
+
+
 def _extract_fingerflow_minutiae_with_details(
     image_path: Path,
     fingerflow_bin: str,
@@ -486,10 +503,18 @@ def _extract_fingerflow_minutiae_with_details(
     raw_csv = output_dir / "fingerflow_minutiae.csv"
     raw_core_csv = output_dir / "fingerflow_core.csv"
     command = _resolve_bridge_command(fingerflow_bin, image_path, model_dir, raw_json, raw_csv, raw_core_csv)
-    completed = subprocess.run(command, capture_output=True, text=True, check=False)
+    env = _fingerflow_subprocess_env()
+    completed = subprocess.run(command, capture_output=True, text=True, check=False, env=env)
     details = {
         "fingerflow_bin": fingerflow_bin,
         "fingerflow_invocation": command,
+        "fingerflow_env": {
+            "CUDA_VISIBLE_DEVICES": env.get("CUDA_VISIBLE_DEVICES"),
+            "FINGERFLOW_ALLOW_CPU": env.get("FINGERFLOW_ALLOW_CPU"),
+            "FINGERFLOW_USE_GPU": env.get("FINGERFLOW_USE_GPU"),
+            "TF_FORCE_GPU_ALLOW_GROWTH": env.get("TF_FORCE_GPU_ALLOW_GROWTH"),
+            "TF_GPU_ALLOCATOR": env.get("TF_GPU_ALLOCATOR"),
+        },
         "returncode": int(completed.returncode),
         "stdout": completed.stdout,
         "stderr": completed.stderr,

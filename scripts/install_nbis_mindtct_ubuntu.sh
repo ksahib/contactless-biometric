@@ -54,12 +54,18 @@ chmod -R u+rwX "$NBIS_SRC" "$INSTALL_PREFIX"
 
 echo "[5/7] Configuring NBIS"
 ./setup.sh "$INSTALL_PREFIX" --without-X11
-make -C commonnbis config
-make -C mindtct config
+NBIS_CONFIG_PACKAGES="${NBIS_CONFIG_PACKAGES:-ijg png openjp2 commonnbis an2k imgtools mindtct pcasys}"
+NBIS_BUILD_PACKAGES="${NBIS_BUILD_PACKAGES:-ijg png openjp2 commonnbis an2k imgtools mindtct}"
+make PACKAGES="$NBIS_CONFIG_PACKAGES" config
 
 echo "[6/7] Building commonnbis and mindtct"
-make -C commonnbis it
-make -C mindtct it
+for package in $NBIS_CONFIG_PACKAGES; do
+  make -C "$package" cpheaders
+done
+for package in $NBIS_BUILD_PACKAGES; do
+  make -C "$package" libs
+done
+make -C mindtct bins
 
 MINDTCT_BUILT="$NBIS_SRC/mindtct/bin/mindtct"
 if [[ ! -x "$MINDTCT_BUILT" ]]; then

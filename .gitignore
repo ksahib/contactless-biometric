@@ -14,3 +14,11 @@ s01_f01_a02/
 weights/*.pt
 problem_samples/
 ground_truth_smoke*/
+runs/
+solo*/
+tmp/
+finger_solov2_dataset/
+weights/
+.codex
+.agents
+.kaggle
