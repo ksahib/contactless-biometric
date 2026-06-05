@@ -21,9 +21,11 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 DEFAULT_ARCHIVE_ROOT = Path("/media/milab-5/82002d9e-66a9-4739-925b-e2b789ec5641/archive")
-DEFAULT_WEIGHTS_PATH = REPO_ROOT / "runs" / "featurenet_v3_plausible_ignore" / "best.pt"
+DEFAULT_WEIGHTS_PATH = REPO_ROOT / "runs" / "featurenet_v4" / "best.pt"
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "match_outputs"
-CACHE_VERSION = 1
+CACHE_VERSION = 2
+DEFAULT_MCC_METHODS = ("LSA", "LSA-R", "LSA-CENTROID")
+DEFAULT_FEATURE_SCORE_THRESHOLDS = (0.5, 0.6, 0.7, 0.8, 0.9)
 
 
 def ensure_stdlib_copy_module() -> None:
@@ -68,6 +70,8 @@ class ImageRecord:
     acquisition_id: int
     view_index: int
     image_path: str
+    mask_path: str = ""
+    source_kind: str = "archive"
 
     @property
     def identity_key(self) -> tuple[str, int, int]:
@@ -84,7 +88,8 @@ class ImageRecord:
     @property
     def cache_key(self) -> str:
         return (
-            f"{_slug(self.dataset)}"
+            f"{_slug(self.source_kind)}"
+            f"/{_slug(self.dataset)}"
             f"/s{self.subject_id:03d}"
             f"/f{self.finger_id:02d}"
             f"/a{self.acquisition_id:02d}"
@@ -127,6 +132,30 @@ def _slug(value: str) -> str:
 
 def _threshold_label(value: float) -> str:
     return f"{float(value):.2f}"
+
+
+def _method_label(value: str) -> str:
+    return str(value).strip().upper()
+
+
+def _method_slug(value: str) -> str:
+    return _slug(_method_label(value).lower().replace("-", "_"))
+
+
+def _unique_methods(values: Iterable[str]) -> list[str]:
+    methods: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        method = _method_label(value)
+        if not method:
+            continue
+        if method in seen:
+            continue
+        seen.add(method)
+        methods.append(method)
+    if not methods:
+        raise ValueError("--methods must contain at least one non-empty method")
+    return methods
 
 
 def _default_output_dir() -> Path:
@@ -177,6 +206,82 @@ def discover_archive_images(
                 continue
             seen_paths.add(record.image_path)
             records.append(record)
+
+    records.sort(
+        key=lambda item: (
+            item.dataset,
+            item.subject_id,
+            item.finger_id,
+            item.acquisition_id,
+            item.view_index,
+            item.image_path,
+        )
+    )
+    return records
+
+
+def _dataset_from_bundle_meta(meta: dict[str, Any], sample_dir: Path, ground_truth_root: Path) -> str:
+    sample_id = str(meta.get("sample_id") or sample_dir.name)
+    prefix = sample_id.split("_", 1)[0].upper()
+    if prefix.startswith("DS") and prefix[2:].isdigit():
+        return prefix
+    raw_path = str(meta.get("raw_image_path") or "")
+    for part in Path(raw_path).parts:
+        upper = part.upper()
+        if upper.startswith("DS") and upper[2:].isdigit():
+            return upper
+    root_name = ground_truth_root.name.upper()
+    return root_name or "GT"
+
+
+def discover_ground_truth_bundle_images(
+    ground_truth_root: Path,
+    *,
+    side_views: set[int],
+    front_view: int = 0,
+) -> list[ImageRecord]:
+    root = ground_truth_root.resolve()
+    samples_root = root / "samples"
+    if not samples_root.exists():
+        raise FileNotFoundError(f"ground-truth samples directory not found: {samples_root}")
+    if not samples_root.is_dir():
+        raise NotADirectoryError(f"ground-truth samples path is not a directory: {samples_root}")
+
+    allowed_views = {int(front_view)} | {int(view) for view in side_views}
+    records: list[ImageRecord] = []
+    seen_paths: set[str] = set()
+    for sample_dir in sorted(path for path in samples_root.iterdir() if path.is_dir()):
+        meta_path = sample_dir / "meta.json"
+        masked_image_path = sample_dir / "masked_image.png"
+        mask_path = sample_dir / "mask.png"
+        if not (meta_path.exists() and masked_image_path.exists() and mask_path.exists()):
+            continue
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            subject_id = int(meta["subject_id"])
+            finger_id = int(meta["finger_id"])
+            acquisition_id = int(meta["acquisition_id"])
+            view_index = int(meta["raw_view_index"])
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if view_index not in allowed_views:
+            continue
+        image_path = str(masked_image_path.resolve())
+        if image_path in seen_paths:
+            continue
+        seen_paths.add(image_path)
+        records.append(
+            ImageRecord(
+                dataset=_dataset_from_bundle_meta(meta, sample_dir, root),
+                subject_id=subject_id,
+                finger_id=finger_id,
+                acquisition_id=acquisition_id,
+                view_index=view_index,
+                image_path=image_path,
+                mask_path=str(mask_path.resolve()),
+                source_kind="gt_bundle",
+            )
+        )
 
     records.sort(
         key=lambda item: (
@@ -298,23 +403,24 @@ def _load_infer_helpers() -> dict[str, Any]:
     from featurenet.models.infer import (
         decode_minutiae_rows,
         load_checkpoint_model,
-        preprocess_input_bgr,
+        preprocess_input_image,
+        preprocess_saved_masked_input,
         run_inference,
         save_minutiae_csv,
         save_pose_sidecars,
         _resolve_device,
     )
-    from featurenet.models.match_infer import _crop_distal_phalanx_with_main, _save_mask_png
+    from featurenet.models.match_infer import _save_mask_png
 
     return {
         "decode_minutiae_rows": decode_minutiae_rows,
         "load_checkpoint_model": load_checkpoint_model,
-        "preprocess_input_bgr": preprocess_input_bgr,
+        "preprocess_input_image": preprocess_input_image,
+        "preprocess_saved_masked_input": preprocess_saved_masked_input,
         "run_inference": run_inference,
         "save_minutiae_csv": save_minutiae_csv,
         "save_pose_sidecars": save_pose_sidecars,
         "_resolve_device": _resolve_device,
-        "_crop_distal_phalanx_with_main": _crop_distal_phalanx_with_main,
         "_save_mask_png": _save_mask_png,
     }
 
@@ -344,6 +450,7 @@ def _cached_extraction_is_complete(
     weights_path: Path,
     score_threshold: float,
     apply_nms: bool,
+    solov2_score_thr: float,
 ) -> tuple[bool, int | None]:
     required = ("minutiae_csv", "mask_png", "orientation_npy", "ridge_period_npy", "metadata_json")
     if not all(files[name].exists() and files[name].stat().st_size > 0 for name in required):
@@ -358,11 +465,17 @@ def _cached_extraction_is_complete(
         return False, None
     if metadata.get("image_path") != record.image_path:
         return False, None
+    if metadata.get("mask_path", "") != record.mask_path:
+        return False, None
+    if metadata.get("source_kind", "archive") != record.source_kind:
+        return False, None
     if metadata.get("weights_path") != str(weights_path.resolve()):
         return False, None
     if float(metadata.get("feature_score_threshold", -1.0)) != float(score_threshold):
         return False, None
     if bool(metadata.get("minutia_nms_enabled")) != bool(apply_nms):
+        return False, None
+    if record.source_kind != "gt_bundle" and float(metadata.get("solov2_score_thr", -1.0)) != float(solov2_score_thr):
         return False, None
     return True, int(metadata.get("minutiae_count", _count_minutiae_csv_rows(files["minutiae_csv"])))
 
@@ -387,6 +500,8 @@ def _extraction_row(
         "acquisition_id": record.acquisition_id,
         "view_index": record.view_index,
         "image_path": record.image_path,
+        "mask_path": record.mask_path,
+        "source_kind": record.source_kind,
         "status": status,
         "cache_hit": str(cache_hit).lower(),
         "cache_dir": str(cache_dir),
@@ -407,6 +522,7 @@ def extract_image(
     device: Any,
     weights_path: Path,
     score_threshold: float,
+    solov2_score_thr: float,
     cache_root: Path,
     reuse_cache: bool,
     apply_nms: bool,
@@ -421,6 +537,7 @@ def extract_image(
                 weights_path=weights_path,
                 score_threshold=score_threshold,
                 apply_nms=apply_nms,
+                solov2_score_thr=solov2_score_thr,
             )
             if complete:
                 return _extraction_row(
@@ -436,16 +553,23 @@ def extract_image(
         image_path = Path(record.image_path)
         if not image_path.exists():
             raise FileNotFoundError(f"image not found: {image_path}")
+        mask_path = Path(record.mask_path) if record.mask_path else None
+        if record.source_kind == "gt_bundle" and (mask_path is None or not mask_path.exists()):
+            raise FileNotFoundError(f"GT bundle mask not found: {record.mask_path}")
 
         cache_dir.mkdir(parents=True, exist_ok=True)
-        crop_result = helpers["_crop_distal_phalanx_with_main"](
-            image_path=image_path,
-            crop_output_dir=cache_dir / "crop",
-        )
-        image_tensor, mask_tensor, input_shape_hw = helpers["preprocess_input_bgr"](
-            full_bgr=crop_result["inference_bgr"],
-            save_preprocess_dir=cache_dir / "preprocess",
-        )
+        if record.source_kind == "gt_bundle":
+            image_tensor, mask_tensor, input_shape_hw = helpers["preprocess_saved_masked_input"](
+                masked_image_path=image_path,
+                mask_path=mask_path,
+                save_preprocess_dir=cache_dir / "preprocess",
+            )
+        else:
+            image_tensor, mask_tensor, input_shape_hw = helpers["preprocess_input_image"](
+                image_path=image_path,
+                save_preprocess_dir=cache_dir / "preprocess",
+                solov2_score_thr=solov2_score_thr,
+            )
         outputs = helpers["run_inference"](
             model=model,
             image_tensor=image_tensor,
@@ -467,8 +591,11 @@ def extract_image(
             "sample_uid": record.sample_uid,
             "record": asdict(record),
             "image_path": record.image_path,
+            "mask_path": record.mask_path,
+            "source_kind": record.source_kind,
             "weights_path": str(weights_path.resolve()),
             "feature_score_threshold": float(score_threshold),
+            "solov2_score_thr": float(solov2_score_thr),
             "minutia_nms_enabled": bool(apply_nms),
             "minutiae_count": len(minutiae_rows),
             "artifacts": {
@@ -477,12 +604,14 @@ def extract_image(
                 "orientation_npy": str(Path(orientation_npy).resolve()),
                 "ridge_period_npy": str(Path(ridge_period_npy).resolve()),
             },
-            "crop": {
-                "crop_bbox_xyxy": list(crop_result["crop_bbox"]),
-                "crop_mode": crop_result["crop_mode"],
-                "fallback_reason": crop_result["fallback_reason"],
-                "coarse_mask_pixels": int(crop_result["coarse_mask_pixels"]),
-                "distal_mask_pixels": int(crop_result["distal_mask_pixels"]),
+            "preprocessing": {
+                "input_source": record.source_kind,
+                "canonical_preprocess": (
+                    "generated_ground_truth_bundle"
+                    if record.source_kind == "gt_bundle"
+                    else "preprocess.py"
+                ),
+                "input_shape_hw": [int(input_shape_hw[0]), int(input_shape_hw[1])],
             },
         }
         files["metadata_json"].write_text(json.dumps(metadata, indent=2), encoding="utf-8")
@@ -517,6 +646,7 @@ def run_inference_for_records(
     device_arg: str,
     weights_path: Path,
     score_threshold: float,
+    solov2_score_thr: float,
     cache_root: Path,
     reuse_cache: bool,
     apply_nms: bool,
@@ -532,6 +662,7 @@ def run_inference_for_records(
                 weights_path=weights_path,
                 score_threshold=score_threshold,
                 apply_nms=apply_nms,
+                solov2_score_thr=solov2_score_thr,
             )
             if complete:
                 rows.append(
@@ -569,6 +700,7 @@ def run_inference_for_records(
                 device=device,
                 weights_path=weights_path,
                 score_threshold=score_threshold,
+                solov2_score_thr=solov2_score_thr,
                 cache_root=cache_root,
                 reuse_cache=reuse_cache,
                 apply_nms=apply_nms,
@@ -815,7 +947,7 @@ def run_mcc_matching(
             if index == 1 or index % 25 == 0 or index == len(jobs):
                 ok_count = sum(1 for row in rows if row.get("status") == "ok")
                 print(
-                    f"[mcc score={_threshold_label(feature_score_threshold)}] "
+                    f"[mcc method={method} score={_threshold_label(feature_score_threshold)}] "
                     f"matched {index}/{len(jobs)} ok={ok_count} total_rows={len(rows)}",
                     flush=True,
                 )
@@ -827,7 +959,7 @@ def run_mcc_matching(
                 if index == 1 or index % 25 == 0 or index == len(futures):
                     ok_count = sum(1 for row in rows if row.get("status") == "ok")
                     print(
-                        f"[mcc score={_threshold_label(feature_score_threshold)}] "
+                        f"[mcc method={method} score={_threshold_label(feature_score_threshold)}] "
                         f"matched {index}/{len(futures)} ok={ok_count} total_rows={len(rows)}",
                         flush=True,
                     )
@@ -921,12 +1053,35 @@ def parse_args() -> argparse.Namespace:
         description="Run FeatureNet inference, MCC matching, and binary threshold ROC counts for sampled pairs."
     )
     parser.add_argument("--archive-root", type=Path, default=DEFAULT_ARCHIVE_ROOT)
+    parser.add_argument(
+        "--ground-truth-root",
+        type=Path,
+        default=None,
+        help="Generated ground-truth root. When provided, inference replays saved masked_image.png/mask.png bundles.",
+    )
     parser.add_argument("--weights-path", type=Path, default=DEFAULT_WEIGHTS_PATH)
-    parser.add_argument("--feature-score-thresholds", type=float, nargs="+", default=[0.8, 0.9])
+    parser.add_argument(
+        "--feature-score-thresholds",
+        type=float,
+        nargs="+",
+        default=list(DEFAULT_FEATURE_SCORE_THRESHOLDS),
+    )
     parser.add_argument("--genuine-pairs", type=int, default=100)
     parser.add_argument("--impostor-pairs", type=int, default=100)
     parser.add_argument("--side-views", type=int, nargs="+", default=[1, 2])
-    parser.add_argument("--method", type=str, default="LSA-R")
+    parser.add_argument(
+        "--methods",
+        type=str,
+        nargs="+",
+        default=None,
+        help="MCC methods to evaluate. Defaults to LSA, LSA-R, and LSA-CENTROID.",
+    )
+    parser.add_argument(
+        "--method",
+        type=str,
+        default=None,
+        help="Deprecated single-method alias. Use --methods for one or more MCC methods.",
+    )
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--mcc-workers", type=str, default="auto")
     parser.add_argument(
@@ -940,6 +1095,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cache-root", type=Path, default=None)
     parser.add_argument("--reuse-cache", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--disable-minutia-nms", action="store_true")
+    parser.add_argument(
+        "--solov2-score-thr",
+        type=float,
+        default=0.15,
+        help="SOLOv2 score threshold for archive/raw canonical preprocessing. Ignored in --ground-truth-root mode.",
+    )
     return parser.parse_args()
 
 
@@ -948,10 +1109,16 @@ def main() -> int:
     args = parse_args()
 
     archive_root = args.archive_root.resolve()
+    ground_truth_root = args.ground_truth_root.resolve() if args.ground_truth_root is not None else None
     weights_path = args.weights_path.resolve()
     output_dir = args.output_dir.resolve() if args.output_dir is not None else _default_output_dir().resolve()
     cache_root = args.cache_root.resolve() if args.cache_root is not None else output_dir / "cache"
     feature_score_thresholds = [float(value) for value in args.feature_score_thresholds]
+    methods = _unique_methods(
+        args.methods
+        if args.methods is not None
+        else ([args.method] if args.method is not None else DEFAULT_MCC_METHODS)
+    )
     side_views = {int(view) for view in args.side_views}
     apply_nms = not bool(args.disable_minutia_nms)
 
@@ -972,9 +1139,15 @@ def main() -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     cache_root.mkdir(parents=True, exist_ok=True)
 
-    records = discover_archive_images(archive_root, side_views=side_views)
-    if not records:
-        raise RuntimeError(f"no raw images discovered under archive root: {archive_root}")
+    input_mode = "gt_bundle" if ground_truth_root is not None else "archive"
+    if ground_truth_root is not None:
+        records = discover_ground_truth_bundle_images(ground_truth_root, side_views=side_views)
+        if not records:
+            raise RuntimeError(f"no generated GT bundle images discovered under: {ground_truth_root}")
+    else:
+        records = discover_archive_images(archive_root, side_views=side_views)
+        if not records:
+            raise RuntimeError(f"no raw images discovered under archive root: {archive_root}")
     pairs = sample_binary_pairs(
         records,
         side_views=side_views,
@@ -987,10 +1160,12 @@ def main() -> int:
     sampled_pairs_path = output_dir / "sampled_pairs.csv"
     _write_csv_rows(sampled_pairs_path, [_pair_row(pair, index) for index, pair in enumerate(pairs, start=1)])
 
-    print(f"Discovered archive images: {len(records)}", flush=True)
+    print(f"Input mode: {input_mode}", flush=True)
+    print(f"Discovered images: {len(records)}", flush=True)
     print(f"Sampled pairs: {len(pairs)}", flush=True)
     print(f"Unique images for inference: {len(unique_records)}", flush=True)
     print(f"Output directory: {output_dir}", flush=True)
+    print(f"MCC methods: {', '.join(methods)}", flush=True)
 
     helpers: dict[str, Any] | None = None
     device: Any | None = None
@@ -1001,7 +1176,9 @@ def main() -> int:
     print(f"Using MCC workers: {mcc_workers}", flush=True)
 
     inference_rows_by_threshold: dict[float, list[dict[str, Any]]] = {}
-    match_rows_by_threshold: dict[float, list[dict[str, Any]]] = {}
+    match_rows_by_method_threshold: dict[str, dict[float, list[dict[str, Any]]]] = {
+        method: {} for method in methods
+    }
     output_paths: dict[str, str] = {
         "output_dir": str(output_dir),
         "cache_root": str(cache_root),
@@ -1010,6 +1187,7 @@ def main() -> int:
         "summary_json": str(output_dir / "summary.json"),
         "roc_counts_csv": str(output_dir / "roc_counts.csv"),
     }
+    single_method = len(methods) == 1
 
     for score_threshold in feature_score_thresholds:
         label = _threshold_label(score_threshold)
@@ -1021,6 +1199,7 @@ def main() -> int:
             device_arg=str(args.device),
             weights_path=weights_path,
             score_threshold=score_threshold,
+            solov2_score_thr=float(args.solov2_score_thr),
             cache_root=cache_root,
             reuse_cache=bool(args.reuse_cache),
             apply_nms=apply_nms,
@@ -1030,55 +1209,115 @@ def main() -> int:
         _write_csv_rows(inference_manifest_path, inference_rows)
         output_paths[f"inference_manifest_score_{label}_csv"] = str(inference_manifest_path)
 
-        match_rows = run_mcc_matching(
-            pairs,
-            inference_rows,
-            method=str(args.method),
-            feature_score_threshold=score_threshold,
-            mcc_workers=mcc_workers,
-            filtered_minutiae_root=output_dir / "mcc_minutiae_inputs",
-            mcc_max_minutiae=args.mcc_max_minutiae,
-        )
-        match_rows_by_threshold[score_threshold] = match_rows
-        mcc_scores_path = output_dir / f"mcc_scores_score_{label}.csv"
-        _write_csv_rows(mcc_scores_path, match_rows)
-        output_paths[f"mcc_scores_score_{label}_csv"] = str(mcc_scores_path)
+        for method in methods:
+            print(f"Running MCC method {method} at feature score {label}", flush=True)
+            match_rows = run_mcc_matching(
+                pairs,
+                inference_rows,
+                method=method,
+                feature_score_threshold=score_threshold,
+                mcc_workers=mcc_workers,
+                filtered_minutiae_root=output_dir / "mcc_minutiae_inputs",
+                mcc_max_minutiae=args.mcc_max_minutiae,
+            )
+            match_rows_by_method_threshold[method][score_threshold] = match_rows
+            method_slug = _method_slug(method)
+            mcc_scores_path = (
+                output_dir / f"mcc_scores_score_{label}.csv"
+                if single_method
+                else output_dir / f"mcc_scores_{method_slug}_score_{label}.csv"
+            )
+            _write_csv_rows(mcc_scores_path, match_rows)
+            output_key = (
+                f"mcc_scores_score_{label}_csv"
+                if single_method
+                else f"mcc_scores_{method_slug}_score_{label}_csv"
+            )
+            output_paths[output_key] = str(mcc_scores_path)
 
-    roc_rows = compute_roc_counts(match_rows_by_threshold)
+    combined_roc_rows: list[dict[str, Any]] = []
+    for method in methods:
+        method_roc_rows = compute_roc_counts(match_rows_by_method_threshold[method])
+        for row in method_roc_rows:
+            combined_roc_rows.append({"method": method, **row})
+        if not single_method:
+            method_slug = _method_slug(method)
+            method_roc_counts_path = output_dir / f"roc_counts_{method_slug}.csv"
+            _write_csv_rows(
+                method_roc_counts_path,
+                [{"method": method, **row} for row in method_roc_rows],
+                fieldnames=[
+                    "method",
+                    "feature_score_threshold",
+                    "matching_threshold",
+                    "TP",
+                    "FN",
+                    "FP",
+                    "TN",
+                    "TPR",
+                    "FPR",
+                    "TNR",
+                    "FNR",
+                    "accuracy",
+                ],
+            )
+            output_paths[f"roc_counts_{method_slug}_csv"] = str(method_roc_counts_path)
+
     roc_counts_path = output_dir / "roc_counts.csv"
     _write_csv_rows(
         roc_counts_path,
-        roc_rows,
-        fieldnames=[
-            "feature_score_threshold",
-            "matching_threshold",
-            "TP",
-            "FN",
-            "FP",
-            "TN",
-            "TPR",
-            "FPR",
-            "TNR",
-            "FNR",
-            "accuracy",
-        ],
+        combined_roc_rows if not single_method else [{key: value for key, value in row.items() if key != "method"} for row in combined_roc_rows],
+        fieldnames=(
+            [
+                "method",
+                "feature_score_threshold",
+                "matching_threshold",
+                "TP",
+                "FN",
+                "FP",
+                "TN",
+                "TPR",
+                "FPR",
+                "TNR",
+                "FNR",
+                "accuracy",
+            ]
+            if not single_method
+            else [
+                "feature_score_threshold",
+                "matching_threshold",
+                "TP",
+                "FN",
+                "FP",
+                "TN",
+                "TPR",
+                "FPR",
+                "TNR",
+                "FNR",
+                "accuracy",
+            ]
+        ),
     )
 
     summary = {
         "config": {
+            "input_mode": input_mode,
             "archive_root": str(archive_root),
+            "ground_truth_root": None if ground_truth_root is None else str(ground_truth_root),
             "weights_path": str(weights_path),
             "feature_score_thresholds": [_threshold_label(value) for value in feature_score_thresholds],
             "genuine_pairs": int(args.genuine_pairs),
             "impostor_pairs": int(args.impostor_pairs),
             "side_views": sorted(side_views),
-            "method": str(args.method),
+            "methods": methods,
+            "method": methods[0] if single_method else None,
             "device": str(args.device),
             "mcc_workers": int(mcc_workers),
             "mcc_max_minutiae": args.mcc_max_minutiae,
             "seed": int(args.seed),
             "reuse_cache": bool(args.reuse_cache),
             "minutia_nms_enabled": bool(apply_nms),
+            "solov2_score_thr": float(args.solov2_score_thr),
         },
         "counts": {
             "discovered_image_count": len(records),
@@ -1089,7 +1328,10 @@ def main() -> int:
             "per_feature_score_threshold": {
                 _threshold_label(threshold): {
                     "inference": _ok_error_counts(inference_rows_by_threshold[threshold]),
-                    "mcc": _ok_error_counts(match_rows_by_threshold[threshold]),
+                    "mcc": {
+                        method: _ok_error_counts(match_rows_by_method_threshold[method][threshold])
+                        for method in methods
+                    },
                 }
                 for threshold in feature_score_thresholds
             },
@@ -1097,7 +1339,14 @@ def main() -> int:
         "errors": {
             _threshold_label(threshold): {
                 "inference": [row for row in inference_rows_by_threshold[threshold] if row.get("status") != "ok"][:200],
-                "mcc": [row for row in match_rows_by_threshold[threshold] if row.get("status") != "ok"][:200],
+                "mcc": {
+                    method: [
+                        row
+                        for row in match_rows_by_method_threshold[method][threshold]
+                        if row.get("status") != "ok"
+                    ][:200]
+                    for method in methods
+                },
             }
             for threshold in feature_score_thresholds
         },

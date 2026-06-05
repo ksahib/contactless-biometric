@@ -827,6 +827,7 @@ def _infer_output_shape_from_targets(targets: Mapping[str, Any]) -> tuple[int, i
 def load_bundle_samples(
     ground_truth_root: str | Path,
     limit: int | None = None,
+    raw_view_indices: set[int] | None = None,
     strict_gradient_targets: bool = False,
     strict_finite_targets: bool = False,
     skip_empty_minutia_support_with_minutiae: bool = True,
@@ -841,6 +842,7 @@ def load_bundle_samples(
         sample_dirs = sample_dirs[:limit]
 
     samples: list[dict[str, Any]] = []
+    allowed_raw_view_indices = {0, 1, 2} if raw_view_indices is None else {int(index) for index in raw_view_indices}
     missing_gradient_paths: list[Path] = []
     non_finite_target_paths: list[tuple[str, Path, list[str]]] = []
     empty_minutia_support_paths: list[tuple[str, Path, int]] = []
@@ -853,7 +855,11 @@ def load_bundle_samples(
             continue
 
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        if meta.get("raw_view_index") not in {0, 1, 2}:
+        try:
+            raw_view_index = int(meta.get("raw_view_index", -1))
+        except (TypeError, ValueError):
+            continue
+        if raw_view_index not in allowed_raw_view_indices:
             continue
         targets = _load_npz_targets(targets_path)
         if "gradient" not in targets:
@@ -895,7 +901,7 @@ def load_bundle_samples(
                 "masked_image": masked_image_path,
                 "mask": mask_path,
                 "targets_path": targets_path,
-                "raw_view_index": int(meta.get("raw_view_index", -1)),
+                "raw_view_index": raw_view_index,
                 "input_shape_hw": tuple(int(value) for value in input_shape_hw),
                 "output_shape_hw": tuple(int(value) for value in output_shape_hw),
             }
@@ -941,8 +947,54 @@ def load_bundle_samples(
         )
 
     if not samples:
-        raise ValueError(f"no usable samples found under {samples_root}")
+        view_text = "all supported views" if raw_view_indices is None else ",".join(str(index) for index in sorted(allowed_raw_view_indices))
+        raise ValueError(f"no usable samples found under {samples_root} for raw_view_indices={view_text}")
     return samples
+
+
+def _raw_view_counts(samples: list[Mapping[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for sample in samples:
+        raw_view_index = str(sample.get("raw_view_index", "unknown"))
+        counts[raw_view_index] = counts.get(raw_view_index, 0) + 1
+    return dict(sorted(counts.items(), key=lambda item: item[0]))
+
+
+def _parse_raw_view_indices(values: list[str] | None) -> set[int] | None:
+    if values is None:
+        return None
+
+    tokens: list[str] = []
+    for value in values:
+        tokens.extend(part.strip() for part in str(value).split(","))
+    tokens = [token for token in tokens if token]
+    if not tokens or any(token.lower() == "all" for token in tokens):
+        return None
+
+    aliases = {
+        "front": 0,
+        "left": 1,
+        "right": 2,
+    }
+    parsed: set[int] = set()
+    for token in tokens:
+        lower = token.lower()
+        if lower in aliases:
+            parsed.add(aliases[lower])
+            continue
+        try:
+            parsed.add(int(token))
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(
+                f"raw view indices must be 0, 1, 2, front, left, right, or all; got {token!r}"
+            ) from exc
+
+    unsupported = parsed - {0, 1, 2}
+    if unsupported:
+        raise argparse.ArgumentTypeError(
+            f"unsupported raw view index/indices: {', '.join(str(index) for index in sorted(unsupported))}"
+        )
+    return parsed
 
 
 def _split_group_key(sample: Mapping[str, Any]) -> Any:
@@ -1107,6 +1159,7 @@ def train_model(args: argparse.Namespace) -> dict[str, Any]:
     samples = load_bundle_samples(
         args.ground_truth_root,
         limit=args.limit,
+        raw_view_indices=getattr(args, "raw_view_indices", None),
         strict_gradient_targets=args.strict_gradient_targets,
         strict_finite_targets=args.strict_finite_targets,
         skip_empty_minutia_support_with_minutiae=args.skip_empty_minutia_support_with_minutiae,
@@ -1332,8 +1385,14 @@ def train_model(args: argparse.Namespace) -> dict[str, Any]:
     summary = {
         "device": str(resolved_device),
         "sample_count": len(samples),
+        "sample_count_by_raw_view_index": _raw_view_counts(samples),
+        "raw_view_indices": None
+        if getattr(args, "raw_view_indices", None) is None
+        else sorted(args.raw_view_indices),
         "train_sample_count": len(train_samples),
+        "train_sample_count_by_raw_view_index": _raw_view_counts(train_samples),
         "val_sample_count": len(val_samples),
+        "val_sample_count_by_raw_view_index": _raw_view_counts(val_samples),
         "epochs": args.epochs,
         "epochs_requested": args.epochs,
         "epochs_ran": len(history),
@@ -1466,9 +1525,23 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Fail fast if any selected sample has NaN or Inf target values instead of skipping it.",
     )
+    parser.add_argument(
+        "--raw-view-indices",
+        type=str,
+        nargs="+",
+        default=None,
+        help=(
+            "Restrict training samples by raw_view_index. Use 0/front for front-only, "
+            "1/left and 2/right for side views, or all to use every supported view."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--limit", type=int, default=None)
     args = parser.parse_args()
+    try:
+        args.raw_view_indices = _parse_raw_view_indices(args.raw_view_indices)
+    except argparse.ArgumentTypeError as exc:
+        parser.error(str(exc))
     if args.resume_checkpoint is not None and not args.resume_checkpoint.exists():
         parser.error(f"--resume-checkpoint does not exist: {args.resume_checkpoint}")
     if args.validate_every < 1:

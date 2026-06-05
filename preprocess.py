@@ -781,6 +781,22 @@ def segment_then_clahe(
     enhanced[mask <= 0] = 0
     return enhanced.astype(np.uint8), mask.astype(np.uint8)
 
+
+def segment_then_clahe_from_mask(
+    image: np.ndarray,
+    mask: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    refined_mask = _refine_mask(_as_uint8_mask(mask))
+    gray_image, _ = _extract_gray_and_alpha(image)
+    if gray_image.shape != refined_mask.shape:
+        raise ValueError(
+            f"fallback mask shape {refined_mask.shape} does not match image shape {gray_image.shape}"
+        )
+    enhanced = _masked_clahe(gray_image, refined_mask)
+    enhanced[refined_mask <= 0] = 0
+    return enhanced.astype(np.uint8), refined_mask.astype(np.uint8)
+
+
 def circular_mask(roi: np.ndarray) -> np.ndarray:
     """Return the central circular mask covering about 20% of the ROI area.
 
@@ -915,6 +931,40 @@ def run_preprocess_pipeline(
         model_config=model_config,
         checkpoint=checkpoint,
     )
+    center_mask = circular_mask(full_mask)
+    scaled_image, scaled_mask, ridge_period, scale = scale_to_paper_ridge_period(
+        enhanced,
+        full_mask,
+        target_period=target_period,
+        orientation=orientation,
+        center_mask=center_mask,
+    )
+    rotated_image, rotated_mask, yaw_angle = rotate_to_vertical_centerline(
+        scaled_image,
+        scaled_mask,
+    )
+    return PreprocessPipelineResult(
+        enhanced=enhanced,
+        full_mask=_as_uint8_mask(full_mask),
+        center_mask=_as_uint8_mask(center_mask),
+        scaled_image=scaled_image,
+        scaled_mask=scaled_mask,
+        ridge_period=float(ridge_period),
+        scale=float(scale),
+        rotated_image=rotated_image,
+        rotated_mask=rotated_mask,
+        yaw_angle=float(yaw_angle),
+    )
+
+
+def run_preprocess_pipeline_from_mask(
+    image: np.ndarray,
+    mask: np.ndarray,
+    *,
+    target_period: float = 10.0,
+    orientation: float | np.ndarray | None = None,
+) -> PreprocessPipelineResult:
+    enhanced, full_mask = segment_then_clahe_from_mask(image, mask)
     center_mask = circular_mask(full_mask)
     scaled_image, scaled_mask, ridge_period, scale = scale_to_paper_ridge_period(
         enhanced,

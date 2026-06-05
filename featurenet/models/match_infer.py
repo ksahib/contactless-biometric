@@ -12,7 +12,9 @@ from .infer import (
     decode_minutiae_rows,
     ensure_stdlib_copy_module,
     load_checkpoint_model,
+    load_bgr_image,
     preprocess_input_bgr,
+    preprocess_input_image,
     print_output_stats,
     run_inference,
     save_minutiae_csv,
@@ -38,6 +40,63 @@ def _save_mask_png(mask_tensor: Any, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if not cv2.imwrite(str(path), mask_img):
         raise RuntimeError(f"failed to write mask image to {path}")
+
+
+def _grayscale_bgr_with_black_background(bgr: np.ndarray, mask: np.ndarray | None = None) -> np.ndarray:
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    if mask is not None:
+        gray = gray.copy()
+        gray[mask <= 0] = 0
+    return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+
+
+def _foreground_mask_with_main(image_path: Path) -> np.ndarray:
+    import main as crop_main
+
+    full_bgr = crop_main.load_bgr_image(image_path)
+    foreground_mask = crop_main.rembg_mask_from_bgr(full_bgr)
+    crop_main.validate_foreground_area(foreground_mask, minimum_ratio=0.03)
+    return foreground_mask
+
+
+def _rotate_bound(array: np.ndarray, angle_degrees: float, interpolation: int, border_value: int = 0) -> np.ndarray:
+    height, width = array.shape[:2]
+    center = (width / 2.0, height / 2.0)
+    matrix = cv2.getRotationMatrix2D(center, float(angle_degrees), 1.0)
+    cos = abs(matrix[0, 0])
+    sin = abs(matrix[0, 1])
+    new_width = int((height * sin) + (width * cos))
+    new_height = int((height * cos) + (width * sin))
+    matrix[0, 2] += (new_width / 2.0) - center[0]
+    matrix[1, 2] += (new_height / 2.0) - center[1]
+    return cv2.warpAffine(
+        array,
+        matrix,
+        (new_width, new_height),
+        flags=interpolation,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=border_value,
+    )
+
+
+def _rotate_foreground_to_horizontal(bgr: np.ndarray, mask: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
+    ys, xs = np.where(mask > 0)
+    if xs.size < 2 or ys.size < 2:
+        raise RuntimeError("cannot rotate foreground to horizontal from an empty mask")
+    coords = np.column_stack([xs, ys]).astype(np.float32)
+    coords -= np.mean(coords, axis=0, keepdims=True)
+    covariance = np.cov(coords, rowvar=False)
+    eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+    axis = eigenvectors[:, int(np.argmax(eigenvalues))]
+    angle = float(np.degrees(np.arctan2(float(axis[1]), float(axis[0]))))
+    if angle > 90.0:
+        angle -= 180.0
+    if angle < -90.0:
+        angle += 180.0
+    rotate_degrees = -angle
+    rotated_bgr = _rotate_bound(bgr, rotate_degrees, cv2.INTER_LINEAR, border_value=0)
+    rotated_mask = _rotate_bound(mask, rotate_degrees, cv2.INTER_NEAREST, border_value=0)
+    return rotated_bgr, rotated_mask, rotate_degrees
 
 
 def _crop_distal_phalanx_with_main(
@@ -201,6 +260,7 @@ def _crop_distal_phalanx_with_main(
         "full_bgr": full_bgr,
         "cropped_bgr": cropped_bgr,
         "inference_bgr": cropped_distal,
+        "distal_mask": distal_mask,
         "crop_bbox": tuple(int(v) for v in crop_bbox),
         "crop_mode": crop_mode,
         "fallback_reason": fallback_reason,
@@ -214,6 +274,52 @@ def _crop_distal_phalanx_with_main(
     }
 
 
+def _fallback_distal_mask_with_main(
+    *,
+    image_path: Path,
+    output_dir: Path,
+) -> dict[str, Any]:
+    crop_result = _crop_distal_phalanx_with_main(
+        image_path=image_path,
+        crop_output_dir=output_dir / "fallback_distal_crop",
+    )
+    full_bgr = crop_result["full_bgr"]
+    full_mask = np.zeros(full_bgr.shape[:2], dtype=np.uint8)
+    x_min, y_min, x_max, y_max = crop_result["crop_bbox"]
+    local_mask = crop_result["distal_mask"]
+    target_h = int(y_max) - int(y_min)
+    target_w = int(x_max) - int(x_min)
+    if local_mask.shape[:2] != (target_h, target_w):
+        local_mask = cv2.resize(local_mask, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+    full_mask[int(y_min) : int(y_max), int(x_min) : int(x_max)] = np.maximum(
+        full_mask[int(y_min) : int(y_max), int(x_min) : int(x_max)],
+        np.where(local_mask > 0, 255, 0).astype(np.uint8),
+    )
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    fallback_mask_path = output_dir / "fallback_distal_mask.png"
+    fallback_input_path = output_dir / "fallback_distal_black_gray.png"
+    fallback_input = _grayscale_bgr_with_black_background(full_bgr, full_mask)
+    cv2.imwrite(str(fallback_mask_path), full_mask)
+    cv2.imwrite(str(fallback_input_path), fallback_input)
+    return {
+        "full_bgr": full_bgr,
+        "fallback_mask": full_mask,
+        "fallback_mask_path": fallback_mask_path,
+        "fallback_input_path": fallback_input_path,
+        "crop": {
+            "crop_bbox": list(crop_result["crop_bbox"]),
+            "crop_mode": crop_result["crop_mode"],
+            "fallback_reason": crop_result["fallback_reason"],
+            "coarse_mask_path": str(crop_result["coarse_mask_path"]),
+            "cropped_path": str(crop_result["cropped_path"]),
+            "distal_mask_path": str(crop_result["distal_mask_path"]),
+            "cropped_distal_path": str(crop_result["cropped_distal_path"]),
+            "crop_bbox_path": str(crop_result["crop_bbox_path"]),
+        },
+    }
+
+
 def _run_single_image_inference(
     *,
     image_path: Path,
@@ -222,19 +328,126 @@ def _run_single_image_inference(
     device: Any,
     score_threshold: float,
     apply_nms: bool,
+    solov2_score_thr: float,
+    solov2_input_mode: str,
+    allow_distal_fallback: bool,
     image_output_dir: Path,
 ) -> dict[str, Any]:
-    crop_dir = image_output_dir / "crop"
-    crop_result = _crop_distal_phalanx_with_main(
-        image_path=image_path,
-        crop_output_dir=crop_dir,
-    )
-
     preprocess_dir = image_output_dir / "preprocess"
-    image_tensor, mask_tensor, input_shape_hw = preprocess_input_bgr(
-        full_bgr=crop_result["inference_bgr"],
-        save_preprocess_dir=preprocess_dir,
-    )
+    solov2_input_artifacts: dict[str, Any]
+    fallback_artifacts: dict[str, Any] | None = None
+    fallback_mask: np.ndarray | None = None
+    fallback_mask_source: str | None = None
+    preprocess_bgr: np.ndarray | None = None
+
+    if solov2_input_mode == "raw":
+        preprocess_bgr = load_bgr_image(image_path)
+        solov2_input_artifacts: dict[str, Any] = {"mode": "raw"}
+    elif solov2_input_mode == "gray":
+        full_bgr = load_bgr_image(image_path)
+        solov2_bgr = _grayscale_bgr_with_black_background(full_bgr)
+        solov2_input_path = image_output_dir / "solov2_input_gray.png"
+        image_output_dir.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(solov2_input_path), solov2_bgr)
+        preprocess_bgr = solov2_bgr
+        solov2_input_artifacts = {"mode": "gray", "solov2_input_png": str(solov2_input_path)}
+    elif solov2_input_mode == "foreground-black-gray":
+        full_bgr = load_bgr_image(image_path)
+        foreground_mask = _foreground_mask_with_main(image_path)
+        solov2_bgr = _grayscale_bgr_with_black_background(full_bgr, foreground_mask)
+        solov2_input_path = image_output_dir / "solov2_input_foreground_black_gray.png"
+        foreground_mask_path = image_output_dir / "foreground_mask.png"
+        image_output_dir.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(solov2_input_path), solov2_bgr)
+        cv2.imwrite(str(foreground_mask_path), foreground_mask)
+        preprocess_bgr = solov2_bgr
+        solov2_input_artifacts = {
+            "mode": "foreground-black-gray",
+            "solov2_input_png": str(solov2_input_path),
+            "foreground_mask_png": str(foreground_mask_path),
+        }
+    elif solov2_input_mode == "foreground-black-gray-horizontal":
+        full_bgr = load_bgr_image(image_path)
+        foreground_mask = _foreground_mask_with_main(image_path)
+        horizontal_bgr, horizontal_mask, rotation_degrees = _rotate_foreground_to_horizontal(
+            full_bgr,
+            foreground_mask,
+        )
+        solov2_bgr = _grayscale_bgr_with_black_background(horizontal_bgr, horizontal_mask)
+        solov2_input_path = image_output_dir / "solov2_input_foreground_black_gray_horizontal.png"
+        foreground_mask_path = image_output_dir / "foreground_mask_horizontal.png"
+        image_output_dir.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(solov2_input_path), solov2_bgr)
+        cv2.imwrite(str(foreground_mask_path), horizontal_mask)
+        preprocess_bgr = solov2_bgr
+        solov2_input_artifacts = {
+            "mode": "foreground-black-gray-horizontal",
+            "solov2_input_png": str(solov2_input_path),
+            "foreground_mask_png": str(foreground_mask_path),
+            "rotation_degrees": float(rotation_degrees),
+        }
+    elif solov2_input_mode == "crop-black-gray":
+        crop_result = _crop_distal_phalanx_with_main(
+            image_path=image_path,
+            crop_output_dir=image_output_dir / "solov2_input_crop",
+        )
+        solov2_bgr = _grayscale_bgr_with_black_background(
+            crop_result["cropped_bgr"],
+            crop_result["distal_mask"],
+        )
+        solov2_input_path = image_output_dir / "solov2_input_crop_black_gray.png"
+        image_output_dir.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(solov2_input_path), solov2_bgr)
+        preprocess_bgr = solov2_bgr
+        solov2_input_artifacts = {
+            "mode": "crop-black-gray",
+            "solov2_input_png": str(solov2_input_path),
+            "crop": {
+                "crop_bbox": list(crop_result["crop_bbox"]),
+                "crop_mode": crop_result["crop_mode"],
+                "fallback_reason": crop_result["fallback_reason"],
+                "coarse_mask_path": str(crop_result["coarse_mask_path"]),
+                "cropped_path": str(crop_result["cropped_path"]),
+                "distal_mask_path": str(crop_result["distal_mask_path"]),
+                "cropped_distal_path": str(crop_result["cropped_distal_path"]),
+                "crop_bbox_path": str(crop_result["crop_bbox_path"]),
+            },
+        }
+    else:
+        raise ValueError(f"unsupported --solov2-input-mode: {solov2_input_mode}")
+
+    assert preprocess_bgr is not None
+    try:
+        image_tensor, mask_tensor, input_shape_hw = preprocess_input_bgr(
+            preprocess_bgr,
+            save_preprocess_dir=preprocess_dir,
+            solov2_score_thr=solov2_score_thr,
+        )
+        mask_source = "solov2"
+    except RuntimeError as exc:
+        if not allow_distal_fallback or "distal phalanx" not in str(exc):
+            raise
+        fallback = _fallback_distal_mask_with_main(
+            image_path=image_path,
+            output_dir=image_output_dir,
+        )
+        fallback_mask = fallback["fallback_mask"]
+        fallback_mask_source = "foreground_distal_fallback"
+        image_tensor, mask_tensor, input_shape_hw = preprocess_input_bgr(
+            fallback["full_bgr"],
+            save_preprocess_dir=preprocess_dir,
+            solov2_score_thr=solov2_score_thr,
+            fallback_mask=fallback_mask,
+            fallback_mask_source=fallback_mask_source,
+        )
+        fallback_artifacts = {
+            "reason": str(exc),
+            "mask_source": fallback_mask_source,
+            "fallback_mask_png": str(fallback["fallback_mask_path"]),
+            "fallback_input_png": str(fallback["fallback_input_path"]),
+            "crop": fallback["crop"],
+        }
+        mask_source = fallback_mask_source
     outputs = run_inference(
         model=model,
         image_tensor=image_tensor,
@@ -264,20 +477,11 @@ def _run_single_image_inference(
         "orientation_npy": orientation_npy,
         "ridge_period_npy": ridge_period_npy,
         "preprocess_dir": preprocess_dir,
-        "crop_dir": crop_dir,
-        "crop_bbox": crop_result["crop_bbox"],
-        "crop_mode": crop_result["crop_mode"],
-        "fallback_reason": crop_result["fallback_reason"],
-        "coarse_mask_path": crop_result["coarse_mask_path"],
-        "cropped_path": crop_result["cropped_path"],
-        "distal_mask_path": crop_result["distal_mask_path"],
-        "cropped_distal_path": crop_result["cropped_distal_path"],
-        "crop_bbox_path": crop_result["crop_bbox_path"],
-        "original_shape_hw": [int(crop_result["full_bgr"].shape[0]), int(crop_result["full_bgr"].shape[1])],
-        "cropped_shape_hw": [int(crop_result["cropped_bgr"].shape[0]), int(crop_result["cropped_bgr"].shape[1])],
-        "distal_mask_pixels": int(crop_result["distal_mask_pixels"]),
-        "coarse_mask_pixels": int(crop_result["coarse_mask_pixels"]),
         "inference_input_shape_hw": [int(input_shape_hw[0]), int(input_shape_hw[1])],
+        "solov2_score_thr": float(solov2_score_thr),
+        "solov2_input": solov2_input_artifacts,
+        "mask_source": mask_source,
+        "distal_fallback": fallback_artifacts,
     }
 
 
@@ -300,6 +504,24 @@ def parse_args() -> argparse.Namespace:
         "--disable-minutia-nms",
         action="store_true",
         help="Disable 3x3 local-maximum suppression during minutia decoding.",
+    )
+    parser.add_argument(
+        "--solov2-score-thr",
+        type=float,
+        default=0.15,
+        help="Minimum SOLOv2 distal phalanx detection score for canonical preprocessing.",
+    )
+    parser.add_argument(
+        "--solov2-input-mode",
+        choices=("raw", "gray", "foreground-black-gray", "foreground-black-gray-horizontal", "crop-black-gray"),
+        default="raw",
+        help="Image preparation before SOLOv2. Use foreground-black-gray-horizontal for real-world photos that differ from black-background grayscale training images.",
+    )
+    parser.add_argument(
+        "--allow-distal-fallback",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="If SOLOv2 finds no distal phalanx, continue with a foreground-geometry distal mask fallback.",
     )
     parser.add_argument(
         "--output-dir",
@@ -342,6 +564,9 @@ def main() -> None:
         device=device,
         score_threshold=float(args.minutia_score_threshold),
         apply_nms=not bool(args.disable_minutia_nms),
+        solov2_score_thr=float(args.solov2_score_thr),
+        solov2_input_mode=str(args.solov2_input_mode),
+        allow_distal_fallback=bool(args.allow_distal_fallback),
         image_output_dir=a_dir,
     )
     result_b = _run_single_image_inference(
@@ -351,6 +576,9 @@ def main() -> None:
         device=device,
         score_threshold=float(args.minutia_score_threshold),
         apply_nms=not bool(args.disable_minutia_nms),
+        solov2_score_thr=float(args.solov2_score_thr),
+        solov2_input_mode=str(args.solov2_input_mode),
+        allow_distal_fallback=bool(args.allow_distal_fallback),
         image_output_dir=b_dir,
     )
 
@@ -372,7 +600,12 @@ def main() -> None:
         "device": str(device),
         "method": args.method,
         "minutia_score_threshold": float(args.minutia_score_threshold),
+        "solov2_score_thr": float(args.solov2_score_thr),
+        "solov2_input_mode": str(args.solov2_input_mode),
+        "allow_distal_fallback": bool(args.allow_distal_fallback),
         "minutia_nms_enabled": not bool(args.disable_minutia_nms),
+        "mask_source_a": result_a["mask_source"],
+        "mask_source_b": result_b["mask_source"],
         "minutiae_count_a": len(result_a["minutiae_rows"]),
         "minutiae_count_b": len(result_b["minutiae_rows"]),
         "mcc_score": float(score),
@@ -383,46 +616,28 @@ def main() -> None:
             "a_mask_png": str(result_a["mask_png"]),
             "a_orientation_npy": str(result_a["orientation_npy"]),
             "a_ridge_period_npy": str(result_a["ridge_period_npy"]),
-            "a_crop_dir": str(result_a["crop_dir"]),
-            "a_crop_coarse_mask_png": str(result_a["coarse_mask_path"]),
-            "a_crop_cropped_png": str(result_a["cropped_path"]),
-            "a_crop_distal_mask_png": str(result_a["distal_mask_path"]),
-            "a_crop_cropped_distal_png": str(result_a["cropped_distal_path"]),
-            "a_crop_bbox_json": str(result_a["crop_bbox_path"]),
             "a_preprocess_dir": str(result_a["preprocess_dir"]),
             "b_minutiae_csv": str(result_b["minutiae_csv"]),
             "b_mask_png": str(result_b["mask_png"]),
             "b_orientation_npy": str(result_b["orientation_npy"]),
             "b_ridge_period_npy": str(result_b["ridge_period_npy"]),
-            "b_crop_dir": str(result_b["crop_dir"]),
-            "b_crop_coarse_mask_png": str(result_b["coarse_mask_path"]),
-            "b_crop_cropped_png": str(result_b["cropped_path"]),
-            "b_crop_distal_mask_png": str(result_b["distal_mask_path"]),
-            "b_crop_cropped_distal_png": str(result_b["cropped_distal_path"]),
-            "b_crop_bbox_json": str(result_b["crop_bbox_path"]),
             "b_preprocess_dir": str(result_b["preprocess_dir"]),
         },
-        "crop_stage": {
+        "preprocessing": {
             "a": {
-                "crop_bbox_xyxy": list(result_a["crop_bbox"]),
-                "crop_mode": result_a["crop_mode"],
-                "fallback_reason": result_a["fallback_reason"],
-                "original_shape_hw": result_a["original_shape_hw"],
-                "cropped_shape_hw": result_a["cropped_shape_hw"],
-                "coarse_mask_pixels": result_a["coarse_mask_pixels"],
-                "distal_mask_pixels": result_a["distal_mask_pixels"],
-                "distal_to_coarse_ratio": float(result_a["distal_mask_pixels"] / max(result_a["coarse_mask_pixels"], 1)),
+                "canonical_preprocess": "preprocess.py",
+                "solov2_score_thr": result_a["solov2_score_thr"],
+                "solov2_input": result_a["solov2_input"],
+                "mask_source": result_a["mask_source"],
+                "distal_fallback": result_a["distal_fallback"],
                 "inference_input_shape_hw": result_a["inference_input_shape_hw"],
             },
             "b": {
-                "crop_bbox_xyxy": list(result_b["crop_bbox"]),
-                "crop_mode": result_b["crop_mode"],
-                "fallback_reason": result_b["fallback_reason"],
-                "original_shape_hw": result_b["original_shape_hw"],
-                "cropped_shape_hw": result_b["cropped_shape_hw"],
-                "coarse_mask_pixels": result_b["coarse_mask_pixels"],
-                "distal_mask_pixels": result_b["distal_mask_pixels"],
-                "distal_to_coarse_ratio": float(result_b["distal_mask_pixels"] / max(result_b["coarse_mask_pixels"], 1)),
+                "canonical_preprocess": "preprocess.py",
+                "solov2_score_thr": result_b["solov2_score_thr"],
+                "solov2_input": result_b["solov2_input"],
+                "mask_source": result_b["mask_source"],
+                "distal_fallback": result_b["distal_fallback"],
                 "inference_input_shape_hw": result_b["inference_input_shape_hw"],
             },
         },
@@ -436,12 +651,10 @@ def main() -> None:
     print(f"Saved run summary: {summary_path}")
     print(f"Saved A minutiae CSV: {result_a['minutiae_csv']}")
     print(f"Saved A mask: {result_a['mask_png']}")
-    print(f"Saved A crop image: {result_a['cropped_path']}")
-    print(f"Saved A distal mask: {result_a['distal_mask_path']}")
+    print(f"Saved A preprocess dir: {result_a['preprocess_dir']}")
     print(f"Saved B minutiae CSV: {result_b['minutiae_csv']}")
     print(f"Saved B mask: {result_b['mask_png']}")
-    print(f"Saved B crop image: {result_b['cropped_path']}")
-    print(f"Saved B distal mask: {result_b['distal_mask_path']}")
+    print(f"Saved B preprocess dir: {result_b['preprocess_dir']}")
 
 
 if __name__ == "__main__":

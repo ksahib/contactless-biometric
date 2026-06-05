@@ -30,8 +30,8 @@ from featurenet.models.train import FeatureNetDataset, load_bundle_samples
 
 
 class FeatureNetLazyLoadingTests(unittest.TestCase):
-    def _write_bundle(self, root: Path) -> Path:
-        sample_dir = root / "samples" / "sample_001"
+    def _write_bundle(self, root: Path, sample_id: str = "sample_001", raw_view_index: int = 0) -> Path:
+        sample_dir = root / "samples" / sample_id
         sample_dir.mkdir(parents=True, exist_ok=True)
 
         image = np.full((8, 8), 127, dtype=np.uint8)
@@ -55,13 +55,13 @@ class FeatureNetLazyLoadingTests(unittest.TestCase):
         )
 
         meta = {
-            "sample_id": "sample_001",
+            "sample_id": sample_id,
             "subject_id": 1,
             "subject_index": 0,
             "finger_id": 1,
             "acquisition_id": 1,
             "finger_class_id": 0,
-            "raw_view_index": 0,
+            "raw_view_index": raw_view_index,
             "counts": {"minutiae": 0},
             "shapes": {"input_image": [8, 8], "featurenet_output": [1, 1]},
         }
@@ -81,6 +81,18 @@ class FeatureNetLazyLoadingTests(unittest.TestCase):
             self.assertEqual(samples[0]["raw_view_index"], 0)
             self.assertEqual(samples[0]["input_shape_hw"], (8, 8))
             self.assertEqual(samples[0]["output_shape_hw"], (1, 1))
+
+    def test_load_bundle_samples_can_filter_to_front_view(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_bundle(root, "sample_front", raw_view_index=0)
+            self._write_bundle(root, "sample_left", raw_view_index=1)
+            self._write_bundle(root, "sample_right", raw_view_index=2)
+
+            samples = load_bundle_samples(root, raw_view_indices={0}, strict_gradient_targets=True)
+
+            self.assertEqual([sample["sample_id"] for sample in samples], ["sample_front"])
+            self.assertEqual([sample["raw_view_index"] for sample in samples], [0])
 
     def test_dataset_getitem_lazy_loads_targets(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

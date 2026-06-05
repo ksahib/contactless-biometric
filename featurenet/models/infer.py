@@ -96,17 +96,28 @@ def preprocess_input_bgr(
     solov2_config: Path | None = None,
     solov2_checkpoint: Path | None = None,
     solov2_device: str | None = None,
-    solov2_score_thr: float = 0.3,
+    solov2_score_thr: float = 0.15,
+    fallback_mask: np.ndarray | None = None,
+    fallback_mask_source: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, tuple[int, int]]:
     raw_gray = cv2.cvtColor(full_bgr, cv2.COLOR_BGR2GRAY)
-    result = solov2_preprocess.run_preprocess_pipeline(
-        full_bgr,
-        score_thr=solov2_score_thr,
-        device=solov2_device,
-        model_config=solov2_config,
-        checkpoint=solov2_checkpoint,
-        target_period=10.0,
-    )
+    if fallback_mask is None:
+        result = solov2_preprocess.run_preprocess_pipeline(
+            full_bgr,
+            score_thr=solov2_score_thr,
+            device=solov2_device,
+            model_config=solov2_config,
+            checkpoint=solov2_checkpoint,
+            target_period=10.0,
+        )
+        mask_source = "solov2"
+    else:
+        result = solov2_preprocess.run_preprocess_pipeline_from_mask(
+            full_bgr,
+            fallback_mask,
+            target_period=10.0,
+        )
+        mask_source = fallback_mask_source or "fallback_mask"
     gray_image = result.rotated_image
     mask = result.rotated_mask
     masked_image = gray_image.copy()
@@ -140,6 +151,46 @@ def preprocess_input_bgr(
             "solov2_device": solov2_device,
             "solov2_config": str(solov2_config) if solov2_config is not None else None,
             "solov2_checkpoint": str(solov2_checkpoint) if solov2_checkpoint is not None else None,
+            "mask_source": mask_source,
+        }
+        (save_preprocess_dir / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+    return image_tensor, mask_tensor, (int(masked_image.shape[0]), int(masked_image.shape[1]))
+
+
+def preprocess_saved_masked_input(
+    masked_image_path: Path,
+    mask_path: Path,
+    save_preprocess_dir: Path | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, tuple[int, int]]:
+    masked_image = cv2.imread(str(masked_image_path), cv2.IMREAD_GRAYSCALE)
+    if masked_image is None:
+        raise FileNotFoundError(f"unable to load masked image from {masked_image_path}")
+    mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+    if mask is None:
+        raise FileNotFoundError(f"unable to load mask from {mask_path}")
+    if masked_image.shape != mask.shape:
+        raise ValueError(
+            "masked image and mask must have the same shape, "
+            f"got {masked_image.shape} and {mask.shape}"
+        )
+
+    image_float = masked_image.astype(np.float32)
+    if image_float.max(initial=0.0) > 1.0:
+        image_float /= 255.0
+    mask_binary = (mask > 0).astype(np.float32)
+
+    image_tensor = torch.from_numpy(image_float).unsqueeze(0).unsqueeze(0)
+    mask_tensor = torch.from_numpy(mask_binary).unsqueeze(0).unsqueeze(0)
+
+    if save_preprocess_dir is not None:
+        save_preprocess_dir.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(save_preprocess_dir / "masked_image.png"), masked_image)
+        cv2.imwrite(str(save_preprocess_dir / "mask.png"), mask)
+        meta = {
+            "canonical_preprocess": "generated_ground_truth_bundle",
+            "masked_image_path": str(masked_image_path),
+            "mask_path": str(mask_path),
         }
         (save_preprocess_dir / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
@@ -153,7 +204,7 @@ def preprocess_input_image(
     solov2_config: Path | None = None,
     solov2_checkpoint: Path | None = None,
     solov2_device: str | None = None,
-    solov2_score_thr: float = 0.3,
+    solov2_score_thr: float = 0.15,
 ) -> tuple[torch.Tensor, torch.Tensor, tuple[int, int]]:
     full_bgr = load_bgr_image(image_path)
     return preprocess_input_bgr(
@@ -344,7 +395,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--solov2-config", type=Path, default=None, help="SOLOv2 MMDetection config path.")
     parser.add_argument("--solov2-checkpoint", type=Path, default=None, help="SOLOv2 checkpoint path.")
     parser.add_argument("--solov2-device", default=None, help="SOLOv2 inference device, e.g. cpu or cuda:0.")
-    parser.add_argument("--solov2-score-thr", type=float, default=0.3, help="Minimum SOLOv2 distal phalanx detection score.")
+    parser.add_argument("--solov2-score-thr", type=float, default=0.15, help="Minimum SOLOv2 distal phalanx detection score.")
     parser.add_argument(
         "--output-minutiae-csv",
         type=Path,

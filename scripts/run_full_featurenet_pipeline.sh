@@ -81,8 +81,14 @@ TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-1}"
 TRAIN_GRAD_ACCUM_STEPS="${TRAIN_GRAD_ACCUM_STEPS:-8}"
 TRAIN_NUM_WORKERS="${TRAIN_NUM_WORKERS:-1}"
 TRAIN_AMP_DTYPE="${TRAIN_AMP_DTYPE:-bf16}"
+TRAIN_RAW_VIEW_INDICES="${TRAIN_RAW_VIEW_INDICES:-all}"
 GT_FAILED_DATASETS=()
 GT_COMMON_ARGS=()
+TRAIN_RAW_VIEW_ARGS=()
+if [[ -n "$TRAIN_RAW_VIEW_INDICES" && "${TRAIN_RAW_VIEW_INDICES,,}" != "all" ]]; then
+  read -r -a TRAIN_RAW_VIEW_INDEX_VALUES <<<"$TRAIN_RAW_VIEW_INDICES"
+  TRAIN_RAW_VIEW_ARGS=(--raw-view-indices "${TRAIN_RAW_VIEW_INDEX_VALUES[@]}")
+fi
 if [[ "$GT_SKIP_EXISTING" == "1" || "$GT_SKIP_EXISTING" == "true" || "$GT_SKIP_EXISTING" == "yes" ]]; then
   GT_COMMON_ARGS+=(--skip-existing)
 fi
@@ -101,6 +107,7 @@ echo "FeatureNet output dir: $TRAIN_OUTPUT_DIR"
 echo "FeatureNet batch size: $TRAIN_BATCH_SIZE"
 echo "FeatureNet grad accumulation steps: $TRAIN_GRAD_ACCUM_STEPS"
 echo "FeatureNet AMP dtype: $TRAIN_AMP_DTYPE"
+echo "FeatureNet raw view indices: $TRAIN_RAW_VIEW_INDICES"
 
 dataset_enabled() {
   case "$START_DATASET:$1" in
@@ -201,7 +208,7 @@ fi
 
 if dataset_enabled train; then
   echo "[7/7] Training FeatureNet"
-  python -m featurenet.models.train --ground-truth-root "$MERGED_OUTPUT_ROOT" --output-dir "$TRAIN_OUTPUT_DIR" --device "$TRAIN_DEVICE" --epochs "$TRAIN_EPOCHS" --batch-size "$TRAIN_BATCH_SIZE" --grad-accum-steps "$TRAIN_GRAD_ACCUM_STEPS" --max-grad-norm 5.0 --num-workers "$TRAIN_NUM_WORKERS" --amp --channels-last --early-stopping --early-stopping-metric best_score_f1 --early-stopping-patience 15 --mu-score 80 --mu-x 40 --mu-y 40 --mu-ori 30 --amp-dtype "$TRAIN_AMP_DTYPE"
+  python -m featurenet.models.train --ground-truth-root "$MERGED_OUTPUT_ROOT" --output-dir "$TRAIN_OUTPUT_DIR" --device "$TRAIN_DEVICE" --epochs "$TRAIN_EPOCHS" --batch-size "$TRAIN_BATCH_SIZE" --grad-accum-steps "$TRAIN_GRAD_ACCUM_STEPS" --max-grad-norm 5.0 --num-workers "$TRAIN_NUM_WORKERS" --amp --channels-last --early-stopping --early-stopping-metric best_score_f1 --early-stopping-patience 15 --mu-score 80 --mu-x 40 --mu-y 40 --mu-ori 30 --amp-dtype "$TRAIN_AMP_DTYPE" "${TRAIN_RAW_VIEW_ARGS[@]}"
 else
   echo "[7/7] Skipping training"
 fi
