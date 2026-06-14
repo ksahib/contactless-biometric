@@ -82,17 +82,20 @@ class FeatureNetLazyLoadingTests(unittest.TestCase):
             self.assertEqual(samples[0]["input_shape_hw"], (8, 8))
             self.assertEqual(samples[0]["output_shape_hw"], (1, 1))
 
-    def test_load_bundle_samples_can_filter_to_front_view(self) -> None:
+    def test_load_bundle_samples_keeps_all_supported_views(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             self._write_bundle(root, "sample_front", raw_view_index=0)
             self._write_bundle(root, "sample_left", raw_view_index=1)
             self._write_bundle(root, "sample_right", raw_view_index=2)
 
-            samples = load_bundle_samples(root, raw_view_indices={0}, strict_gradient_targets=True)
+            samples = load_bundle_samples(root, strict_gradient_targets=True)
 
-            self.assertEqual([sample["sample_id"] for sample in samples], ["sample_front"])
-            self.assertEqual([sample["raw_view_index"] for sample in samples], [0])
+            self.assertEqual(
+                [sample["sample_id"] for sample in samples],
+                ["sample_front", "sample_left", "sample_right"],
+            )
+            self.assertEqual([sample["raw_view_index"] for sample in samples], [0, 1, 2])
 
     def test_dataset_getitem_lazy_loads_targets(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

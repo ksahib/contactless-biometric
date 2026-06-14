@@ -381,6 +381,41 @@ def _principal_axis_angle_degrees(mask: np.ndarray) -> float:
     return _normalize_angle_degrees_180(angle)
 
 
+def _foreground_band_width(mask: np.ndarray, rows: np.ndarray) -> float:
+    widths: list[float] = []
+    for row in rows:
+        cols = np.flatnonzero(mask[int(row)] > 0)
+        if cols.size > 0:
+            widths.append(float(cols[-1] - cols[0] + 1))
+    if not widths:
+        return 0.0
+    return float(np.median(np.asarray(widths, dtype=np.float32)))
+
+
+def _should_flip_tip_to_top(mask: np.ndarray) -> bool:
+    refined = _largest_component_mask(_as_uint8_mask(mask))
+    ys, _ = np.where(refined > 0)
+    if ys.size < 2:
+        return False
+
+    y_min = int(ys.min())
+    y_max = int(ys.max())
+    height = y_max - y_min + 1
+    if height < 8:
+        return False
+
+    band_height = max(2, int(round(0.2 * height)))
+    top_rows = np.arange(y_min, min(y_min + band_height, y_max + 1), dtype=np.int32)
+    bottom_rows = np.arange(max(y_min, y_max - band_height + 1), y_max + 1, dtype=np.int32)
+    top_width = _foreground_band_width(refined, top_rows)
+    bottom_width = _foreground_band_width(refined, bottom_rows)
+    if top_width <= 0.0 or bottom_width <= 0.0:
+        return False
+
+    min_margin = max(4.0, 0.08 * max(top_width, bottom_width))
+    return (top_width - bottom_width) > min_margin
+
+
 def _resolve_asset_path(
     explicit_path: str | Path | None,
     env_var_name: str,
@@ -910,6 +945,10 @@ def rotate_to_vertical_centerline(
         interpolation=cv2.INTER_NEAREST,
         border_value=0,
     )
+    if _should_flip_tip_to_top(rotated_mask):
+        rotated_image = np.ascontiguousarray(np.flipud(np.fliplr(rotated_image)))
+        rotated_mask = np.ascontiguousarray(np.flipud(np.fliplr(rotated_mask)))
+        yaw_angle = _normalize_angle_degrees_180(yaw_angle + 180.0)
     rotated_image[rotated_mask <= 0] = 0
     return rotated_image.astype(np.uint8), _as_uint8_mask(rotated_mask), float(yaw_angle)
 

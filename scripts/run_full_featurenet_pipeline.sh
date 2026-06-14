@@ -81,16 +81,43 @@ TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-1}"
 TRAIN_GRAD_ACCUM_STEPS="${TRAIN_GRAD_ACCUM_STEPS:-8}"
 TRAIN_NUM_WORKERS="${TRAIN_NUM_WORKERS:-1}"
 TRAIN_AMP_DTYPE="${TRAIN_AMP_DTYPE:-bf16}"
-TRAIN_RAW_VIEW_INDICES="${TRAIN_RAW_VIEW_INDICES:-all}"
+TRAIN_AUGMENTATIONS="${TRAIN_AUGMENTATIONS:-1}"
+TRAIN_AUGMENTATION_COUNT="${TRAIN_AUGMENTATION_COUNT:-5}"
+TRAIN_TRANSLATION_JITTER_PX="${TRAIN_TRANSLATION_JITTER_PX:-16 32}"
+TRAIN_YAW_JITTER_DEG="${TRAIN_YAW_JITTER_DEG:-5}"
+TRAIN_PITCH_ROLL_JITTER_DEG="${TRAIN_PITCH_ROLL_JITTER_DEG:-5 15}"
+TRAIN_AUGMENTATION_MISSING_RECONSTRUCTION="${TRAIN_AUGMENTATION_MISSING_RECONSTRUCTION:-skip}"
+TRAIN_AUGMENTATION_DEBUG_DIR="${TRAIN_AUGMENTATION_DEBUG_DIR:-}"
+TRAIN_AUGMENTATION_DEBUG_LIMIT="${TRAIN_AUGMENTATION_DEBUG_LIMIT:-0}"
+TRAIN_AUGMENTATION_RECONSTRUCTION_CACHE_SIZE="${TRAIN_AUGMENTATION_RECONSTRUCTION_CACHE_SIZE:-2}"
+TRAIN_AUGMENTATION_SAMPLE_CACHE_SIZE="${TRAIN_AUGMENTATION_SAMPLE_CACHE_SIZE:-8}"
+TRAIN_AUGMENTATION_GROUP_VARIANTS="${TRAIN_AUGMENTATION_GROUP_VARIANTS:-0}"
 GT_FAILED_DATASETS=()
 GT_COMMON_ARGS=()
-TRAIN_RAW_VIEW_ARGS=()
-if [[ -n "$TRAIN_RAW_VIEW_INDICES" && "${TRAIN_RAW_VIEW_INDICES,,}" != "all" ]]; then
-  read -r -a TRAIN_RAW_VIEW_INDEX_VALUES <<<"$TRAIN_RAW_VIEW_INDICES"
-  TRAIN_RAW_VIEW_ARGS=(--raw-view-indices "${TRAIN_RAW_VIEW_INDEX_VALUES[@]}")
-fi
+TRAIN_AUGMENTATION_ARGS=()
 if [[ "$GT_SKIP_EXISTING" == "1" || "$GT_SKIP_EXISTING" == "true" || "$GT_SKIP_EXISTING" == "yes" ]]; then
   GT_COMMON_ARGS+=(--skip-existing)
+fi
+if [[ "$TRAIN_AUGMENTATIONS" == "1" || "$TRAIN_AUGMENTATIONS" == "true" || "$TRAIN_AUGMENTATIONS" == "yes" ]]; then
+  read -r -a TRAIN_TRANSLATION_JITTER_VALUES <<<"$TRAIN_TRANSLATION_JITTER_PX"
+  read -r -a TRAIN_PITCH_ROLL_JITTER_VALUES <<<"$TRAIN_PITCH_ROLL_JITTER_DEG"
+  TRAIN_AUGMENTATION_ARGS=(
+    --train-augmentations
+    --augmentation-count "$TRAIN_AUGMENTATION_COUNT"
+    --translation-jitter-px "${TRAIN_TRANSLATION_JITTER_VALUES[@]}"
+    --yaw-jitter-deg "$TRAIN_YAW_JITTER_DEG"
+    --pitch-roll-jitter-deg "${TRAIN_PITCH_ROLL_JITTER_VALUES[@]}"
+    --augmentation-missing-reconstruction "$TRAIN_AUGMENTATION_MISSING_RECONSTRUCTION"
+    --augmentation-debug-limit "$TRAIN_AUGMENTATION_DEBUG_LIMIT"
+    --augmentation-reconstruction-cache-size "$TRAIN_AUGMENTATION_RECONSTRUCTION_CACHE_SIZE"
+    --augmentation-sample-cache-size "$TRAIN_AUGMENTATION_SAMPLE_CACHE_SIZE"
+  )
+  if [[ "$TRAIN_AUGMENTATION_GROUP_VARIANTS" == "1" || "$TRAIN_AUGMENTATION_GROUP_VARIANTS" == "true" || "$TRAIN_AUGMENTATION_GROUP_VARIANTS" == "yes" ]]; then
+    TRAIN_AUGMENTATION_ARGS+=(--augmentation-group-variants)
+  fi
+  if [[ -n "$TRAIN_AUGMENTATION_DEBUG_DIR" ]]; then
+    TRAIN_AUGMENTATION_ARGS+=(--augmentation-debug-dir "$TRAIN_AUGMENTATION_DEBUG_DIR")
+  fi
 fi
 
 echo "Using NBIS mindtct: $MINDTCT_BIN"
@@ -107,7 +134,8 @@ echo "FeatureNet output dir: $TRAIN_OUTPUT_DIR"
 echo "FeatureNet batch size: $TRAIN_BATCH_SIZE"
 echo "FeatureNet grad accumulation steps: $TRAIN_GRAD_ACCUM_STEPS"
 echo "FeatureNet AMP dtype: $TRAIN_AMP_DTYPE"
-echo "FeatureNet raw view indices: $TRAIN_RAW_VIEW_INDICES"
+echo "FeatureNet train augmentations: $TRAIN_AUGMENTATIONS"
+echo "FeatureNet augmentation grouped variants: $TRAIN_AUGMENTATION_GROUP_VARIANTS"
 
 dataset_enabled() {
   case "$START_DATASET:$1" in
@@ -208,7 +236,7 @@ fi
 
 if dataset_enabled train; then
   echo "[7/7] Training FeatureNet"
-  python -m featurenet.models.train --ground-truth-root "$MERGED_OUTPUT_ROOT" --output-dir "$TRAIN_OUTPUT_DIR" --device "$TRAIN_DEVICE" --epochs "$TRAIN_EPOCHS" --batch-size "$TRAIN_BATCH_SIZE" --grad-accum-steps "$TRAIN_GRAD_ACCUM_STEPS" --max-grad-norm 5.0 --num-workers "$TRAIN_NUM_WORKERS" --amp --channels-last --early-stopping --early-stopping-metric best_score_f1 --early-stopping-patience 15 --mu-score 80 --mu-x 40 --mu-y 40 --mu-ori 30 --amp-dtype "$TRAIN_AMP_DTYPE" "${TRAIN_RAW_VIEW_ARGS[@]}"
+  python -m featurenet.models.train --ground-truth-root "$MERGED_OUTPUT_ROOT" --output-dir "$TRAIN_OUTPUT_DIR" --device "$TRAIN_DEVICE" --epochs "$TRAIN_EPOCHS" --batch-size "$TRAIN_BATCH_SIZE" --grad-accum-steps "$TRAIN_GRAD_ACCUM_STEPS" --max-grad-norm 5.0 --num-workers "$TRAIN_NUM_WORKERS" --amp --channels-last --early-stopping --early-stopping-metric best_score_f1 --early-stopping-patience 15 --mu-score 80 --mu-x 40 --mu-y 40 --mu-ori 30 --amp-dtype "$TRAIN_AMP_DTYPE" "${TRAIN_AUGMENTATION_ARGS[@]}"
 else
   echo "[7/7] Skipping training"
 fi

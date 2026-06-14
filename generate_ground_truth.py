@@ -51,6 +51,7 @@ import numpy as np
 import pyfing
 
 from scripts.minutiae_gaussian_heatmap import rasterize_consensus_gaussian_heatmap
+from featurenet.models import target_rasterization as featurenet_targets
 
 
 def _install_numpy_scalar_aliases_compat() -> None:
@@ -5002,51 +5003,17 @@ def _build_featurenet_targets(
     extractor_config: MinutiaeExtractorConfig | None = None,
     output_shape: tuple[int, int] | None = None,
 ) -> dict[str, np.ndarray]:
-    extractor_config = extractor_config or MinutiaeExtractorConfig()
-    if output_shape is None:
-        output_shape = _compute_output_shape(*gray_image.shape)
-    mask_small_dense = _resize_mask(mask, output_shape)
-    mask_small_points = _downsample_mask_for_points(mask, output_shape)
-
-    orientation_small = _resize_orientation_for_model(orientation, mask.astype(np.float32) / 255.0, output_shape)
-    orientation_one_hot = _build_orientation_one_hot(orientation_small, mask_small_dense)
-
-    ridge_small = _resize_float(ridge_period, output_shape) * mask_small_dense
-    ridge_max = float(ridge_small.max(initial=0.0))
-    if ridge_max > 0.0:
-        ridge_small = ridge_small / ridge_max
-
-    minutia_targets = _rasterize_minutiae(minutiae, gray_image.shape, output_shape, mask_small_points)
-    minutia_targets = _apply_gaussian_score_targets(
-        minutia_targets,
-        positive_minutiae=minutiae,
+    return featurenet_targets.build_featurenet_targets(
+        gray_image=gray_image,
+        mask=mask,
+        orientation=orientation,
+        ridge_period=ridge_period,
+        gradient=gradient,
+        minutiae=minutiae,
         single_source_candidates=single_source_candidates,
-        source_shape=gray_image.shape,
-        target_shape=output_shape,
-        mask_small=mask_small_points,
-        extractor_config=extractor_config,
+        extractor_config=extractor_config or MinutiaeExtractorConfig(),
+        output_shape=output_shape,
     )
-    targets = {
-        "orientation": orientation_one_hot.astype(np.float32),
-        "ridge_period": ridge_small[np.newaxis, ...].astype(np.float32),
-        "minutia_score": minutia_targets["minutia_score"],
-        "minutia_score_weight_map": minutia_targets["minutia_score_weight_map"],
-        "minutia_score_ignore_mask": minutia_targets["minutia_score_ignore_mask"],
-        "minutia_score_center_map": minutia_targets["minutia_score_center_map"],
-        "minutia_valid_mask": minutia_targets["minutia_valid_mask"],
-        "minutia_x": minutia_targets["minutia_x"],
-        "minutia_y": minutia_targets["minutia_y"],
-        "minutia_x_offset": minutia_targets["minutia_x_offset"],
-        "minutia_y_offset": minutia_targets["minutia_y_offset"],
-        "minutia_orientation": minutia_targets["minutia_orientation"],
-        "minutia_orientation_vec": minutia_targets["minutia_orientation_vec"],
-        "output_mask": mask_small_dense[np.newaxis, ...].astype(np.float32),
-    }
-    if gradient is not None:
-        grad_x_small = _resize_float(gradient[:, :, 0], output_shape) * mask_small_dense
-        grad_y_small = _resize_float(gradient[:, :, 1], output_shape) * mask_small_dense
-        targets["gradient"] = np.stack([grad_x_small, grad_y_small], axis=0).astype(np.float32)
-    return targets
 
 
 def _build_targets_and_count_rasterized_minutiae(

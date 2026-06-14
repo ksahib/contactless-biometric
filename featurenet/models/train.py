@@ -32,7 +32,7 @@ ensure_stdlib_copy_module()
 import torch
 import torch.nn.functional as F
 from torch import optim
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 
 try:
     import cv2  # type: ignore
@@ -46,6 +46,12 @@ except ImportError:  # pragma: no cover - Pillow may also be unavailable
 
 from .feature_extractor import FeatureExtractor
 from .losses import FeatureNetLoss
+from .augmentation import (
+    AugmentationConfig,
+    augment_sample,
+    has_usable_reconstruction,
+    sample_augmentation_params,
+)
 
 
 FLOAT_TARGET_KEYS = {
@@ -187,22 +193,103 @@ def _materialize_sample_targets(sample: Mapping[str, Any]) -> dict[str, Any]:
 
 
 class FeatureNetDataset(Dataset):
-    def __init__(self, samples: list[Mapping[str, Any]]):
+    def __init__(
+        self,
+        samples: list[Mapping[str, Any]],
+        augmentation_config: AugmentationConfig | None = None,
+        seed: int | None = None,
+    ):
         self.samples = samples
+        self.augmentation_config = augmentation_config
+        self.seed = int(seed if seed is not None else 0)
+        self._access_counts: dict[tuple[int, int], int] = defaultdict(int)
 
     def __len__(self) -> int:
-        return len(self.samples)
+        if self.augmentation_config is None:
+            return len(self.samples)
+        return len(self.samples) * (1 + max(0, int(self.augmentation_config.count)))
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        sample = self.samples[index]
-        input_tensor, mask_tensor = build_input_tensor(
-            sample["masked_image"],
-            sample["mask"],
-        )
+        if self.augmentation_config is None:
+            base_index = index
+            variant_index = 0
+        else:
+            variants_per_sample = 1 + max(0, int(self.augmentation_config.count))
+            base_index = index // variants_per_sample
+            variant_index = index % variants_per_sample
 
-        targets = prepare_targets(_materialize_sample_targets(sample), mask_tensor)
-        targets["_sample_index"] = torch.tensor(index, dtype=torch.long)
+        sample = self.samples[base_index]
+        augmentation_mode = 0
+        if self.augmentation_config is None or variant_index == 0:
+            input_tensor, mask_tensor = build_input_tensor(
+                sample["masked_image"],
+                sample["mask"],
+            )
+            materialized_targets = _materialize_sample_targets(sample)
+        else:
+            access_key = (base_index, variant_index)
+            access_count = self._access_counts[access_key]
+            self._access_counts[access_key] = access_count + 1
+            rng = np.random.default_rng(
+                self.seed
+                + (base_index + 1) * 1_000_003
+                + variant_index * 10_007
+                + access_count * 97_409
+            )
+            params = sample_augmentation_params(rng, self.augmentation_config)
+            output_shape = tuple(int(value) for value in sample["output_shape_hw"])
+            debug_dir = None
+            debug_stem = None
+            if self.augmentation_config.debug_dir is not None and access_count < self.augmentation_config.debug_limit:
+                debug_dir = self.augmentation_config.debug_dir
+                debug_stem = f"{sample.get('sample_id', base_index)}_v{variant_index}_n{access_count}"
+            augmented = augment_sample(
+                sample,
+                params,
+                output_shape=output_shape,
+                debug_dir=debug_dir,
+                debug_stem=debug_stem,
+                reconstruction_cache_size=self.augmentation_config.reconstruction_cache_size,
+                sample_cache_size=self.augmentation_config.sample_cache_size,
+            )
+            input_tensor, mask_tensor = build_input_tensor(augmented.image, augmented.mask)
+            materialized_targets = dict(augmented.targets)
+            for metadata_key in ("raw_view_index", "input_shape_hw", "output_shape_hw"):
+                if metadata_key in sample:
+                    if metadata_key.endswith("_shape_hw"):
+                        materialized_targets[metadata_key] = np.asarray(sample[metadata_key], dtype=np.int64)
+                    else:
+                        materialized_targets[metadata_key] = np.int64(sample[metadata_key])
+            if "output_mask" in materialized_targets and "mask" not in materialized_targets:
+                materialized_targets["mask"] = materialized_targets.pop("output_mask")
+            augmentation_mode = 2 if str(augmented.details.get("mode", "")).startswith("3d") else 1
+
+        targets = prepare_targets(materialized_targets, mask_tensor)
+        targets["_sample_index"] = torch.tensor(base_index, dtype=torch.long)
+        targets["_augmentation_mode"] = torch.tensor(augmentation_mode, dtype=torch.long)
+        targets["_augmentation_variant_index"] = torch.tensor(variant_index, dtype=torch.long)
         return input_tensor, targets
+
+
+class FeatureNetGroupedVariantSampler(Sampler[int]):
+    def __init__(self, sample_count: int, variants_per_sample: int, seed: int | None = None):
+        self.sample_count = int(sample_count)
+        self.variants_per_sample = int(variants_per_sample)
+        self.seed = int(seed if seed is not None else 0)
+        self.epoch = 0
+
+    def __iter__(self):
+        order = list(range(self.sample_count))
+        rng = random.Random(self.seed + self.epoch * 1_000_003)
+        rng.shuffle(order)
+        self.epoch += 1
+        for base_index in order:
+            start = base_index * self.variants_per_sample
+            for variant_index in range(self.variants_per_sample):
+                yield start + variant_index
+
+    def __len__(self) -> int:
+        return self.sample_count * self.variants_per_sample
 
 
 def _pad_tensor_to_shape(tensor: torch.Tensor, spatial_shape: tuple[int, int]) -> torch.Tensor:
@@ -243,8 +330,23 @@ def create_dataloader(
     pin_memory: bool | None = None,
     persistent_workers: bool = False,
     prefetch_factor: int | None = None,
+    train_augmentations: bool = False,
+    augmentation_config: AugmentationConfig | None = None,
+    seed: int | None = None,
 ) -> DataLoader:
-    dataset = FeatureNetDataset(samples)
+    dataset = FeatureNetDataset(
+        samples,
+        augmentation_config=augmentation_config if train_augmentations else None,
+        seed=seed,
+    )
+    sampler = None
+    if train_augmentations and augmentation_config is not None and augmentation_config.group_variants:
+        sampler = FeatureNetGroupedVariantSampler(
+            sample_count=len(samples),
+            variants_per_sample=1 + max(0, int(augmentation_config.count)),
+            seed=seed,
+        )
+        shuffle = False
     if pin_memory is None:
         pin_memory = torch.cuda.is_available()
     dataloader_kwargs: dict[str, Any] = {
@@ -255,6 +357,9 @@ def create_dataloader(
         "pin_memory": pin_memory,
         "collate_fn": _collate_batch,
     }
+    if sampler is not None:
+        dataloader_kwargs["sampler"] = sampler
+        dataloader_kwargs.pop("shuffle", None)
     if num_workers > 0:
         dataloader_kwargs["persistent_workers"] = persistent_workers
         if prefetch_factor is not None:
@@ -547,12 +652,45 @@ def train_one_epoch(
     grad_norm_count = 0
     grad_accum_steps = max(1, int(grad_accum_steps))
     optimizer.zero_grad(set_to_none=True)
+    data_wait_seconds = 0.0
+    host_to_device_seconds = 0.0
+    forward_loss_seconds = 0.0
+    backward_optimizer_seconds = 0.0
+    augmentation_mode_counts = {"original": 0, "2d": 0, "3d": 0, "unknown": 0}
 
-    for batch_index, (inputs, targets) in enumerate(dataloader, start=1):
+    batch_index = 0
+    iterator = iter(dataloader)
+    next_fetch_started = time.perf_counter()
+    while True:
+        try:
+            inputs, targets = next(iterator)
+        except StopIteration:
+            break
+        fetched_at = time.perf_counter()
+        data_wait_seconds += fetched_at - next_fetch_started
+        batch_index += 1
+
+        mode_values = targets.get("_augmentation_mode")
+        if mode_values is not None:
+            for mode_value in mode_values.detach().cpu().flatten().tolist():
+                if int(mode_value) == 0:
+                    augmentation_mode_counts["original"] += 1
+                elif int(mode_value) == 1:
+                    augmentation_mode_counts["2d"] += 1
+                elif int(mode_value) == 2:
+                    augmentation_mode_counts["3d"] += 1
+                else:
+                    augmentation_mode_counts["unknown"] += 1
+
+        host_to_device_started = time.perf_counter()
         inputs = inputs.to(resolved_device, non_blocking=True)
         inputs = _prepare_inputs_for_model(inputs, channels_last)
         targets = _move_targets_to_device(targets, resolved_device)
+        host_to_device_seconds += time.perf_counter() - host_to_device_started
+
+        forward_loss_started = time.perf_counter()
         losses = _run_model_step(model, criterion, inputs, targets, amp=amp, amp_dtype=amp_dtype)
+        forward_loss_seconds += time.perf_counter() - forward_loss_started
         total_loss = losses["total"]
         if not torch.isfinite(total_loss):
             sample_ids = _sample_ids_for_batch(dataloader, targets)
@@ -566,11 +704,13 @@ def train_one_epoch(
                     + _non_finite_loss_message(losses, batch_index, sample_ids, target_issues, output_issues),
                     flush=True,
                 )
+                next_fetch_started = time.perf_counter()
                 continue
             raise RuntimeError(
                 _non_finite_loss_message(losses, batch_index, sample_ids, target_issues, output_issues)
             )
 
+        backward_started = time.perf_counter()
         scaled_loss = total_loss / grad_accum_steps
         if scaler is not None and amp and resolved_device.type == "cuda":
             scaler.scale(scaled_loss).backward()
@@ -595,11 +735,13 @@ def train_one_epoch(
                 grad_norm_sum += grad_norm
                 grad_norm_count += 1
             accum_batches = 0
+        backward_optimizer_seconds += time.perf_counter() - backward_started
 
         scalar_losses = _loss_dict_to_scalars(losses)
         for key in LOSS_KEYS:
             running[key] += scalar_losses[key]
         num_batches += 1
+        next_fetch_started = time.perf_counter()
 
     if accum_batches > 0:
         stepped, grad_norm = _optimizer_step(
@@ -627,6 +769,18 @@ def train_one_epoch(
     metrics["skipped_optimizer_steps"] = float(skipped_optimizer_steps)
     if grad_norm_count > 0:
         metrics["grad_norm"] = grad_norm_sum / grad_norm_count
+    metrics["data_wait_seconds"] = data_wait_seconds
+    metrics["host_to_device_seconds"] = host_to_device_seconds
+    metrics["forward_loss_seconds"] = forward_loss_seconds
+    metrics["backward_optimizer_seconds"] = backward_optimizer_seconds
+    metrics["data_wait_seconds_per_batch"] = data_wait_seconds / num_batches
+    metrics["host_to_device_seconds_per_batch"] = host_to_device_seconds / num_batches
+    metrics["forward_loss_seconds_per_batch"] = forward_loss_seconds / num_batches
+    metrics["backward_optimizer_seconds_per_batch"] = backward_optimizer_seconds / num_batches
+    metrics["augmentation_original_batches"] = float(augmentation_mode_counts["original"])
+    metrics["augmentation_2d_batches"] = float(augmentation_mode_counts["2d"])
+    metrics["augmentation_3d_batches"] = float(augmentation_mode_counts["3d"])
+    metrics["augmentation_unknown_batches"] = float(augmentation_mode_counts["unknown"])
     return metrics
 
 
@@ -827,7 +981,6 @@ def _infer_output_shape_from_targets(targets: Mapping[str, Any]) -> tuple[int, i
 def load_bundle_samples(
     ground_truth_root: str | Path,
     limit: int | None = None,
-    raw_view_indices: set[int] | None = None,
     strict_gradient_targets: bool = False,
     strict_finite_targets: bool = False,
     skip_empty_minutia_support_with_minutiae: bool = True,
@@ -842,7 +995,6 @@ def load_bundle_samples(
         sample_dirs = sample_dirs[:limit]
 
     samples: list[dict[str, Any]] = []
-    allowed_raw_view_indices = {0, 1, 2} if raw_view_indices is None else {int(index) for index in raw_view_indices}
     missing_gradient_paths: list[Path] = []
     non_finite_target_paths: list[tuple[str, Path, list[str]]] = []
     empty_minutia_support_paths: list[tuple[str, Path, int]] = []
@@ -851,6 +1003,9 @@ def load_bundle_samples(
         masked_image_path = sample_dir / "masked_image.png"
         mask_path = sample_dir / "mask.png"
         targets_path = sample_dir / "featurenet_targets.npz"
+        minutiae_path = sample_dir / "minutiae.json"
+        orientation_path = sample_dir / "orientation.npy"
+        ridge_period_path = sample_dir / "ridge_period.npy"
         if not (meta_path.exists() and masked_image_path.exists() and mask_path.exists() and targets_path.exists()):
             continue
 
@@ -859,7 +1014,7 @@ def load_bundle_samples(
             raw_view_index = int(meta.get("raw_view_index", -1))
         except (TypeError, ValueError):
             continue
-        if raw_view_index not in allowed_raw_view_indices:
+        if raw_view_index not in {0, 1, 2}:
             continue
         targets = _load_npz_targets(targets_path)
         if "gradient" not in targets:
@@ -890,22 +1045,41 @@ def load_bundle_samples(
         if input_shape_hw is None:
             image_height, image_width = _read_grayscale_image(masked_image_path).shape[-2:]
             input_shape_hw = (int(image_height), int(image_width))
-        samples.append(
-            {
-                "sample_id": meta["sample_id"],
-                "parent_sample_id": meta.get("parent_sample_id"),
-                "finger_class_id": meta.get("finger_class_id"),
-                "subject_id": meta.get("subject_id"),
-                "finger_id": meta.get("finger_id"),
-                "acquisition_id": meta.get("acquisition_id"),
-                "masked_image": masked_image_path,
-                "mask": mask_path,
-                "targets_path": targets_path,
-                "raw_view_index": raw_view_index,
-                "input_shape_hw": tuple(int(value) for value in input_shape_hw),
-                "output_shape_hw": tuple(int(value) for value in output_shape_hw),
+        sample_record = {
+            "sample_id": meta["sample_id"],
+            "parent_sample_id": meta.get("parent_sample_id"),
+            "finger_class_id": meta.get("finger_class_id"),
+            "subject_id": meta.get("subject_id"),
+            "finger_id": meta.get("finger_id"),
+            "acquisition_id": meta.get("acquisition_id"),
+            "meta_path": meta_path,
+            "masked_image": masked_image_path,
+            "mask": mask_path,
+            "targets_path": targets_path,
+            "minutiae_path": minutiae_path,
+            "orientation_path": orientation_path,
+            "ridge_period_path": ridge_period_path,
+            "raw_view_index": raw_view_index,
+            "input_shape_hw": tuple(int(value) for value in input_shape_hw),
+            "output_shape_hw": tuple(int(value) for value in output_shape_hw),
+        }
+        reconstruction = meta.get("multiview_reconstruction")
+        if isinstance(reconstruction, Mapping):
+            sample_record["reconstruction"] = {
+                key: value
+                for key, value in reconstruction.items()
+                if key
+                in {
+                    "role",
+                    "reconstruction_dir",
+                    "reconstruction_maps_path",
+                    "depth_front_path",
+                    "depth_left_path",
+                    "depth_right_path",
+                    "depth_gradient_labels_path",
+                }
             }
-        )
+        samples.append(sample_record)
 
     if missing_gradient_paths:
         preview_items = [str(path) for path in missing_gradient_paths[:3]]
@@ -947,8 +1121,7 @@ def load_bundle_samples(
         )
 
     if not samples:
-        view_text = "all supported views" if raw_view_indices is None else ",".join(str(index) for index in sorted(allowed_raw_view_indices))
-        raise ValueError(f"no usable samples found under {samples_root} for raw_view_indices={view_text}")
+        raise ValueError(f"no usable samples found under {samples_root}")
     return samples
 
 
@@ -960,41 +1133,23 @@ def _raw_view_counts(samples: list[Mapping[str, Any]]) -> dict[str, int]:
     return dict(sorted(counts.items(), key=lambda item: item[0]))
 
 
-def _parse_raw_view_indices(values: list[str] | None) -> set[int] | None:
-    if values is None:
-        return None
-
-    tokens: list[str] = []
-    for value in values:
-        tokens.extend(part.strip() for part in str(value).split(","))
-    tokens = [token for token in tokens if token]
-    if not tokens or any(token.lower() == "all" for token in tokens):
-        return None
-
-    aliases = {
-        "front": 0,
-        "left": 1,
-        "right": 2,
-    }
-    parsed: set[int] = set()
-    for token in tokens:
-        lower = token.lower()
-        if lower in aliases:
-            parsed.add(aliases[lower])
-            continue
-        try:
-            parsed.add(int(token))
-        except ValueError as exc:
-            raise argparse.ArgumentTypeError(
-                f"raw view indices must be 0, 1, 2, front, left, right, or all; got {token!r}"
-            ) from exc
-
-    unsupported = parsed - {0, 1, 2}
-    if unsupported:
-        raise argparse.ArgumentTypeError(
-            f"unsupported raw view index/indices: {', '.join(str(index) for index in sorted(unsupported))}"
+def _filter_samples_for_augmentation(
+    samples: list[dict[str, Any]],
+    augmentation_config: AugmentationConfig,
+) -> list[dict[str, Any]]:
+    if augmentation_config.missing_reconstruction != "skip":
+        return samples
+    kept = [sample for sample in samples if has_usable_reconstruction(sample)]
+    skipped = len(samples) - len(kept)
+    if skipped:
+        print(
+            "[train_model] skipped "
+            f"{skipped} samples without usable reconstruction metadata for train-time 3D augmentation",
+            flush=True,
         )
-    return parsed
+    if not kept:
+        raise ValueError("no usable samples remain after augmentation reconstruction filtering")
+    return kept
 
 
 def _split_group_key(sample: Mapping[str, Any]) -> Any:
@@ -1149,6 +1304,87 @@ def _is_metric_improved(current: float, best: float, mode: str, min_delta: float
     raise ValueError(f"unsupported monitor mode: {mode}")
 
 
+def _make_augmentation_config(args: argparse.Namespace) -> AugmentationConfig:
+    translation_values = tuple(float(value) for value in args.translation_jitter_px)
+    pitch_roll_values = tuple(float(value) for value in args.pitch_roll_jitter_deg)
+    translation_typical, translation_strong = sorted(translation_values)
+    _, pitch_roll_strong = sorted(pitch_roll_values)
+    return AugmentationConfig(
+        count=args.augmentation_count,
+        translation_typical_px=translation_typical,
+        translation_strong_px=translation_strong,
+        yaw_deg=float(args.yaw_jitter_deg),
+        pitch_roll_typical_deg=pitch_roll_strong,
+        pitch_roll_strong_deg=max(25.0, pitch_roll_strong),
+        missing_reconstruction=args.augmentation_missing_reconstruction,
+        debug_dir=args.augmentation_debug_dir,
+        debug_limit=args.augmentation_debug_limit,
+        reconstruction_cache_size=args.augmentation_reconstruction_cache_size,
+        sample_cache_size=args.augmentation_sample_cache_size,
+        group_variants=bool(args.augmentation_group_variants),
+    )
+
+
+def run_augmentation_probe(args: argparse.Namespace) -> dict[str, Any]:
+    samples = load_bundle_samples(
+        args.ground_truth_root,
+        limit=args.limit,
+        strict_gradient_targets=args.strict_gradient_targets,
+        strict_finite_targets=args.strict_finite_targets,
+        skip_empty_minutia_support_with_minutiae=args.skip_empty_minutia_support_with_minutiae,
+    )
+    config = _make_augmentation_config(args)
+    samples = _filter_samples_for_augmentation(samples, config)
+    sample = samples[0]
+    image_shape = tuple(_read_grayscale_image(sample["masked_image"]).shape)
+    output_shape = tuple(int(value) for value in sample["output_shape_hw"])
+
+    from .augmentation import AugmentationParams, augment_sample, reconstruction_cache_info, sample_cache_info
+
+    probes = [
+        AugmentationParams(True, True, False, False, 8.0, -8.0, min(3.0, config.yaw_deg), 0.0, 0.0),
+        AugmentationParams(True, False, True, True, 4.0, -4.0, 0.0, 8.0, -8.0),
+    ]
+    records: list[dict[str, Any]] = []
+    for params in probes:
+        started = time.perf_counter()
+        result = augment_sample(
+            sample,
+            params,
+            output_shape=output_shape,
+            debug_dir=args.augmentation_debug_dir,
+            debug_stem=f"probe_{len(records)}" if args.augmentation_debug_dir is not None else None,
+            reconstruction_cache_size=config.reconstruction_cache_size,
+            sample_cache_size=config.sample_cache_size,
+        )
+        records.append(
+            {
+                "params": {
+                    "dx": params.dx,
+                    "dy": params.dy,
+                    "yaw_deg": params.yaw_deg,
+                    "pitch_deg": params.pitch_deg,
+                    "roll_deg": params.roll_deg,
+                },
+                "seconds": round(time.perf_counter() - started, 3),
+                "image_shape": list(result.image.shape),
+                "mask_pixels": int(np.count_nonzero(result.mask)),
+                "minutiae": len(result.minutiae),
+                "mode": result.details.get("mode"),
+            }
+        )
+    summary = {
+        "sample_id": sample.get("sample_id"),
+        "input_shape": list(image_shape),
+        "output_shape": list(output_shape),
+        "records": records,
+        "reconstruction_cache": reconstruction_cache_info(),
+        "sample_cache": sample_cache_info(),
+    }
+    print(json.dumps(summary, indent=2), flush=True)
+    return summary
+
+
 def train_model(args: argparse.Namespace) -> dict[str, Any]:
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -1159,11 +1395,34 @@ def train_model(args: argparse.Namespace) -> dict[str, Any]:
     samples = load_bundle_samples(
         args.ground_truth_root,
         limit=args.limit,
-        raw_view_indices=getattr(args, "raw_view_indices", None),
         strict_gradient_targets=args.strict_gradient_targets,
         strict_finite_targets=args.strict_finite_targets,
         skip_empty_minutia_support_with_minutiae=args.skip_empty_minutia_support_with_minutiae,
     )
+    augmentation_config = None
+    if args.train_augmentations:
+        augmentation_config = _make_augmentation_config(args)
+        samples = _filter_samples_for_augmentation(samples, augmentation_config)
+        first_image_shape = tuple(_read_grayscale_image(samples[0]["masked_image"]).shape)
+        print(
+            "[train_model] train augmentations enabled: "
+            f"count={augmentation_config.count}, image_shape={first_image_shape}, "
+            f"translation_typical/strong=({augmentation_config.translation_typical_px}, "
+            f"{augmentation_config.translation_strong_px}), yaw_deg={augmentation_config.yaw_deg}, "
+            f"pitch_roll_typical/strong=({augmentation_config.pitch_roll_typical_deg}, "
+            f"{augmentation_config.pitch_roll_strong_deg}), "
+            f"reconstruction_cache_size={augmentation_config.reconstruction_cache_size}, "
+            f"sample_cache_size={augmentation_config.sample_cache_size}, "
+            f"group_variants={augmentation_config.group_variants}",
+            flush=True,
+        )
+        h, w = first_image_shape
+        cache_mb = (float(h) * float(w) * 18.0 * float(augmentation_config.sample_cache_size)) / (1024.0 * 1024.0)
+        print(
+            "[train_model] estimated maximum sample-cache memory per worker: "
+            f"{cache_mb:.1f} MiB (includes lazy full-resolution gradient when used)",
+            flush=True,
+        )
     train_samples, val_samples = split_samples(samples, val_fraction=args.val_fraction, seed=args.seed)
     resolved_device = _resolve_device(args.device)
     use_amp = bool(args.amp) and resolved_device.type == "cuda"
@@ -1172,6 +1431,15 @@ def train_model(args: argparse.Namespace) -> dict[str, Any]:
     if args.cudnn_benchmark and resolved_device.type == "cuda":
         torch.backends.cudnn.benchmark = True
 
+    train_prefetch_factor = args.prefetch_factor
+    if args.train_augmentations and args.num_workers > 0:
+        if train_prefetch_factor is None or train_prefetch_factor > 1:
+            print(
+                "[train_model] reducing train DataLoader prefetch_factor to 1 for full-resolution augmentation",
+                flush=True,
+            )
+        train_prefetch_factor = 1
+
     train_loader = create_dataloader(
         samples=train_samples,
         batch_size=args.batch_size,
@@ -1179,7 +1447,10 @@ def train_model(args: argparse.Namespace) -> dict[str, Any]:
         num_workers=args.num_workers,
         pin_memory=use_pin_memory,
         persistent_workers=args.persistent_workers,
-        prefetch_factor=args.prefetch_factor,
+        prefetch_factor=train_prefetch_factor,
+        train_augmentations=bool(args.train_augmentations),
+        augmentation_config=augmentation_config,
+        seed=args.seed,
     )
     val_loader = None
     if val_samples:
@@ -1191,6 +1462,7 @@ def train_model(args: argparse.Namespace) -> dict[str, Any]:
             pin_memory=use_pin_memory,
             persistent_workers=args.persistent_workers,
             prefetch_factor=args.prefetch_factor,
+            train_augmentations=False,
         )
 
     model = _maybe_channels_last(FeatureExtractor().to(resolved_device), args.channels_last)
@@ -1386,9 +1658,6 @@ def train_model(args: argparse.Namespace) -> dict[str, Any]:
         "device": str(resolved_device),
         "sample_count": len(samples),
         "sample_count_by_raw_view_index": _raw_view_counts(samples),
-        "raw_view_indices": None
-        if getattr(args, "raw_view_indices", None) is None
-        else sorted(args.raw_view_indices),
         "train_sample_count": len(train_samples),
         "train_sample_count_by_raw_view_index": _raw_view_counts(train_samples),
         "val_sample_count": len(val_samples),
@@ -1410,13 +1679,19 @@ def train_model(args: argparse.Namespace) -> dict[str, Any]:
         "skip_empty_minutia_support_with_minutiae": bool(args.skip_empty_minutia_support_with_minutiae),
         "pin_memory": use_pin_memory,
         "persistent_workers": args.persistent_workers,
-        "prefetch_factor": args.prefetch_factor,
+        "prefetch_factor": train_prefetch_factor,
         "adam_beta1": 0.9,
         "adam_beta2": 0.999,
         "weight_decay": 0.0,
         "seed": args.seed,
         "strict_gradient_targets": bool(args.strict_gradient_targets),
         "strict_finite_targets": bool(args.strict_finite_targets),
+        "train_augmentations": bool(args.train_augmentations),
+        "augmentation_count": int(args.augmentation_count) if args.train_augmentations else 0,
+        "effective_train_dataset_length": len(train_loader.dataset),
+        "augmentation_reconstruction_cache_size": args.augmentation_reconstruction_cache_size,
+        "augmentation_sample_cache_size": args.augmentation_sample_cache_size,
+        "augmentation_group_variants": bool(args.augmentation_group_variants),
         "orientation_weight": args.orientation_weight,
         "ridge_weight": args.ridge_weight,
         "gradient_weight": args.gradient_weight,
@@ -1525,23 +1800,69 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Fail fast if any selected sample has NaN or Inf target values instead of skipping it.",
     )
-    parser.add_argument(
-        "--raw-view-indices",
-        type=str,
-        nargs="+",
-        default=None,
-        help=(
-            "Restrict training samples by raw_view_index. Use 0/front for front-only, "
-            "1/left and 2/right for side views, or all to use every supported view."
-        ),
-    )
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--train-augmentations", action="store_true", help="Enable train-only on-the-fly supervised geometry augmentations.")
+    parser.add_argument("--augmentation-count", type=int, default=5, help="Number of synthetic variants per eligible training sample.")
+    parser.add_argument(
+        "--translation-jitter-px",
+        type=float,
+        nargs=2,
+        default=(16.0, 32.0),
+        metavar=("TYPICAL", "STRONG"),
+        help=(
+            "Translation jitter typical/strong pixel ranges. Sampling includes small shifts: "
+            "70%% in [0,TYPICAL] and 30%% in [TYPICAL,STRONG], with random sign per axis."
+        ),
+    )
+    parser.add_argument(
+        "--yaw-jitter-deg",
+        type=float,
+        default=5.0,
+        help="Maximum residual in-plane yaw degrees sampled uniformly from [-value,+value].",
+    )
+    parser.add_argument(
+        "--pitch-roll-jitter-deg",
+        type=float,
+        nargs=2,
+        default=(5.0, 15.0),
+        metavar=("TYPICAL_MIN", "TYPICAL_MAX"),
+        help=(
+            "Pitch/roll CLI compatibility range. The upper value is used as the typical "
+            "mild limit, so small pitch/roll values are included; rare strong samples may reach +/-25 deg."
+        ),
+    )
+    parser.add_argument(
+        "--augmentation-missing-reconstruction",
+        choices=("skip", "allow"),
+        default="skip",
+        help="How to handle samples without reconstruction metadata when train augmentations are enabled.",
+    )
+    parser.add_argument("--augmentation-debug-dir", type=Path, default=None, help="Optional directory for before/after augmentation debug PNGs.")
+    parser.add_argument("--augmentation-debug-limit", type=int, default=0, help="Maximum debug examples per synthetic variant access counter.")
+    parser.add_argument(
+        "--augmentation-reconstruction-cache-size",
+        type=int,
+        default=2,
+        help="Maximum reconstruction map entries cached inside each DataLoader worker.",
+    )
+    parser.add_argument(
+        "--augmentation-sample-cache-size",
+        type=int,
+        default=8,
+        help="Maximum full-resolution sample bundles cached inside each DataLoader worker.",
+    )
+    parser.add_argument(
+        "--augmentation-group-variants",
+        action="store_true",
+        help="Shuffle base samples, then emit original plus all augmentation variants together for better worker cache hits.",
+    )
+    parser.add_argument(
+        "--augmentation-probe",
+        action="store_true",
+        help="Load one eligible sample, run forced 2D/3D augmentations, print timing/shape diagnostics, and exit.",
+    )
     args = parser.parse_args()
-    try:
-        args.raw_view_indices = _parse_raw_view_indices(args.raw_view_indices)
-    except argparse.ArgumentTypeError as exc:
-        parser.error(str(exc))
     if args.resume_checkpoint is not None and not args.resume_checkpoint.exists():
         parser.error(f"--resume-checkpoint does not exist: {args.resume_checkpoint}")
     if args.validate_every < 1:
@@ -1552,6 +1873,22 @@ def parse_args() -> argparse.Namespace:
         parser.error("--early-stopping-min-delta must be non-negative")
     if args.grad_accum_steps < 1:
         parser.error("--grad-accum-steps must be at least 1")
+    if args.augmentation_count < 0:
+        parser.error("--augmentation-count must be non-negative")
+    if any(float(value) < 0.0 for value in args.translation_jitter_px):
+        parser.error("--translation-jitter-px values must be non-negative")
+    if max(args.translation_jitter_px) <= 0.0 and args.train_augmentations:
+        parser.error("--translation-jitter-px must include a positive value when augmentations are enabled")
+    if args.yaw_jitter_deg < 0.0:
+        parser.error("--yaw-jitter-deg must be non-negative")
+    if any(float(value) < 0.0 for value in args.pitch_roll_jitter_deg):
+        parser.error("--pitch-roll-jitter-deg values must be non-negative")
+    if args.augmentation_debug_limit < 0:
+        parser.error("--augmentation-debug-limit must be non-negative")
+    if args.augmentation_reconstruction_cache_size < 1:
+        parser.error("--augmentation-reconstruction-cache-size must be at least 1")
+    if args.augmentation_sample_cache_size < 1:
+        parser.error("--augmentation-sample-cache-size must be at least 1")
     if args.max_grad_norm < 0.0:
         parser.error("--max-grad-norm must be non-negative")
     if args.amp and args.amp_dtype == "bf16" and torch.cuda.is_available() and not torch.cuda.is_bf16_supported():
@@ -1579,6 +1916,9 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.augmentation_probe:
+        run_augmentation_probe(args)
+        return
     summary = train_model(args)
     print(json.dumps(summary, indent=2), flush=True)
 
