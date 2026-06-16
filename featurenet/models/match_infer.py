@@ -19,7 +19,14 @@ from .infer import (
     run_inference,
     save_minutiae_csv,
     save_pose_sidecars,
+    unwarp_minutiae_rows,
     _resolve_device,
+)
+from .finger_pad_segmentation import (
+    FingerPadSegmentationError,
+    save_finger_pad_debug,
+    save_finger_pad_rejection,
+    segment_finger_pad,
 )
 
 ensure_stdlib_copy_module()
@@ -37,6 +44,13 @@ def _save_mask_png(mask_tensor: Any, path: Path) -> None:
     if mask_np.ndim != 4:
         raise ValueError(f"expected mask tensor shape [B,1,H,W], got {tuple(mask_np.shape)}")
     mask_img = (mask_np[0, 0] > 0.5).astype(np.uint8) * 255
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not cv2.imwrite(str(path), mask_img):
+        raise RuntimeError(f"failed to write mask image to {path}")
+
+
+def _save_mask_array_png(mask_array: np.ndarray, path: Path) -> None:
+    mask_img = (np.asarray(mask_array) > 0).astype(np.uint8) * 255
     path.parent.mkdir(parents=True, exist_ok=True)
     if not cv2.imwrite(str(path), mask_img):
         raise RuntimeError(f"failed to write mask image to {path}")
@@ -329,9 +343,10 @@ def _run_single_image_inference(
     score_threshold: float,
     apply_nms: bool,
     solov2_score_thr: float,
-    solov2_input_mode: str,
-    allow_distal_fallback: bool,
     image_output_dir: Path,
+    solov2_input_mode: str = "raw",
+    allow_distal_fallback: bool = False,
+    unwarp: str = "none",
 ) -> dict[str, Any]:
     preprocess_dir = image_output_dir / "preprocess"
     solov2_input_artifacts: dict[str, Any]
@@ -339,6 +354,7 @@ def _run_single_image_inference(
     fallback_mask: np.ndarray | None = None
     fallback_mask_source: str | None = None
     preprocess_bgr: np.ndarray | None = None
+    finger_pad_artifacts: dict[str, Any] | None = None
 
     if solov2_input_mode == "raw":
         preprocess_bgr = load_bgr_image(image_path)
@@ -413,6 +429,37 @@ def _run_single_image_inference(
                 "crop_bbox_path": str(crop_result["crop_bbox_path"]),
             },
         }
+    elif solov2_input_mode == "finger-pad-auto":
+        full_bgr = load_bgr_image(image_path)
+        finger_pad_dir = image_output_dir / "finger_pad_auto"
+        try:
+            segmentation = segment_finger_pad(full_bgr)
+        except FingerPadSegmentationError as exc:
+            save_finger_pad_rejection(
+                output_dir=finger_pad_dir,
+                bgr=full_bgr,
+                reason=str(exc),
+                image_path=image_path,
+                error=exc,
+            )
+            raise
+        debug_paths = save_finger_pad_debug(
+            output_dir=finger_pad_dir,
+            bgr=full_bgr,
+            segmentation=segmentation,
+        )
+        preprocess_bgr = full_bgr
+        fallback_mask = segmentation.distal_mask
+        fallback_mask_source = "finger_pad_auto"
+        finger_pad_artifacts = {
+            "debug": debug_paths,
+            "diagnostics": segmentation.diagnostics,
+        }
+        solov2_input_artifacts = {
+            "mode": "finger-pad-auto",
+            "mask_source": fallback_mask_source,
+            "finger_pad": finger_pad_artifacts,
+        }
     else:
         raise ValueError(f"unsupported --solov2-input-mode: {solov2_input_mode}")
 
@@ -422,8 +469,10 @@ def _run_single_image_inference(
             preprocess_bgr,
             save_preprocess_dir=preprocess_dir,
             solov2_score_thr=solov2_score_thr,
+            fallback_mask=fallback_mask,
+            fallback_mask_source=fallback_mask_source,
         )
-        mask_source = "solov2"
+        mask_source = fallback_mask_source or "solov2"
     except RuntimeError as exc:
         if not allow_distal_fallback or "distal phalanx" not in str(exc):
             raise
@@ -466,9 +515,28 @@ def _run_single_image_inference(
 
     minutiae_csv = image_output_dir / "minutiae.csv"
     mask_png = image_output_dir / "mask.png"
-    save_minutiae_csv(minutiae_rows, minutiae_csv)
+    unwarp_applied = False
+    if unwarp == "gradient":
+        gray_full = image_tensor.detach().cpu().numpy()[0, 0]
+        warped_rows, unwarped_mask = unwarp_minutiae_rows(
+            rows=minutiae_rows,
+            gradient_tensor=outputs["gradient"],
+            mask_tensor=mask_tensor,
+            input_shape_hw=input_shape_hw,
+            gray_image=gray_full,
+        )
+        if warped_rows is not minutiae_rows:
+            unwarp_applied = True
+            minutiae_rows = warped_rows
+            save_minutiae_csv(minutiae_rows, minutiae_csv)
+            _save_mask_array_png(unwarped_mask, mask_png)
+        else:
+            save_minutiae_csv(minutiae_rows, minutiae_csv)
+            _save_mask_png(mask_tensor, mask_png)
+    else:
+        save_minutiae_csv(minutiae_rows, minutiae_csv)
+        _save_mask_png(mask_tensor, mask_png)
     orientation_npy, ridge_period_npy = save_pose_sidecars(outputs, image_output_dir)
-    _save_mask_png(mask_tensor, mask_png)
 
     return {
         "minutiae_rows": minutiae_rows,
@@ -482,6 +550,9 @@ def _run_single_image_inference(
         "solov2_input": solov2_input_artifacts,
         "mask_source": mask_source,
         "distal_fallback": fallback_artifacts,
+        "finger_pad": finger_pad_artifacts,
+        "unwarp": unwarp,
+        "unwarp_applied": unwarp_applied,
     }
 
 
@@ -513,15 +584,28 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--solov2-input-mode",
-        choices=("raw", "gray", "foreground-black-gray", "foreground-black-gray-horizontal", "crop-black-gray"),
+        choices=(
+            "raw",
+            "gray",
+            "foreground-black-gray",
+            "foreground-black-gray-horizontal",
+            "crop-black-gray",
+            "finger-pad-auto",
+        ),
         default="raw",
-        help="Image preparation before SOLOv2. Use foreground-black-gray-horizontal for real-world photos that differ from black-background grayscale training images.",
+        help="Image preparation before canonical preprocessing. Use finger-pad-auto for controlled contactless finger photos.",
     )
     parser.add_argument(
         "--allow-distal-fallback",
         action=argparse.BooleanOptionalAction,
         default=False,
         help="If SOLOv2 finds no distal phalanx, continue with a foreground-geometry distal mask fallback.",
+    )
+    parser.add_argument(
+        "--unwarp",
+        choices=("none", "gradient"),
+        default="gradient",
+        help="Route A: warp decoded minutiae into the predicted-gradient canonical frame before MCC.",
     )
     parser.add_argument(
         "--output-dir",
@@ -567,6 +651,7 @@ def main() -> None:
         solov2_score_thr=float(args.solov2_score_thr),
         solov2_input_mode=str(args.solov2_input_mode),
         allow_distal_fallback=bool(args.allow_distal_fallback),
+        unwarp=str(args.unwarp),
         image_output_dir=a_dir,
     )
     result_b = _run_single_image_inference(
@@ -579,6 +664,7 @@ def main() -> None:
         solov2_score_thr=float(args.solov2_score_thr),
         solov2_input_mode=str(args.solov2_input_mode),
         allow_distal_fallback=bool(args.allow_distal_fallback),
+        unwarp=str(args.unwarp),
         image_output_dir=b_dir,
     )
 
@@ -603,6 +689,9 @@ def main() -> None:
         "solov2_score_thr": float(args.solov2_score_thr),
         "solov2_input_mode": str(args.solov2_input_mode),
         "allow_distal_fallback": bool(args.allow_distal_fallback),
+        "unwarp": str(args.unwarp),
+        "unwarp_applied_a": bool(result_a.get("unwarp_applied", False)),
+        "unwarp_applied_b": bool(result_b.get("unwarp_applied", False)),
         "minutia_nms_enabled": not bool(args.disable_minutia_nms),
         "mask_source_a": result_a["mask_source"],
         "mask_source_b": result_b["mask_source"],
@@ -630,6 +719,7 @@ def main() -> None:
                 "solov2_input": result_a["solov2_input"],
                 "mask_source": result_a["mask_source"],
                 "distal_fallback": result_a["distal_fallback"],
+                "finger_pad": result_a["finger_pad"],
                 "inference_input_shape_hw": result_a["inference_input_shape_hw"],
             },
             "b": {
@@ -638,6 +728,7 @@ def main() -> None:
                 "solov2_input": result_b["solov2_input"],
                 "mask_source": result_b["mask_source"],
                 "distal_fallback": result_b["distal_fallback"],
+                "finger_pad": result_b["finger_pad"],
                 "inference_input_shape_hw": result_b["inference_input_shape_hw"],
             },
         },

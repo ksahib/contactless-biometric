@@ -236,7 +236,7 @@ fi
 
 if dataset_enabled train; then
   echo "[7/7] Training FeatureNet"
-  python -m featurenet.models.train --ground-truth-root "$MERGED_OUTPUT_ROOT" --output-dir "$TRAIN_OUTPUT_DIR" --device "$TRAIN_DEVICE" --epochs "$TRAIN_EPOCHS" --batch-size "$TRAIN_BATCH_SIZE" --grad-accum-steps "$TRAIN_GRAD_ACCUM_STEPS" --max-grad-norm 5.0 --num-workers "$TRAIN_NUM_WORKERS" --amp --channels-last --early-stopping --early-stopping-metric best_score_f1 --early-stopping-patience 15 --mu-score 80 --mu-x 40 --mu-y 40 --mu-ori 30 --amp-dtype "$TRAIN_AMP_DTYPE" "${TRAIN_AUGMENTATION_ARGS[@]}"
+  python -m featurenet.models.train --ground-truth-root "$MERGED_OUTPUT_ROOT" --output-dir "$TRAIN_OUTPUT_DIR" --device "$TRAIN_DEVICE" --epochs "$TRAIN_EPOCHS" --batch-size "$TRAIN_BATCH_SIZE" --grad-accum-steps "$TRAIN_GRAD_ACCUM_STEPS" --max-grad-norm 5.0 --num-workers "$TRAIN_NUM_WORKERS" --amp --channels-last --early-stopping --early-stopping-metric pair_auc --pair-eval --pair-eval-unwarp gradient --early-stopping-patience 15 --mu-score 80 --mu-x 40 --mu-y 40 --mu-ori 30 --amp-dtype "$TRAIN_AMP_DTYPE" "${TRAIN_AUGMENTATION_ARGS[@]}"
 else
   echo "[7/7] Skipping training"
 fi

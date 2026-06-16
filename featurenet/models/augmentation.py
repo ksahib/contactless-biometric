@@ -6,6 +6,7 @@ import time
 from collections import OrderedDict
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Mapping
 
 import cv2
@@ -138,8 +139,10 @@ def augment_sample(
     orientation = cached_sample["orientation"]
     ridge_period = cached_sample["ridge_period"]
     minutiae = cached_sample["minutiae"]
+    single_source_candidates = cached_sample["single_source_candidates"]
     use_3d = params.has_3d and has_usable_reconstruction(sample)
-    base_targets = {} if use_3d else _cached_gradient_for_sample(sample, cached_sample, image.shape)
+    base_targets = _cached_gradient_for_sample(sample, cached_sample, image.shape)
+    gradient_full = base_targets.get("gradient_full")
 
     if use_3d:
         role = str(sample["reconstruction"].get("role", _role_for_raw_view(sample.get("raw_view_index"))))
@@ -148,8 +151,9 @@ def augment_sample(
             mask=mask,
             orientation=orientation,
             ridge_period=ridge_period,
-            gradient=base_targets.get("gradient_full"),
+            gradient=gradient_full,
             minutiae=minutiae,
+            single_source_candidates=single_source_candidates,
             reconstruction=_load_reconstruction_maps(
                 Path(sample["reconstruction"]["reconstruction_maps_path"]),
                 role=role,
@@ -164,11 +168,13 @@ def augment_sample(
             mask=mask,
             orientation=orientation,
             ridge_period=ridge_period,
-            gradient=base_targets.get("gradient_full"),
+            gradient=gradient_full,
             minutiae=minutiae,
+            single_source_candidates=single_source_candidates,
             params=params,
         )
 
+    extractor_config = _sample_target_config(sample)
     targets = tr.build_featurenet_targets(
         rendered["image"],
         rendered["mask"],
@@ -178,6 +184,8 @@ def augment_sample(
         if rendered["gradient"] is not None
         else np.zeros((*rendered["image"].shape, 2), dtype=np.float32),
         rendered["minutiae"],
+        single_source_candidates=rendered.get("single_source_candidates"),
+        extractor_config=extractor_config,
         output_shape=output_shape,
     )
 
@@ -210,6 +218,7 @@ def render_2d_augmented(
     gradient: np.ndarray | None,
     minutiae: list[dict[str, Any]],
     params: AugmentationParams,
+    single_source_candidates: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     height, width = image.shape
     matrix = _affine_matrix(width, height, params.yaw_deg, params.dx, params.dy)
@@ -219,6 +228,9 @@ def render_2d_augmented(
     warped_ridge = cv2.warpAffine(ridge_period.astype(np.float32), matrix, (width, height), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
     warped_gradient = _warp_gradient_2d(gradient, matrix, params.yaw_deg, image.shape) if gradient is not None else None
     transformed_minutiae = _transform_minutiae_affine(minutiae, matrix, math.radians(params.yaw_deg), warped_mask)
+    transformed_single_source = _transform_minutiae_affine(
+        single_source_candidates or [], matrix, math.radians(params.yaw_deg), warped_mask
+    )
     return {
         "image": _finite_u8(warped_image),
         "mask": np.where(warped_mask > 0, 255, 0).astype(np.uint8),
@@ -226,6 +238,7 @@ def render_2d_augmented(
         "ridge_period": np.nan_to_num(warped_ridge, nan=0.0).astype(np.float32),
         "gradient": warped_gradient,
         "minutiae": transformed_minutiae,
+        "single_source_candidates": transformed_single_source,
         "details": {"mode": "2d_affine", "dropped_minutiae": len(minutiae) - len(transformed_minutiae)},
     }
 
@@ -241,6 +254,7 @@ def render_3d_augmented(
     reconstruction: dict[str, np.ndarray],
     role: str,
     params: AugmentationParams,
+    single_source_candidates: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     height, width = image.shape
     base_x, base_y, depth, valid = _role_surface(reconstruction, role, image.shape)
@@ -249,63 +263,26 @@ def render_3d_augmented(
     cy = (height - 1.0) * 0.5
     r = rotation_matrix(params.yaw_deg, params.pitch_deg, params.roll_deg)
 
-    ys, xs = np.nonzero(valid)
-    source_x = base_x[ys, xs]
-    source_y = base_y[ys, xs]
-    texture_image = _sample_bilinear(image.astype(np.float32), source_x, source_y)
-    texture_mask = _sample_nearest(mask, source_x, source_y)
-    texture_orientation = _sample_orientation(orientation, source_x, source_y)
-    texture_ridge = _sample_bilinear(ridge_period.astype(np.float32), source_x, source_y)
-
-    points = np.stack([source_x - cx, source_y - cy, depth[ys, xs] - depth_center], axis=0)
-    rotated = r @ points
-    proj_x = rotated[0] + cx + params.dx
-    proj_y = rotated[1] + cy + params.dy
+    # Forward-project every grid vertex of the role surface (height field z=depth)
+    # into screen space; invalid vertices are flagged with NaN so the rasterizer
+    # never builds a triangle that touches them.
+    points = np.stack([base_x - cx, base_y - cy, depth - depth_center], axis=0).astype(np.float32)
+    rotated = np.einsum("ij,jhw->ihw", r, points).astype(np.float32)
+    proj_x = rotated[0] + cx + float(params.dx)
+    proj_y = rotated[1] + cy + float(params.dy)
     proj_z = rotated[2] + depth_center
+    invalid = ~valid
+    proj_x[invalid] = np.nan
+    proj_y[invalid] = np.nan
+    proj_z[invalid] = np.nan
 
-    rendered_image = np.zeros((height, width), dtype=np.float32)
-    rendered_mask = np.zeros((height, width), dtype=np.uint8)
-    rendered_depth = np.full((height, width), np.nan, dtype=np.float32)
-    rendered_orientation = np.zeros((height, width), dtype=np.float32)
-    rendered_ridge = np.zeros((height, width), dtype=np.float32)
-
-    orientation_delta = _orientation_delta_for_points(texture_orientation, r)
-    xp = np.rint(proj_x).astype(np.int32)
-    yp = np.rint(proj_y).astype(np.int32)
-    visible = (
-        np.isfinite(proj_x)
-        & np.isfinite(proj_y)
-        & np.isfinite(proj_z)
-        & (xp >= 0)
-        & (xp < width)
-        & (yp >= 0)
-        & (yp < height)
-        & (texture_mask > 0)
+    # Z-buffered mesh rasterization yields, per output pixel, the interpolated
+    # source coordinate (sx_map, sy_map) -- the dense inverse map -- plus coverage.
+    source_map_x, source_map_y, coverage, _ = _rasterize_source_map(
+        proj_x, proj_y, proj_z, base_x, base_y, valid, height, width
     )
 
-    visible_indices = np.nonzero(visible)[0]
-    if visible_indices.size:
-        visible_flat = (yp[visible_indices].astype(np.int64) * int(width)) + xp[visible_indices].astype(np.int64)
-        visible_z = proj_z[visible_indices].astype(np.float32)
-        z_buffer_flat = np.full(height * width, -np.inf, dtype=np.float32)
-        np.maximum.at(z_buffer_flat, visible_flat, visible_z)
-        winner_mask = visible_z >= (z_buffer_flat[visible_flat] - 1e-6)
-        winner_indices = visible_indices[winner_mask]
-        winner_flat = visible_flat[winner_mask]
-
-        image_flat = rendered_image.reshape(-1)
-        mask_flat = rendered_mask.reshape(-1)
-        depth_flat = rendered_depth.reshape(-1)
-        orientation_flat = rendered_orientation.reshape(-1)
-        ridge_flat = rendered_ridge.reshape(-1)
-        image_flat[winner_flat] = texture_image[winner_indices]
-        mask_flat[winner_flat] = 255
-        depth_flat[winner_flat] = proj_z[winner_indices]
-        orientation_flat[winner_flat] = orientation_delta[winner_indices]
-        ridge_flat[winner_flat] = texture_ridge[winner_indices]
-        _fill_nearest_holes(rendered_image, rendered_mask, rendered_depth, rendered_orientation, rendered_ridge)
-
-    if not np.any(rendered_mask > 0):
+    if not np.any(coverage):
         return render_2d_augmented(
             image=image,
             mask=mask,
@@ -313,17 +290,46 @@ def render_3d_augmented(
             ridge_period=ridge_period,
             gradient=gradient,
             minutiae=minutiae,
+            single_source_candidates=single_source_candidates,
             params=params,
         )
 
-    rendered_depth_filled = np.where(np.isfinite(rendered_depth), rendered_depth, 0.0).astype(np.float32)
-    grad_y, grad_x = np.gradient(rendered_depth_filled)
-    rendered_gradient = np.stack([grad_x, grad_y], axis=-1).astype(np.float32)
-    rendered_gradient[rendered_mask <= 0] = 0.0
+    map_x = source_map_x.astype(np.float32)
+    map_y = source_map_y.astype(np.float32)
+    remap_kwargs = dict(interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    rendered_image = cv2.remap(image.astype(np.float32), map_x, map_y, **remap_kwargs)
+    cos2 = cv2.remap(np.cos(2.0 * orientation).astype(np.float32), map_x, map_y, **remap_kwargs)
+    sin2 = cv2.remap(np.sin(2.0 * orientation).astype(np.float32), map_x, map_y, **remap_kwargs)
+    theta_src = (0.5 * np.arctan2(sin2, cos2)).astype(np.float32)
+    ridge_src = cv2.remap(ridge_period.astype(np.float32), map_x, map_y, **remap_kwargs)
+    if gradient is not None:
+        gx_src = cv2.remap(np.ascontiguousarray(gradient[:, :, 0], dtype=np.float32), map_x, map_y, **remap_kwargs)
+        gy_src = cv2.remap(np.ascontiguousarray(gradient[:, :, 1], dtype=np.float32), map_x, map_y, **remap_kwargs)
+    else:
+        gx_src = np.zeros((height, width), dtype=np.float32)
+        gy_src = np.zeros((height, width), dtype=np.float32)
 
+    # Closed-form geometric transforms of the dense labels under the pose change.
+    rendered_orientation = _transform_orientation_field(theta_src, gx_src, gy_src, r)
+    rendered_gradient = _transform_gradient_field(gx_src, gy_src, r)
+    rendered_ridge = _foreshorten_ridge_field(ridge_src, theta_src, gx_src, gy_src, r)
+
+    # Erode coverage by 1px so partially-covered silhouette cells are not supervised.
+    coverage_u8 = coverage.astype(np.uint8) * 255
+    kernel = np.ones((3, 3), dtype=np.uint8)
+    rendered_mask = np.where(cv2.erode(coverage_u8, kernel, iterations=1) > 0, 255, 0).astype(np.uint8)
+
+    # Keep finite values everywhere inside the rendered surface; the eroded mask
+    # passed to build_featurenet_targets is what actually gates supervision.
+    rendered_image = np.where(coverage, rendered_image, 0.0).astype(np.float32)
+    rendered_orientation = np.where(coverage, rendered_orientation, 0.0).astype(np.float32)
+    rendered_ridge = np.where(coverage, rendered_ridge, 0.0).astype(np.float32)
+    rendered_gradient[~coverage] = 0.0
+
+    pose_depth = _pose_depth_image(base_x, base_y, depth, valid, image.shape)
     transformed_minutiae = _transform_minutiae_3d(
         minutiae=minutiae,
-        depth_image=_pose_depth_image(base_x, base_y, depth, valid, image.shape),
+        depth_image=pose_depth,
         r=r,
         cx=cx,
         cy=cy,
@@ -331,16 +337,30 @@ def render_3d_augmented(
         dx=params.dx,
         dy=params.dy,
         rendered_mask=rendered_mask,
+        gradient=gradient,
+    )
+    transformed_single_source = _transform_minutiae_3d(
+        minutiae=single_source_candidates or [],
+        depth_image=pose_depth,
+        r=r,
+        cx=cx,
+        cy=cy,
+        depth_center=depth_center,
+        dx=params.dx,
+        dy=params.dy,
+        rendered_mask=rendered_mask,
+        gradient=gradient,
     )
     return {
         "image": _finite_u8(rendered_image),
         "mask": rendered_mask,
         "orientation": np.nan_to_num(rendered_orientation, nan=0.0).astype(np.float32),
         "ridge_period": np.nan_to_num(rendered_ridge, nan=0.0).astype(np.float32),
-        "gradient": rendered_gradient,
+        "gradient": np.nan_to_num(rendered_gradient, nan=0.0).astype(np.float32),
         "minutiae": transformed_minutiae,
+        "single_source_candidates": transformed_single_source,
         "details": {
-            "mode": "3d_orthographic_zbuffer",
+            "mode": "3d_orthographic_mesh",
             "dropped_minutiae": len(minutiae) - len(transformed_minutiae),
             "axis_convention": "yaw=z, pitch=x, roll=y",
         },
@@ -433,6 +453,7 @@ def _load_cached_sample(sample: Mapping[str, Any], *, max_cache_size: int) -> di
         "orientation": _load_or_default(Path(sample.get("orientation_path", "")), image.shape, dtype=np.float32),
         "ridge_period": _load_or_default(Path(sample.get("ridge_period_path", "")), image.shape, dtype=np.float32),
         "minutiae": _load_minutiae(Path(sample.get("minutiae_path", ""))),
+        "single_source_candidates": _load_minutiae(Path(sample.get("single_source_candidates_path", ""))),
         "gradient_full": None,
     }
     _SAMPLE_CACHE[key] = cached
@@ -559,31 +580,196 @@ def _role_for_raw_view(raw_view_index: Any) -> str:
     return {0: "front", 1: "left", 2: "right"}.get(int(raw_view_index), "front")
 
 
-def _fill_nearest_holes(
-    image: np.ndarray,
-    mask: np.ndarray,
-    depth: np.ndarray,
-    orientation: np.ndarray,
-    ridge: np.ndarray,
+def _rasterize_source_map(
+    proj_x: np.ndarray,
+    proj_y: np.ndarray,
+    proj_z: np.ndarray,
+    src_x: np.ndarray,
+    src_y: np.ndarray,
+    valid: np.ndarray,
+    height: int,
+    width: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Z-buffered rasterization of the grid mesh.
+
+    Returns dense maps ``(sx, sy)`` giving, per output pixel, the interpolated
+    source coordinate to sample from, a boolean coverage mask, and the projected
+    depth of the winning (nearest) triangle. Out-of-coverage source coordinates
+    are set to ``-1`` so a subsequent ``cv2.remap`` reads the border value.
+    """
+    sx_map = np.full((height, width), -1.0, dtype=np.float32)
+    sy_map = np.full((height, width), -1.0, dtype=np.float32)
+    coverage = np.zeros((height, width), dtype=bool)
+    depth_map = np.full((height, width), np.nan, dtype=np.float32)
+
+    v00 = valid[:-1, :-1]
+    v01 = valid[:-1, 1:]
+    v10 = valid[1:, :-1]
+    v11 = valid[1:, 1:]
+    quad = v00 & v01 & v10 & v11
+    if not np.any(quad):
+        return sx_map, sy_map, coverage, depth_map
+
+    top_left = (slice(0, -1), slice(0, -1))
+    top_right = (slice(0, -1), slice(1, None))
+    bottom_left = (slice(1, None), slice(0, -1))
+    bottom_right = (slice(1, None), slice(1, None))
+
+    def gather(arr: np.ndarray, idx: tuple[slice, slice]) -> np.ndarray:
+        return arr[idx][quad].astype(np.float32)
+
+    # Each valid quad splits into triangle1 = (TL, TR, BR) and triangle2 = (TL, BR, BL).
+    ax = np.concatenate([gather(proj_x, top_left), gather(proj_x, top_left)])
+    ay = np.concatenate([gather(proj_y, top_left), gather(proj_y, top_left)])
+    az = np.concatenate([gather(proj_z, top_left), gather(proj_z, top_left)])
+    asx = np.concatenate([gather(src_x, top_left), gather(src_x, top_left)])
+    asy = np.concatenate([gather(src_y, top_left), gather(src_y, top_left)])
+    bx = np.concatenate([gather(proj_x, top_right), gather(proj_x, bottom_right)])
+    by = np.concatenate([gather(proj_y, top_right), gather(proj_y, bottom_right)])
+    bz = np.concatenate([gather(proj_z, top_right), gather(proj_z, bottom_right)])
+    bsx = np.concatenate([gather(src_x, top_right), gather(src_x, bottom_right)])
+    bsy = np.concatenate([gather(src_y, top_right), gather(src_y, bottom_right)])
+    cx = np.concatenate([gather(proj_x, bottom_right), gather(proj_x, bottom_left)])
+    cy = np.concatenate([gather(proj_y, bottom_right), gather(proj_y, bottom_left)])
+    cz = np.concatenate([gather(proj_z, bottom_right), gather(proj_z, bottom_left)])
+    csx = np.concatenate([gather(src_x, bottom_right), gather(src_x, bottom_left)])
+    csy = np.concatenate([gather(src_y, bottom_right), gather(src_y, bottom_left)])
+
+    _raster_triangles_into(
+        sx_map, sy_map, coverage, depth_map,
+        ax, ay, az, asx, asy,
+        bx, by, bz, bsx, bsy,
+        cx, cy, cz, csx, csy,
+        height, width,
+    )
+    return sx_map, sy_map, coverage, depth_map
+
+
+def _raster_triangles_into(
+    sx_map: np.ndarray,
+    sy_map: np.ndarray,
+    coverage: np.ndarray,
+    depth_map: np.ndarray,
+    ax: np.ndarray, ay: np.ndarray, az: np.ndarray, asx: np.ndarray, asy: np.ndarray,
+    bx: np.ndarray, by: np.ndarray, bz: np.ndarray, bsx: np.ndarray, bsy: np.ndarray,
+    cx: np.ndarray, cy: np.ndarray, cz: np.ndarray, csx: np.ndarray, csy: np.ndarray,
+    height: int,
+    width: int,
 ) -> None:
-    source_mask = mask > 0
-    if not np.any(source_mask):
+    finite = (
+        np.isfinite(ax) & np.isfinite(ay) & np.isfinite(az)
+        & np.isfinite(bx) & np.isfinite(by) & np.isfinite(bz)
+        & np.isfinite(cx) & np.isfinite(cy) & np.isfinite(cz)
+    )
+    denom = (by - cy) * (ax - cx) + (cx - bx) * (ay - cy)
+    keep = finite & (np.abs(denom) > 1e-8)
+    if not np.any(keep):
         return
-    kernel = np.ones((3, 3), dtype=np.uint8)
-    fill_mask = (cv2.dilate(source_mask.astype(np.uint8), kernel, iterations=1) > 0) & ~source_mask
-    if not np.any(fill_mask):
+    ax, ay, az, asx, asy = ax[keep], ay[keep], az[keep], asx[keep], asy[keep]
+    bx, by, bz, bsx, bsy = bx[keep], by[keep], bz[keep], bsx[keep], bsy[keep]
+    cx, cy, cz, csx, csy = cx[keep], cy[keep], cz[keep], csx[keep], csy[keep]
+    denom = denom[keep]
+
+    x0 = np.clip(np.floor(np.minimum(np.minimum(ax, bx), cx)), 0, width - 1).astype(np.int64)
+    x1 = np.clip(np.ceil(np.maximum(np.maximum(ax, bx), cx)), 0, width - 1).astype(np.int64)
+    y0 = np.clip(np.floor(np.minimum(np.minimum(ay, by), cy)), 0, height - 1).astype(np.int64)
+    y1 = np.clip(np.ceil(np.maximum(np.maximum(ay, by), cy)), 0, height - 1).astype(np.int64)
+    box_w = x1 - x0 + 1
+    box_h = y1 - y0 + 1
+    area = (box_w * box_h).astype(np.int64)
+    total = int(area.sum())
+    if total <= 0:
         return
 
-    image_d = cv2.dilate(image.astype(np.float32), kernel, iterations=1)
-    finite_depth = np.where(np.isfinite(depth), depth, 0.0).astype(np.float32)
-    depth_d = cv2.dilate(finite_depth, kernel, iterations=1)
-    orientation_d = cv2.dilate(orientation.astype(np.float32), kernel, iterations=1)
-    ridge_d = cv2.dilate(ridge.astype(np.float32), kernel, iterations=1)
-    image[fill_mask] = image_d[fill_mask]
-    mask[fill_mask] = 255
-    depth[fill_mask] = depth_d[fill_mask]
-    orientation[fill_mask] = orientation_d[fill_mask]
-    ridge[fill_mask] = ridge_d[fill_mask]
+    tri = np.repeat(np.arange(area.size, dtype=np.int64), area)
+    starts = np.zeros(area.size, dtype=np.int64)
+    if area.size > 1:
+        np.cumsum(area[:-1], out=starts[1:])
+    local = np.arange(total, dtype=np.int64) - starts[tri]
+    box_w_rep = box_w[tri]
+    px = x0[tri] + (local % box_w_rep)
+    py = y0[tri] + (local // box_w_rep)
+    pxf = px.astype(np.float32)
+    pyf = py.astype(np.float32)
+
+    axt, ayt = ax[tri], ay[tri]
+    bxt, byt = bx[tri], by[tri]
+    cxt, cyt = cx[tri], cy[tri]
+    dent = denom[tri]
+    l1 = ((byt - cyt) * (pxf - cxt) + (cxt - bxt) * (pyf - cyt)) / dent
+    l2 = ((cyt - ayt) * (pxf - cxt) + (axt - cxt) * (pyf - cyt)) / dent
+    l3 = 1.0 - l1 - l2
+    edge_eps = -1e-4
+    inside = (l1 >= edge_eps) & (l2 >= edge_eps) & (l3 >= edge_eps)
+    if not np.any(inside):
+        return
+    tri_i = tri[inside]
+    px = px[inside]
+    py = py[inside]
+    l1 = l1[inside].astype(np.float32)
+    l2 = l2[inside].astype(np.float32)
+    l3 = l3[inside].astype(np.float32)
+
+    zc = l1 * az[tri_i] + l2 * bz[tri_i] + l3 * cz[tri_i]
+    sxc = l1 * asx[tri_i] + l2 * bsx[tri_i] + l3 * csx[tri_i]
+    syc = l1 * asy[tri_i] + l2 * bsy[tri_i] + l3 * csy[tri_i]
+    flat = py.astype(np.int64) * int(width) + px.astype(np.int64)
+
+    zbuf = np.full(height * width, -np.inf, dtype=np.float32)
+    np.maximum.at(zbuf, flat, zc.astype(np.float32))
+    winner = zc >= (zbuf[flat] - 1e-4)
+    flat_w = flat[winner]
+
+    sx_map.reshape(-1)[flat_w] = sxc[winner]
+    sy_map.reshape(-1)[flat_w] = syc[winner]
+    coverage.reshape(-1)[flat_w] = True
+    depth_map.reshape(-1)[flat_w] = zc[winner]
+
+
+def _transform_orientation_field(theta: np.ndarray, gx: np.ndarray, gy: np.ndarray, r: np.ndarray) -> np.ndarray:
+    """Lift the undirected ridge tangent onto the surface, rotate by R, reproject."""
+    ct = np.cos(theta)
+    st = np.sin(theta)
+    tz = gx * ct + gy * st
+    tx = r[0, 0] * ct + r[0, 1] * st + r[0, 2] * tz
+    ty = r[1, 0] * ct + r[1, 1] * st + r[1, 2] * tz
+    return tr.normalize_angle_pi(np.arctan2(ty, tx)).astype(np.float32)
+
+
+def _transform_gradient_field(gx: np.ndarray, gy: np.ndarray, r: np.ndarray) -> np.ndarray:
+    """Transform the surface gradient via the rotated surface normal n=(-gx,-gy,1)."""
+    nx = -gx
+    ny = -gy
+    nz = np.ones_like(gx)
+    n_x = r[0, 0] * nx + r[0, 1] * ny + r[0, 2] * nz
+    n_y = r[1, 0] * nx + r[1, 1] * ny + r[1, 2] * nz
+    n_z = r[2, 0] * nx + r[2, 1] * ny + r[2, 2] * nz
+    eps = 1e-3
+    n_z_safe = np.where(np.abs(n_z) < eps, eps, n_z)
+    new_gx = -n_x / n_z_safe
+    new_gy = -n_y / n_z_safe
+    return np.stack([new_gx, new_gy], axis=-1).astype(np.float32)
+
+
+def _foreshorten_ridge_field(
+    ridge: np.ndarray, theta: np.ndarray, gx: np.ndarray, gy: np.ndarray, r: np.ndarray
+) -> np.ndarray:
+    """Scale ridge period by the screen/source Jacobian along the ridge-normal.
+
+    The screen-vs-source Jacobian of the orthographic projection of the height
+    field is J = R[:2,:2] + R[:2,2] (x) (gx, gy). Period is measured along the
+    ridge-normal n_hat=(-sin, cos); the apparent period scales by ||J @ n_hat||.
+    """
+    j00 = r[0, 0] + r[0, 2] * gx
+    j01 = r[0, 1] + r[0, 2] * gy
+    j10 = r[1, 0] + r[1, 2] * gx
+    j11 = r[1, 1] + r[1, 2] * gy
+    nhx = -np.sin(theta)
+    nhy = np.cos(theta)
+    vx = j00 * nhx + j01 * nhy
+    vy = j10 * nhx + j11 * nhy
+    factor = np.sqrt(vx * vx + vy * vy)
+    return (ridge * factor).astype(np.float32)
 
 
 def _role_surface(reconstruction: dict[str, np.ndarray], role: str, image_shape: tuple[int, int]) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -630,9 +816,9 @@ def _transform_minutiae_3d(
     dx: float,
     dy: float,
     rendered_mask: np.ndarray,
+    gradient: np.ndarray | None = None,
 ) -> list[dict[str, Any]]:
     transformed: list[dict[str, Any]] = []
-    delta = 3.0
     for minutia in minutiae:
         x = float(minutia.get("x", float("nan")))
         y = float(minutia.get("y", float("nan")))
@@ -645,13 +831,14 @@ def _transform_minutiae_3d(
         p = _project_3d_point(x, y, z, r, cx, cy, depth_center, dx, dy)
         if not _point_in_mask(rendered_mask, p[0], p[1]):
             continue
-        x2 = x + math.cos(theta) * delta
-        y2 = y + math.sin(theta) * delta
-        z2 = _sample_depth(depth_image, x2, y2)
-        if z2 is None:
-            z2 = z
-        p2 = _project_3d_point(x2, y2, z2, r, cx, cy, depth_center, dx, dy)
-        theta_new = math.atan2(float(p2[1] - p[1]), float(p2[0] - p[0]))
+        # Lift the directional minutia tangent onto the surface using the local
+        # gradient, rotate by R, then read the screen-space direction.
+        gx, gy = _sample_gradient(gradient, x, y)
+        ct = math.cos(theta)
+        st = math.sin(theta)
+        tz = gx * ct + gy * st
+        tangent = r @ np.asarray([ct, st, tz], dtype=np.float32)
+        theta_new = math.atan2(float(tangent[1]), float(tangent[0]))
         item = {key: value for key, value in minutia.items() if key not in {"x", "y", "theta"}}
         item.update({"x": float(p[0]), "y": float(p[1]), "theta": tr.normalize_angle_2pi_scalar(theta_new)})
         transformed.append(item)
@@ -662,12 +849,6 @@ def _project_3d_point(x: float, y: float, z: float, r: np.ndarray, cx: float, cy
     point = np.asarray([x - cx, y - cy, z - depth_center], dtype=np.float32)
     rotated = r @ point
     return np.asarray([rotated[0] + cx + dx, rotated[1] + cy + dy, rotated[2] + depth_center], dtype=np.float32)
-
-
-def _orientation_delta_for_points(theta: np.ndarray, r: np.ndarray) -> np.ndarray:
-    tangent = np.stack([np.cos(theta), np.sin(theta), np.zeros_like(theta)], axis=0).astype(np.float32)
-    projected = r @ tangent
-    return tr.normalize_angle_pi(np.arctan2(projected[1], projected[0]))
 
 
 def _sample_bilinear(array: np.ndarray, x: np.ndarray, y: np.ndarray) -> np.ndarray:
@@ -688,17 +869,23 @@ def _sample_bilinear(array: np.ndarray, x: np.ndarray, y: np.ndarray) -> np.ndar
     ).astype(np.float32)
 
 
-def _sample_nearest(array: np.ndarray, x: np.ndarray, y: np.ndarray) -> np.ndarray:
-    height, width = array.shape
-    xi = np.clip(np.rint(x).astype(np.int32), 0, width - 1)
-    yi = np.clip(np.rint(y).astype(np.int32), 0, height - 1)
-    return array[yi, xi]
+def _sample_gradient(gradient: np.ndarray | None, x: float, y: float) -> tuple[float, float]:
+    if gradient is None or not (math.isfinite(x) and math.isfinite(y)):
+        return 0.0, 0.0
+    coords_x = np.asarray([x], dtype=np.float32)
+    coords_y = np.asarray([y], dtype=np.float32)
+    gx = float(_sample_bilinear(np.ascontiguousarray(gradient[:, :, 0], dtype=np.float32), coords_x, coords_y)[0])
+    gy = float(_sample_bilinear(np.ascontiguousarray(gradient[:, :, 1], dtype=np.float32), coords_x, coords_y)[0])
+    if not (math.isfinite(gx) and math.isfinite(gy)):
+        return 0.0, 0.0
+    return gx, gy
 
 
-def _sample_orientation(orientation: np.ndarray, x: np.ndarray, y: np.ndarray) -> np.ndarray:
-    cos2 = _sample_bilinear(np.cos(2.0 * orientation).astype(np.float32), x, y)
-    sin2 = _sample_bilinear(np.sin(2.0 * orientation).astype(np.float32), x, y)
-    return tr.normalize_angle_pi(0.5 * np.arctan2(sin2, cos2))
+def _sample_target_config(sample: Mapping[str, Any]) -> Any | None:
+    config = sample.get("minutiae_target_config")
+    if not isinstance(config, Mapping) or not config:
+        return None
+    return tr.target_config_from_object(SimpleNamespace(**dict(config)))
 
 
 def _sample_depth(depth: np.ndarray, x: float, y: float) -> float | None:

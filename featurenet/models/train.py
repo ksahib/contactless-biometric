@@ -77,6 +77,7 @@ EARLY_STOPPING_METRICS = (
     "minutia_x_accuracy",
     "minutia_y_accuracy",
     "minutia_orientation_accuracy",
+    "pair_auc",
 )
 
 
@@ -1004,6 +1005,7 @@ def load_bundle_samples(
         mask_path = sample_dir / "mask.png"
         targets_path = sample_dir / "featurenet_targets.npz"
         minutiae_path = sample_dir / "minutiae.json"
+        single_source_candidates_path = sample_dir / "minutiae_single_source_candidates.json"
         orientation_path = sample_dir / "orientation.npy"
         ridge_period_path = sample_dir / "ridge_period.npy"
         if not (meta_path.exists() and masked_image_path.exists() and mask_path.exists() and targets_path.exists()):
@@ -1057,11 +1059,15 @@ def load_bundle_samples(
             "mask": mask_path,
             "targets_path": targets_path,
             "minutiae_path": minutiae_path,
+            "single_source_candidates_path": single_source_candidates_path,
             "orientation_path": orientation_path,
             "ridge_period_path": ridge_period_path,
             "raw_view_index": raw_view_index,
             "input_shape_hw": tuple(int(value) for value in input_shape_hw),
             "output_shape_hw": tuple(int(value) for value in output_shape_hw),
+            "minutiae_target_config": meta.get("minutiae_ground_truth")
+            if isinstance(meta.get("minutiae_ground_truth"), Mapping)
+            else None,
         }
         reconstruction = meta.get("multiview_reconstruction")
         if isinstance(reconstruction, Mapping):
@@ -1274,9 +1280,15 @@ def _select_monitored_metric(
     metric_name: str,
     val_losses: Mapping[str, float],
     val_metrics: Mapping[str, Any] | None,
+    pair_metrics: Mapping[str, Any] | None = None,
 ) -> tuple[float, str]:
     if metric_name == "val_total":
         return float(val_losses["total"]), "min"
+
+    if metric_name == "pair_auc":
+        if pair_metrics is None or pair_metrics.get("pair_auc") is None:
+            raise ValueError("pair metrics are required to monitor pair_auc")
+        return float(pair_metrics["pair_auc"]), "max"
 
     if val_metrics is None:
         raise ValueError(f"validation metrics are required to monitor {metric_name}")
@@ -1605,26 +1617,81 @@ def train_model(args: argparse.Namespace) -> dict[str, Any]:
                 )
                 record["val_metrics"] = extended_val_metrics
 
-            current_monitor_value, monitor_mode = _select_monitored_metric(
-                monitor_name,
-                val_metrics,
-                extended_val_metrics,
-            )
-            improved = _is_metric_improved(
-                current=current_monitor_value,
-                best=best_monitor_value,
-                mode=monitor_mode,
-                min_delta=args.early_stopping_min_delta,
-            )
-            if improved:
-                best_monitor_value = current_monitor_value
-                patience_counter = 0
-                torch.save(
-                    _checkpoint_payload(model, optimizer, epoch, record, args),
-                    output_dir / "best.pt",
+            pair_metrics: dict[str, Any] | None = None
+            want_pair_for_selection = monitor_name == "pair_auc"
+            pair_eval_enabled = bool(args.pair_eval) or want_pair_for_selection
+            run_pair_this_epoch = bool(
+                pair_eval_enabled
+                and val_samples
+                and (
+                    want_pair_for_selection
+                    or epoch % max(1, int(args.pair_eval_every)) == 0
+                    or epoch == args.epochs
                 )
+            )
+            if run_pair_this_epoch:
+                from .pair_eval import evaluate_pairs
+
+                pair_metrics = evaluate_pairs(
+                    model,
+                    val_samples,
+                    resolved_device,
+                    method=str(args.pair_eval_method),
+                    score_threshold=float(args.pair_eval_score_threshold),
+                    apply_nms=True,
+                    unwarp=str(args.pair_eval_unwarp),
+                    max_genuine=int(args.pair_eval_max_genuine),
+                    max_impostor=int(args.pair_eval_max_impostor),
+                    seed=int(args.seed),
+                    repeat_dist_px=float(args.pair_eval_dist_px),
+                    repeat_angle_deg=float(args.pair_eval_angle_deg),
+                )
+                if pair_metrics is not None:
+                    record["pair_metrics"] = pair_metrics
+                else:
+                    record["pair_metrics_warning"] = "no_genuine_pairs"
+                    print(
+                        "[train_model] pair evaluation skipped: no genuine pairs could be formed "
+                        "from the held-out validation fingers",
+                        flush=True,
+                    )
+
+            monitor_available = True
+            if monitor_name == "pair_auc":
+                pair_auc_value = None if pair_metrics is None else pair_metrics.get("pair_auc")
+                monitor_available = pair_auc_value is not None and np.isfinite(float(pair_auc_value))
+
+            if monitor_available:
+                current_monitor_value, monitor_mode = _select_monitored_metric(
+                    monitor_name,
+                    val_metrics,
+                    extended_val_metrics,
+                    pair_metrics,
+                )
+                improved = _is_metric_improved(
+                    current=current_monitor_value,
+                    best=best_monitor_value,
+                    mode=monitor_mode,
+                    min_delta=args.early_stopping_min_delta,
+                )
+                if improved:
+                    best_monitor_value = current_monitor_value
+                    patience_counter = 0
+                    torch.save(
+                        _checkpoint_payload(model, optimizer, epoch, record, args),
+                        output_dir / "best.pt",
+                    )
+                else:
+                    patience_counter += 1
             else:
+                current_monitor_value = float("nan")
+                improved = False
                 patience_counter += 1
+                print(
+                    f"[train_model] monitored metric {monitor_name} unavailable this epoch; "
+                    "treating as non-improvement",
+                    flush=True,
+                )
 
             record["monitor"] = {
                 "name": monitor_name,
@@ -1632,6 +1699,7 @@ def train_model(args: argparse.Namespace) -> dict[str, Any]:
                 "value": current_monitor_value,
                 "best_value": best_monitor_value,
                 "improved": improved,
+                "available": monitor_available,
             }
             record["early_stopping"].update(
                 {
@@ -1777,6 +1845,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--early-stopping-metric", choices=EARLY_STOPPING_METRICS, default="val_total")
     parser.add_argument("--early-stopping-patience", type=int, default=5)
     parser.add_argument("--early-stopping-min-delta", type=float, default=1e-4)
+    parser.add_argument(
+        "--pair-eval",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Compute held-out pair AUC/EER + repeatability during validation (auto-enabled when monitoring pair_auc).",
+    )
+    parser.add_argument("--pair-eval-every", type=int, default=1, help="Run pair evaluation every N validation epochs (logging only; selection on pair_auc always runs).")
+    parser.add_argument("--pair-eval-method", type=str, default="LSA", help="MCC method for pair scoring.")
+    parser.add_argument(
+        "--pair-eval-unwarp",
+        choices=("none", "gradient"),
+        default="gradient",
+        help="Route A unwarp mode applied to decoded minutiae before MCC during pair evaluation.",
+    )
+    parser.add_argument("--pair-eval-score-threshold", type=float, default=0.5, help="Minutia score threshold for pair-eval decoding.")
+    parser.add_argument("--pair-eval-max-genuine", type=int, default=200, help="Cap on genuine pairs sampled for pair evaluation.")
+    parser.add_argument("--pair-eval-max-impostor", type=int, default=200, help="Cap on impostor pairs sampled for pair evaluation.")
+    parser.add_argument("--pair-eval-dist-px", type=float, default=25.0, help="Distance tolerance (px) for matcher-free repeatability.")
+    parser.add_argument("--pair-eval-angle-deg", type=float, default=30.0, help="Angle tolerance (deg) for matcher-free repeatability.")
     parser.add_argument("--orientation-weight", type=float, default=1.0)
     parser.add_argument("--ridge-weight", type=float, default=1.0)
     parser.add_argument("--gradient-weight", type=float, default=1.0)

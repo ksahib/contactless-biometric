@@ -120,17 +120,22 @@ def test_match_infer_uses_full_image_canonical_preprocess_without_crop(
     def forbidden_crop(*args: object, **kwargs: object) -> None:
         raise AssertionError("match_infer should not use the relaxed distal crop")
 
-    def fake_preprocess_input_image(
-        image_path: Path,
+    def fake_preprocess_input_bgr(
+        full_bgr: np.ndarray,
         save_preprocess_dir: Path | None = None,
         *,
         solov2_score_thr: float = 0.15,
+        fallback_mask: np.ndarray | None = None,
+        fallback_mask_source: str | None = None,
+        **kwargs: object,
     ) -> tuple[torch.Tensor, torch.Tensor, tuple[int, int]]:
         calls.append(
             {
-                "image_path": image_path,
+                "full_bgr_shape": tuple(full_bgr.shape),
                 "save_preprocess_dir": save_preprocess_dir,
                 "solov2_score_thr": solov2_score_thr,
+                "fallback_mask": fallback_mask,
+                "fallback_mask_source": fallback_mask_source,
             }
         )
         return torch.ones((1, 1, 8, 8)), torch.ones((1, 1, 8, 8)), (8, 8)
@@ -147,7 +152,8 @@ def test_match_infer_uses_full_image_canonical_preprocess_without_crop(
         }
 
     monkeypatch.setattr(match_infer, "_crop_distal_phalanx_with_main", forbidden_crop)
-    monkeypatch.setattr(match_infer, "preprocess_input_image", fake_preprocess_input_image)
+    monkeypatch.setattr(match_infer, "load_bgr_image", lambda path: np.zeros((8, 8, 3), dtype=np.uint8))
+    monkeypatch.setattr(match_infer, "preprocess_input_bgr", fake_preprocess_input_bgr)
     monkeypatch.setattr(match_infer, "run_inference", fake_run_inference)
     monkeypatch.setattr(match_infer, "print_output_stats", lambda outputs: None)
     monkeypatch.setattr(match_infer, "decode_minutiae_rows", lambda **kwargs: [])
@@ -165,9 +171,11 @@ def test_match_infer_uses_full_image_canonical_preprocess_without_crop(
 
     assert calls == [
         {
-            "image_path": image_path,
+            "full_bgr_shape": (8, 8, 3),
             "save_preprocess_dir": tmp_path / "out" / "preprocess",
             "solov2_score_thr": pytest.approx(0.15),
+            "fallback_mask": None,
+            "fallback_mask_source": None,
         }
     ]
     assert result["preprocess_dir"] == tmp_path / "out" / "preprocess"

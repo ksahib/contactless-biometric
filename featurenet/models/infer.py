@@ -4,6 +4,7 @@ import argparse
 import csv
 import importlib.util
 import json
+import math
 import pathlib
 import sys
 import sysconfig
@@ -28,6 +29,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+import center_unwarping
 import preprocess as solov2_preprocess
 from generate_ground_truth import load_bgr_image
 
@@ -348,6 +350,127 @@ def save_minutiae_csv(rows: list[dict[str, float]], output_csv: Path) -> None:
         writer.writeheader()
         for row in rows:
             writer.writerow(row)
+
+
+def _upsample_gradient_to_full(gradient_tensor: torch.Tensor, input_shape_hw: tuple[int, int]) -> tuple[np.ndarray, np.ndarray]:
+    grad = gradient_tensor.detach().float().cpu().numpy()
+    if grad.ndim != 4 or grad.shape[0] != 1 or grad.shape[1] != 2:
+        raise ValueError(f"expected gradient with shape [1,2,H,W], got {tuple(grad.shape)}")
+    height, width = int(input_shape_hw[0]), int(input_shape_hw[1])
+    gx = cv2.resize(grad[0, 0], (width, height), interpolation=cv2.INTER_LINEAR).astype(np.float32)
+    gy = cv2.resize(grad[0, 1], (width, height), interpolation=cv2.INTER_LINEAR).astype(np.float32)
+    return gx, gy
+
+
+def _sample_map_nearest(
+    map_array: np.ndarray,
+    valid_mask: np.ndarray,
+    x: float,
+    y: float,
+) -> float | None:
+    if not (math.isfinite(x) and math.isfinite(y)):
+        return None
+    height, width = map_array.shape
+    xi = int(round(x))
+    yi = int(round(y))
+    if xi < 0 or yi < 0 or xi >= width or yi >= height:
+        return None
+    if not bool(valid_mask[yi, xi]):
+        return None
+    value = float(map_array[yi, xi])
+    return value if math.isfinite(value) else None
+
+
+def _warp_point(x_out: np.ndarray, y_out: np.ndarray, valid: np.ndarray, x: float, y: float) -> tuple[float, float] | None:
+    xu = _sample_map_nearest(x_out, valid, x, y)
+    yu = _sample_map_nearest(y_out, valid, x, y)
+    if xu is None or yu is None:
+        return None
+    return xu, yu
+
+
+def unwarp_minutiae_rows(
+    rows: list[dict[str, float]],
+    gradient_tensor: torch.Tensor,
+    mask_tensor: torch.Tensor,
+    input_shape_hw: tuple[int, int],
+    gray_image: np.ndarray | None = None,
+    orient_delta_px: float = 4.0,
+) -> tuple[list[dict[str, float]], np.ndarray]:
+    """Route A: warp decoded minutiae into the predicted-gradient unwarped frame.
+
+    Uses the model's predicted shape (gradient) head to flatten the finger via
+    ``center_unwarping.run_center_unwarping``, then moves each minutia's coordinate
+    and orientation into the canonical (unwarped) frame. Extraction stays in the
+    contactless view; only the geometry is transported, mirroring how the ground
+    truth reprojects minutiae. Returns the warped rows and the unwarped mask that
+    matches the new coordinate frame (for MCC overlap gating).
+    """
+    height, width = int(input_shape_hw[0]), int(input_shape_hw[1])
+    mask = mask_tensor.detach().float().cpu().numpy()
+    while mask.ndim > 2:
+        mask = mask[0]
+    mask_u8 = (mask > 0).astype(np.uint8)
+
+    gx, gy = _upsample_gradient_to_full(gradient_tensor, input_shape_hw)
+    gx = gx * mask_u8
+    gy = gy * mask_u8
+
+    if gray_image is not None:
+        image = gray_image.astype(np.float32)
+        if image.shape != (height, width):
+            image = cv2.resize(image, (width, height), interpolation=cv2.INTER_LINEAR).astype(np.float32)
+    else:
+        image = np.zeros((height, width), dtype=np.float32)
+
+    if int(mask_u8.sum()) == 0:
+        return rows, mask_u8
+    try:
+        maps = center_unwarping.run_center_unwarping(image, mask_u8, gx, gy)
+    except (ValueError, FloatingPointError):
+        return rows, mask_u8
+
+    x_out = np.asarray(maps["x_out"], dtype=np.float32)
+    y_out = np.asarray(maps["y_out"], dtype=np.float32)
+    valid = np.asarray(maps["valid_mask"], dtype=bool)
+    unwarped_mask = np.asarray(maps["unwarped_mask"], dtype=np.uint8)
+
+    warped_rows: list[dict[str, float]] = []
+    for row in rows:
+        x = float(row["x"])
+        y = float(row["y"])
+        angle = float(row.get("angle", 0.0))
+        center = _warp_point(x_out, y_out, valid, x, y)
+        if center is None:
+            continue
+        cxu, cyu = center
+        forward = _warp_point(
+            x_out, y_out, valid,
+            x + math.cos(angle) * orient_delta_px,
+            y + math.sin(angle) * orient_delta_px,
+        )
+        backward = _warp_point(
+            x_out, y_out, valid,
+            x - math.cos(angle) * orient_delta_px,
+            y - math.sin(angle) * orient_delta_px,
+        )
+        if forward is not None and backward is not None:
+            new_angle = math.atan2(forward[1] - backward[1], forward[0] - backward[0])
+        elif forward is not None:
+            new_angle = math.atan2(forward[1] - cyu, forward[0] - cxu)
+        elif backward is not None:
+            new_angle = math.atan2(cyu - backward[1], cxu - backward[0])
+        else:
+            new_angle = angle
+        warped_rows.append(
+            {
+                "x": float(cxu),
+                "y": float(cyu),
+                "angle": float(new_angle),
+                "score": float(row.get("score", 1.0)),
+            }
+        )
+    return warped_rows, unwarped_mask
 
 
 def print_output_stats(outputs: dict[str, torch.Tensor]) -> None:

@@ -23,7 +23,7 @@ if str(REPO_ROOT) not in sys.path:
 DEFAULT_ARCHIVE_ROOT = Path("/media/milab-5/82002d9e-66a9-4739-925b-e2b789ec5641/archive")
 DEFAULT_WEIGHTS_PATH = REPO_ROOT / "runs" / "featurenet_v4" / "best.pt"
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "match_outputs"
-CACHE_VERSION = 2
+CACHE_VERSION = 3
 DEFAULT_MCC_METHODS = ("LSA", "LSA-R", "LSA-CENTROID")
 DEFAULT_FEATURE_SCORE_THRESHOLDS = (0.5, 0.6, 0.7, 0.8, 0.9)
 
@@ -51,11 +51,21 @@ from dataclasses import asdict, dataclass
 
 
 def prepend_workspace_site_packages() -> None:
+    try:
+        sys_prefix = Path(sys.prefix).resolve()
+    except Exception:
+        sys_prefix = None
     for site_packages in (
         REPO_ROOT / ".venv" / "Lib" / "site-packages",
         REPO_ROOT / ".venv" / "lib" / "site-packages",
     ):
-        if site_packages.exists():
+        if not site_packages.exists():
+            continue
+        try:
+            resolved = site_packages.resolve()
+        except Exception:
+            resolved = site_packages
+        if sys_prefix is None or sys_prefix in resolved.parents:
             sys.path.insert(0, str(site_packages))
 
 
@@ -408,9 +418,10 @@ def _load_infer_helpers() -> dict[str, Any]:
         run_inference,
         save_minutiae_csv,
         save_pose_sidecars,
+        unwarp_minutiae_rows,
         _resolve_device,
     )
-    from featurenet.models.match_infer import _save_mask_png
+    from featurenet.models.match_infer import _save_mask_png, _save_mask_array_png
 
     return {
         "decode_minutiae_rows": decode_minutiae_rows,
@@ -420,8 +431,10 @@ def _load_infer_helpers() -> dict[str, Any]:
         "run_inference": run_inference,
         "save_minutiae_csv": save_minutiae_csv,
         "save_pose_sidecars": save_pose_sidecars,
+        "unwarp_minutiae_rows": unwarp_minutiae_rows,
         "_resolve_device": _resolve_device,
         "_save_mask_png": _save_mask_png,
+        "_save_mask_array_png": _save_mask_array_png,
     }
 
 
@@ -451,6 +464,7 @@ def _cached_extraction_is_complete(
     score_threshold: float,
     apply_nms: bool,
     solov2_score_thr: float,
+    unwarp: str,
 ) -> tuple[bool, int | None]:
     required = ("minutiae_csv", "mask_png", "orientation_npy", "ridge_period_npy", "metadata_json")
     if not all(files[name].exists() and files[name].stat().st_size > 0 for name in required):
@@ -474,6 +488,8 @@ def _cached_extraction_is_complete(
     if float(metadata.get("feature_score_threshold", -1.0)) != float(score_threshold):
         return False, None
     if bool(metadata.get("minutia_nms_enabled")) != bool(apply_nms):
+        return False, None
+    if str(metadata.get("unwarp", "none")) != str(unwarp):
         return False, None
     if record.source_kind != "gt_bundle" and float(metadata.get("solov2_score_thr", -1.0)) != float(solov2_score_thr):
         return False, None
@@ -526,6 +542,7 @@ def extract_image(
     cache_root: Path,
     reuse_cache: bool,
     apply_nms: bool,
+    unwarp: str = "none",
 ) -> dict[str, Any]:
     cache_dir = cache_root / f"score_{_threshold_label(score_threshold)}" / record.cache_key
     files = _cache_files(cache_dir)
@@ -538,6 +555,7 @@ def extract_image(
                 score_threshold=score_threshold,
                 apply_nms=apply_nms,
                 solov2_score_thr=solov2_score_thr,
+                unwarp=unwarp,
             )
             if complete:
                 return _extraction_row(
@@ -582,9 +600,28 @@ def extract_image(
             score_threshold=score_threshold,
             apply_nms=apply_nms,
         )
-        helpers["save_minutiae_csv"](minutiae_rows, files["minutiae_csv"])
+        unwarp_applied = False
+        if unwarp == "gradient":
+            gray_full = image_tensor.detach().cpu().numpy()[0, 0]
+            warped_rows, unwarped_mask = helpers["unwarp_minutiae_rows"](
+                rows=minutiae_rows,
+                gradient_tensor=outputs["gradient"],
+                mask_tensor=mask_tensor,
+                input_shape_hw=input_shape_hw,
+                gray_image=gray_full,
+            )
+            if warped_rows is not minutiae_rows:
+                unwarp_applied = True
+                minutiae_rows = warped_rows
+                helpers["save_minutiae_csv"](minutiae_rows, files["minutiae_csv"])
+                helpers["_save_mask_array_png"](unwarped_mask, files["mask_png"])
+            else:
+                helpers["save_minutiae_csv"](minutiae_rows, files["minutiae_csv"])
+                helpers["_save_mask_png"](mask_tensor, files["mask_png"])
+        else:
+            helpers["save_minutiae_csv"](minutiae_rows, files["minutiae_csv"])
+            helpers["_save_mask_png"](mask_tensor, files["mask_png"])
         orientation_npy, ridge_period_npy = helpers["save_pose_sidecars"](outputs, cache_dir)
-        helpers["_save_mask_png"](mask_tensor, files["mask_png"])
 
         metadata = {
             "cache_version": CACHE_VERSION,
@@ -597,6 +634,8 @@ def extract_image(
             "feature_score_threshold": float(score_threshold),
             "solov2_score_thr": float(solov2_score_thr),
             "minutia_nms_enabled": bool(apply_nms),
+            "unwarp": unwarp,
+            "unwarp_applied": bool(unwarp_applied),
             "minutiae_count": len(minutiae_rows),
             "artifacts": {
                 "minutiae_csv": str(files["minutiae_csv"].resolve()),
@@ -650,6 +689,7 @@ def run_inference_for_records(
     cache_root: Path,
     reuse_cache: bool,
     apply_nms: bool,
+    unwarp: str = "none",
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for index, record in enumerate(records, start=1):
@@ -663,6 +703,7 @@ def run_inference_for_records(
                 score_threshold=score_threshold,
                 apply_nms=apply_nms,
                 solov2_score_thr=solov2_score_thr,
+                unwarp=unwarp,
             )
             if complete:
                 rows.append(
@@ -704,6 +745,7 @@ def run_inference_for_records(
                 cache_root=cache_root,
                 reuse_cache=reuse_cache,
                 apply_nms=apply_nms,
+                unwarp=unwarp,
             )
         )
         if index == 1 or index % 25 == 0 or index == len(records):
@@ -1096,6 +1138,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reuse-cache", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--disable-minutia-nms", action="store_true")
     parser.add_argument(
+        "--unwarp",
+        choices=("none", "gradient"),
+        default="gradient",
+        help="Route A: warp decoded minutiae into the predicted-gradient canonical frame before MCC.",
+    )
+    parser.add_argument(
         "--solov2-score-thr",
         type=float,
         default=0.15,
@@ -1203,6 +1251,7 @@ def main() -> int:
             cache_root=cache_root,
             reuse_cache=bool(args.reuse_cache),
             apply_nms=apply_nms,
+            unwarp=str(args.unwarp),
         )
         inference_rows_by_threshold[score_threshold] = inference_rows
         inference_manifest_path = output_dir / f"inference_manifest_score_{label}.csv"
@@ -1317,6 +1366,7 @@ def main() -> int:
             "seed": int(args.seed),
             "reuse_cache": bool(args.reuse_cache),
             "minutia_nms_enabled": bool(apply_nms),
+            "unwarp": str(args.unwarp),
             "solov2_score_thr": float(args.solov2_score_thr),
         },
         "counts": {

@@ -8,6 +8,7 @@ import sysconfig
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
@@ -102,6 +103,58 @@ def _write_bundle(root: Path, sample_id: str = "sample_001") -> dict[str, Path]:
     }
     (sample_dir / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
     return {"sample_dir": sample_dir, "reconstruction_maps": reconstruction_maps_path}
+
+
+def _write_single_source_bundle(root: Path, sample_id: str = "single_source_sample") -> None:
+    """Larger bundle whose single-source candidate sits far from any positive,
+    so the consensus rasterizer produces a non-empty ignore region."""
+    sample_dir = root / "samples" / sample_id
+    sample_dir.mkdir(parents=True, exist_ok=True)
+    height = width = 64
+    output_shape = (8, 8)
+    image = np.full((height, width), 120, dtype=np.uint8)
+    mask = np.full((height, width), 255, dtype=np.uint8)
+    orientation = np.full((height, width), 0.25, dtype=np.float32)
+    ridge = np.ones((height, width), dtype=np.float32) * 10.0
+    gradient = np.zeros((height, width, 2), dtype=np.float32)
+    minutiae = [{"x": 8.0, "y": 8.0, "theta": 0.25, "score": 1.0, "type": "ending"}]
+    single_source = [{"x": 52.0, "y": 52.0, "theta": 0.0, "score": 0.5, "type": "ending"}]
+    extractor_config = {
+        "minutiae_score_target": "gaussian",
+        "gaussian_amp_2src": 0.85,
+        "gaussian_sigma_2src_cells": 1.25,
+        "single_source_ignore_sigma_cells": 1.25,
+        "single_source_ignore_truncate_sigma": 3.0,
+        "single_source_ignore_weight": 0.0,
+    }
+    targets = build_featurenet_targets(
+        image, mask, orientation, ridge, gradient, minutiae,
+        single_source_candidates=single_source,
+        extractor_config=SimpleNamespace(**extractor_config),
+        output_shape=output_shape,
+    )
+
+    cv2.imwrite(str(sample_dir / "masked_image.png"), image)
+    cv2.imwrite(str(sample_dir / "mask.png"), mask)
+    np.save(sample_dir / "orientation.npy", orientation)
+    np.save(sample_dir / "ridge_period.npy", ridge)
+    np.savez_compressed(sample_dir / "featurenet_targets.npz", **targets)
+    (sample_dir / "minutiae.json").write_text(json.dumps(minutiae), encoding="utf-8")
+    (sample_dir / "minutiae_single_source_candidates.json").write_text(
+        json.dumps(single_source), encoding="utf-8"
+    )
+    meta = {
+        "sample_id": sample_id,
+        "subject_id": 1,
+        "finger_id": 1,
+        "acquisition_id": 1,
+        "finger_class_id": 0,
+        "raw_view_index": 0,
+        "counts": {"minutiae": 1},
+        "shapes": {"input_image": [height, width], "featurenet_output": list(output_shape)},
+        "minutiae_ground_truth": extractor_config,
+    }
+    (sample_dir / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
 
 
 class FeatureNetAugmentationTests(unittest.TestCase):
@@ -200,11 +253,13 @@ class FeatureNetAugmentationTests(unittest.TestCase):
         self.assertGreater(np.count_nonzero(rendered["mask"]), 0)
         self.assertLess(float(np.mean(np.abs(rendered["image"].astype(np.float32) - image.astype(np.float32)))), 1.0)
 
-    def test_3d_orientation_update_uses_projected_tangent(self) -> None:
+    def test_3d_orientation_update_uses_surface_tangent(self) -> None:
         depth = np.zeros((16, 16), dtype=np.float32)
         r = rotation_matrix(35.0, 10.0, 0.0)
         minutiae = [{"x": 8.0, "y": 8.0, "theta": 0.0, "score": 1.0}]
-        transformed = _transform_minutiae_3d(
+        rendered_mask = np.full((16, 16), 255, dtype=np.uint8)
+
+        flat = _transform_minutiae_3d(
             minutiae=minutiae,
             depth_image=depth,
             r=r,
@@ -213,12 +268,32 @@ class FeatureNetAugmentationTests(unittest.TestCase):
             depth_center=0.0,
             dx=0.0,
             dy=0.0,
-            rendered_mask=np.full((16, 16), 255, dtype=np.uint8),
+            rendered_mask=rendered_mask,
         )
-        p0 = _project_3d_point(8.0, 8.0, 0.0, r, 7.5, 7.5, 0.0, 0.0, 0.0)
-        p1 = _project_3d_point(11.0, 8.0, 0.0, r, 7.5, 7.5, 0.0, 0.0, 0.0)
-        expected = math.atan2(float(p1[1] - p0[1]), float(p1[0] - p0[0]))
-        self.assertAlmostEqual(transformed[0]["theta"], expected, places=5)
+        # With zero surface gradient the tangent lift reduces to the flat projected tangent.
+        expected_flat = math.atan2(float(r[1, 0]), float(r[0, 0])) % (2.0 * math.pi)
+        self.assertAlmostEqual(flat[0]["theta"], expected_flat, places=5)
+
+        gradient = np.zeros((16, 16, 2), dtype=np.float32)
+        gradient[..., 0] = 0.5
+        gradient[..., 1] = -0.3
+        sloped = _transform_minutiae_3d(
+            minutiae=minutiae,
+            depth_image=depth,
+            r=r,
+            cx=7.5,
+            cy=7.5,
+            depth_center=0.0,
+            dx=0.0,
+            dy=0.0,
+            rendered_mask=rendered_mask,
+            gradient=gradient,
+        )
+        # theta=0 -> source tangent (1, 0, gx) lifted onto the surface, then rotated by R.
+        tangent = r @ np.asarray([1.0, 0.0, 0.5], dtype=np.float32)
+        expected_sloped = math.atan2(float(tangent[1]), float(tangent[0])) % (2.0 * math.pi)
+        self.assertAlmostEqual(sloped[0]["theta"], expected_sloped, places=5)
+        self.assertNotAlmostEqual(sloped[0]["theta"], flat[0]["theta"], places=3)
 
     def test_determinism_for_same_seed_and_access_sequence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -340,6 +415,71 @@ class FeatureNetAugmentationTests(unittest.TestCase):
 
         self.assertEqual(rendered["image"].shape, (height, width))
         self.assertGreater(np.count_nonzero(rendered["mask"]), 1000)
+
+    def test_roll_foreshortens_period_and_transforms_gradient(self) -> None:
+        size = 64
+        image = np.full((size, size), 120, dtype=np.uint8)
+        mask = np.full((size, size), 255, dtype=np.uint8)
+        # Ridges running vertically (orientation pi/2) so the ridge-normal is along x,
+        # which is the axis a roll about y compresses.
+        orientation = np.full((size, size), math.pi / 2.0, dtype=np.float32)
+        ridge = np.full((size, size), 10.0, dtype=np.float32)
+        yy, xx = np.indices((size, size), dtype=np.float32)
+        reconstruction = {
+            "support_mask": np.ones((size, size), dtype=np.uint8),
+            "front_pose_x_map": xx,
+            "front_pose_y_map": yy,
+            "depth_front": np.zeros((size, size), dtype=np.float32),
+        }
+        roll_deg = 20.0
+        params = AugmentationParams(False, False, False, True, 0.0, 0.0, 0.0, 0.0, roll_deg)
+
+        rendered = render_3d_augmented(
+            image=image,
+            mask=mask,
+            orientation=orientation,
+            ridge_period=ridge,
+            gradient=np.zeros((size, size, 2), dtype=np.float32),
+            minutiae=[],
+            reconstruction=reconstruction,
+            role="front",
+            params=params,
+        )
+
+        foreground = rendered["mask"] > 0
+        self.assertGreater(int(foreground.sum()), 0)
+
+        # Hole-free: morphological closing must not add any pixels.
+        closed = cv2.morphologyEx(rendered["mask"], cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+        self.assertTrue(np.array_equal(closed, rendered["mask"]))
+
+        roll = math.radians(roll_deg)
+        period = rendered["ridge_period"][foreground]
+        self.assertAlmostEqual(float(np.mean(period)), 10.0 * math.cos(roll), delta=0.05)
+
+        gradient_x = rendered["gradient"][..., 0][foreground]
+        self.assertAlmostEqual(float(np.mean(gradient_x)), -math.tan(roll), delta=0.02)
+        gradient_y = rendered["gradient"][..., 1][foreground]
+        self.assertAlmostEqual(float(np.mean(gradient_y)), 0.0, delta=0.02)
+
+        orient = rendered["orientation"][foreground]
+        self.assertAlmostEqual(float(np.mean(orient)), math.pi / 2.0, delta=0.02)
+
+    def test_augmented_targets_apply_single_source_ignore(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            _SAMPLE_CACHE.clear()
+            root = Path(directory)
+            _write_single_source_bundle(root)
+            samples = load_bundle_samples(root, strict_gradient_targets=True)
+            sample = samples[0]
+            self.assertIsInstance(sample.get("minutiae_target_config"), dict)
+
+            params = AugmentationParams(True, False, False, False, 0.0, 0.0, 0.0, 0.0, 0.0)
+            result = augment_sample(sample, params, output_shape=(8, 8))
+
+            self.assertIn("minutia_score_weight_map", result.targets)
+            self.assertIn("minutia_score_ignore_mask", result.targets)
+            self.assertGreater(float(result.targets["minutia_score_ignore_mask"].sum()), 0.0)
 
     def test_augmented_outputs_are_finite_and_training_step_compatible(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
