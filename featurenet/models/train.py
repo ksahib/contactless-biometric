@@ -1659,7 +1659,7 @@ def train_model(args: argparse.Namespace) -> dict[str, Any]:
             monitor_available = True
             if monitor_name == "pair_auc":
                 pair_auc_value = None if pair_metrics is None else pair_metrics.get("pair_auc")
-                monitor_available = pair_auc_value is not None and np.isfinite(float(pair_auc_value))
+                monitor_available = pair_auc_value is not None and bool(np.isfinite(float(pair_auc_value)))
 
             if monitor_available:
                 current_monitor_value, monitor_mode = _select_monitored_metric(
