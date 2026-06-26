@@ -20,7 +20,7 @@ class AugmentationConfig:
     count: int = 5
     translation_typical_px: float = 16.0
     translation_strong_px: float = 32.0
-    yaw_deg: float = 5.0
+    yaw_deg: float = 15.0
     pitch_roll_typical_deg: float = 15.0
     pitch_roll_strong_deg: float = 25.0
     missing_reconstruction: str = "skip"
@@ -29,6 +29,25 @@ class AugmentationConfig:
     reconstruction_cache_size: int = 2
     sample_cache_size: int = 8
     group_variants: bool = False
+    # Photometric + uniform-scale augmentation (applied to synthetic variants only).
+    photometric: bool = True
+    yaw_prob: float = 0.70
+    scale_jitter_min: float = 0.90
+    scale_jitter_max: float = 1.10
+    brightness_max: float = 30.0
+    contrast_delta: float = 0.25
+    gamma_min: float = 0.70
+    gamma_max: float = 1.50
+    blur_sigma_max: float = 1.60
+    blur_prob: float = 0.40
+    noise_std_max: float = 10.0
+    noise_prob: float = 0.50
+    jpeg_quality_min: int = 35
+    jpeg_prob: float = 0.40
+    illum_strength_max: float = 0.35
+    illum_prob: float = 0.40
+    glare_prob: float = 0.20
+    glare_intensity_max: float = 120.0
 
 
 @dataclass(slots=True)
@@ -42,6 +61,22 @@ class AugmentationParams:
     yaw_deg: float
     pitch_deg: float
     roll_deg: float
+    # Uniform in-plane scale (2D-affine path only); 1.0 is identity.
+    scale: float = 1.0
+    # Photometric parameters; neutral defaults are a no-op.
+    brightness: float = 0.0
+    contrast: float = 1.0
+    gamma: float = 1.0
+    blur_sigma: float = 0.0
+    noise_std: float = 0.0
+    noise_seed: int = 0
+    jpeg_quality: int = 0
+    illum_strength: float = 0.0
+    illum_angle: float = 0.0
+    glare_intensity: float = 0.0
+    glare_cx: float = 0.5
+    glare_cy: float = 0.5
+    glare_radius: float = 0.2
 
     @property
     def has_3d(self) -> bool:
@@ -64,7 +99,7 @@ _SAMPLE_CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
 
 def sample_augmentation_params(rng: np.random.Generator, config: AugmentationConfig) -> AugmentationParams:
     translate = bool(rng.random() < 0.80)
-    yaw = bool(rng.random() < 0.45)
+    yaw = bool(rng.random() < config.yaw_prob)
     pitch = bool(rng.random() < 0.35)
     roll = bool(rng.random() < 0.35)
     if not (translate or yaw or pitch or roll):
@@ -88,6 +123,8 @@ def sample_augmentation_params(rng: np.random.Generator, config: AugmentationCon
         roll_deg *= 0.75
         yaw_deg *= 0.75
 
+    photometric = _sample_photometric_params(rng, config)
+
     return AugmentationParams(
         translate=translate,
         yaw=yaw,
@@ -98,7 +135,104 @@ def sample_augmentation_params(rng: np.random.Generator, config: AugmentationCon
         yaw_deg=float(yaw_deg),
         pitch_deg=float(pitch_deg),
         roll_deg=float(roll_deg),
+        **photometric,
     )
+
+
+def _sample_photometric_params(rng: np.random.Generator, config: AugmentationConfig) -> dict[str, Any]:
+    """Sample appearance + scale jitter. Neutral when photometric is disabled."""
+    neutral = {
+        "scale": 1.0,
+        "brightness": 0.0,
+        "contrast": 1.0,
+        "gamma": 1.0,
+        "blur_sigma": 0.0,
+        "noise_std": 0.0,
+        "noise_seed": 0,
+        "jpeg_quality": 0,
+        "illum_strength": 0.0,
+        "illum_angle": 0.0,
+        "glare_intensity": 0.0,
+        "glare_cx": 0.5,
+        "glare_cy": 0.5,
+        "glare_radius": 0.2,
+    }
+    if not config.photometric:
+        return neutral
+
+    values = dict(neutral)
+    values["scale"] = float(rng.uniform(config.scale_jitter_min, config.scale_jitter_max))
+    if rng.random() < 0.70:
+        values["brightness"] = float(rng.uniform(-config.brightness_max, config.brightness_max))
+    if rng.random() < 0.70:
+        values["contrast"] = float(rng.uniform(1.0 - config.contrast_delta, 1.0 + config.contrast_delta))
+    if rng.random() < 0.60:
+        values["gamma"] = float(rng.uniform(config.gamma_min, config.gamma_max))
+    if rng.random() < config.blur_prob:
+        values["blur_sigma"] = float(rng.uniform(0.4, config.blur_sigma_max))
+    if rng.random() < config.noise_prob:
+        values["noise_std"] = float(rng.uniform(0.3 * config.noise_std_max, config.noise_std_max))
+        values["noise_seed"] = int(rng.integers(0, 2**31 - 1))
+    if rng.random() < config.jpeg_prob:
+        values["jpeg_quality"] = int(rng.integers(config.jpeg_quality_min, 96))
+    if rng.random() < config.illum_prob:
+        values["illum_strength"] = float(rng.uniform(0.1, config.illum_strength_max))
+        values["illum_angle"] = float(rng.uniform(0.0, 2.0 * math.pi))
+    if rng.random() < config.glare_prob:
+        values["glare_intensity"] = float(rng.uniform(40.0, config.glare_intensity_max))
+        values["glare_cx"] = float(rng.uniform(0.2, 0.8))
+        values["glare_cy"] = float(rng.uniform(0.2, 0.8))
+        values["glare_radius"] = float(rng.uniform(0.08, 0.20))
+    return values
+
+
+def apply_photometric(image: np.ndarray, mask: np.ndarray, params: AugmentationParams) -> np.ndarray:
+    """Label-preserving appearance jitter on a masked grayscale uint8 image.
+
+    Geometry is untouched, so FeatureNet targets remain valid. Background stays 0.
+    """
+    foreground = mask > 0
+    if not np.any(foreground):
+        return image
+
+    img = image.astype(np.float32)
+    if params.contrast != 1.0 or params.brightness != 0.0:
+        mean = float(img[foreground].mean())
+        img = (img - mean) * float(params.contrast) + mean + float(params.brightness)
+    if params.gamma != 1.0:
+        norm = np.clip(img, 0.0, 255.0) / 255.0
+        img = np.power(norm, float(params.gamma)) * 255.0
+    if params.illum_strength > 0.0:
+        height, width = img.shape
+        yy, xx = np.mgrid[0:height, 0:width].astype(np.float32)
+        nx = (xx / max(width - 1, 1)) - 0.5
+        ny = (yy / max(height - 1, 1)) - 0.5
+        ramp = math.cos(params.illum_angle) * nx + math.sin(params.illum_angle) * ny
+        img = img * (1.0 + float(params.illum_strength) * ramp)
+    if params.glare_intensity > 0.0:
+        height, width = img.shape
+        cx = float(params.glare_cx) * width
+        cy = float(params.glare_cy) * height
+        yy, xx = np.mgrid[0:height, 0:width].astype(np.float32)
+        sigma = max(float(params.glare_radius) * max(height, width), 1.0)
+        blob = np.exp(-((xx - cx) ** 2 + (yy - cy) ** 2) / (2.0 * sigma * sigma))
+        img = img + float(params.glare_intensity) * blob
+    img = np.clip(img, 0.0, 255.0)
+    if params.blur_sigma > 0.0:
+        img = cv2.GaussianBlur(img, (0, 0), float(params.blur_sigma))
+    if params.noise_std > 0.0:
+        noise_rng = np.random.default_rng(int(params.noise_seed))
+        img = img + noise_rng.normal(0.0, float(params.noise_std), size=img.shape).astype(np.float32)
+        img = np.clip(img, 0.0, 255.0)
+    out = np.clip(img, 0.0, 255.0).astype(np.uint8)
+    if params.jpeg_quality > 0:
+        ok, encoded = cv2.imencode(".jpg", out, [int(cv2.IMWRITE_JPEG_QUALITY), int(params.jpeg_quality)])
+        if ok:
+            decoded = cv2.imdecode(encoded, cv2.IMREAD_GRAYSCALE)
+            if decoded is not None:
+                out = decoded.astype(np.uint8)
+    out[~foreground] = 0
+    return out
 
 
 def rotation_matrix(yaw_deg: float, pitch_deg: float, roll_deg: float) -> np.ndarray:
@@ -174,6 +308,8 @@ def augment_sample(
             params=params,
         )
 
+    rendered["image"] = apply_photometric(rendered["image"], rendered["mask"], params)
+
     extractor_config = _sample_target_config(sample)
     targets = tr.build_featurenet_targets(
         rendered["image"],
@@ -221,12 +357,17 @@ def render_2d_augmented(
     single_source_candidates: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     height, width = image.shape
-    matrix = _affine_matrix(width, height, params.yaw_deg, params.dx, params.dy)
+    scale = float(params.scale)
+    matrix = _affine_matrix(width, height, params.yaw_deg, params.dx, params.dy, scale)
     warped_image = cv2.warpAffine(image, matrix, (width, height), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
     warped_mask = cv2.warpAffine(mask, matrix, (width, height), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
     warped_orientation = _warp_orientation_2d(orientation, mask, matrix, params.yaw_deg)
-    warped_ridge = cv2.warpAffine(ridge_period.astype(np.float32), matrix, (width, height), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    # Uniform zoom scales the apparent ridge period linearly.
+    warped_ridge = cv2.warpAffine(ridge_period.astype(np.float32), matrix, (width, height), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0) * scale
     warped_gradient = _warp_gradient_2d(gradient, matrix, params.yaw_deg, image.shape) if gradient is not None else None
+    if warped_gradient is not None and scale != 1.0:
+        # Surface slope measured in screen space shrinks as the image is enlarged.
+        warped_gradient = (warped_gradient / scale).astype(np.float32)
     transformed_minutiae = _transform_minutiae_affine(minutiae, matrix, math.radians(params.yaw_deg), warped_mask)
     transformed_single_source = _transform_minutiae_affine(
         single_source_candidates or [], matrix, math.radians(params.yaw_deg), warped_mask
@@ -523,9 +664,9 @@ def _load_targets_for_gradient(sample: Mapping[str, Any], image_shape: tuple[int
     return {}
 
 
-def _affine_matrix(width: int, height: int, yaw_deg: float, dx: float, dy: float) -> np.ndarray:
+def _affine_matrix(width: int, height: int, yaw_deg: float, dx: float, dy: float, scale: float = 1.0) -> np.ndarray:
     center = ((width - 1.0) * 0.5, (height - 1.0) * 0.5)
-    matrix = cv2.getRotationMatrix2D(center, float(yaw_deg), 1.0).astype(np.float32)
+    matrix = cv2.getRotationMatrix2D(center, float(yaw_deg), float(scale)).astype(np.float32)
     matrix[0, 2] += float(dx)
     matrix[1, 2] += float(dy)
     return matrix

@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .blocks import ConvBlock
+from .blocks import ConvBlock, MaxBlurPool2d
 
 
 class FeatureExtractor(nn.Module):
@@ -12,13 +12,13 @@ class FeatureExtractor(nn.Module):
         self.branch1 = nn.Sequential(
             ConvBlock(2, 64, kernel_size=3, stride=1, padding=1),
             ConvBlock(64, 64, kernel_size=3, stride=1, padding=1),
-            nn.MaxPool2d(kernel_size=2, stride=2),
+            MaxBlurPool2d(64),
             ConvBlock(64, 128, kernel_size=3, stride=1, padding=1),
             ConvBlock(128, 128, kernel_size=3, stride=1, padding=1),
-            nn.MaxPool2d(kernel_size=2, stride=2),
+            MaxBlurPool2d(128),
             ConvBlock(128, 256, kernel_size=3, stride=1, padding=1),
             ConvBlock(256, 256, kernel_size=3, stride=1, padding=1),
-            nn.MaxPool2d(kernel_size=2, stride=2),
+            MaxBlurPool2d(256),
         )
 
         # Ridge branch stems
@@ -36,11 +36,11 @@ class FeatureExtractor(nn.Module):
 
         # branch 2 (minutiae branch), exposed stages for /4 and /8 localization features
         self.branch2_conv1 = ConvBlock(2, 64, kernel_size=9, stride=1, padding=4)
-        self.branch2_pool1 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.branch2_pool1 = MaxBlurPool2d(64)
         self.branch2_conv2 = ConvBlock(64, 128, kernel_size=5, stride=1, padding=2)
-        self.branch2_pool2 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.branch2_pool2 = MaxBlurPool2d(128)
         self.branch2_conv3 = ConvBlock(128, 256, kernel_size=3, stride=1, padding=1)
-        self.branch2_pool3 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.branch2_pool3 = MaxBlurPool2d(256)
 
         self.ridge_conv = nn.Conv2d(256, 1, kernel_size=1, stride=1, padding=0)
         self.gradient_conv = nn.Sequential(

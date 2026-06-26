@@ -45,7 +45,14 @@ except ImportError:  # pragma: no cover - Pillow may also be unavailable
     Image = None
 
 from .feature_extractor import FeatureExtractor
-from .losses import FeatureNetLoss
+from .losses import (
+    ConsistencyConfig,
+    FeatureNetLoss,
+    apply_gpu_photometric,
+    make_affine_theta,
+    masked_mse,
+    warp_tensor,
+)
 from .augmentation import (
     AugmentationConfig,
     augment_sample,
@@ -69,7 +76,7 @@ FLOAT_TARGET_KEYS = {
     "minutia_orientation_vec",
 }
 LONG_TARGET_KEYS = {"minutia_x", "minutia_y", "minutia_orientation"}
-LOSS_KEYS = ("total", "orientation", "ridge", "gradient", "minutia", "m1", "m2", "m3", "m4")
+LOSS_KEYS = ("total", "orientation", "ridge", "gradient", "minutia", "m1", "m2", "m3", "m4", "consistency")
 TARGET_FINITE_KEYS = frozenset(FLOAT_TARGET_KEYS | LONG_TARGET_KEYS)
 EARLY_STOPPING_METRICS = (
     "val_total",
@@ -603,6 +610,7 @@ def _run_model_step(
     targets: Mapping[str, torch.Tensor],
     amp: bool = False,
     amp_dtype: torch.dtype = torch.float16,
+    consistency: ConsistencyConfig | None = None,
 ) -> dict[str, torch.Tensor]:
     image = inputs[:, :1]
     mask = inputs[:, 1:2]
@@ -624,7 +632,51 @@ def _run_model_step(
     if "gradient" not in targets:
         raise KeyError("missing explicit reconstruction-derived gradient target for gradient supervision")
     with _loss_context(device):
-        return criterion(_float_outputs(outputs), targets)
+        losses = criterion(_float_outputs(outputs), targets)
+    if consistency is not None and consistency.weight > 0.0:
+        _augment_losses_with_consistency(
+            model, image, mask, outputs, losses, consistency, amp=amp, amp_dtype=amp_dtype
+        )
+    elif "consistency" not in losses:
+        losses["consistency"] = outputs["minutia_score"].new_tensor(0.0)
+    return losses
+
+
+def _augment_losses_with_consistency(
+    model: FeatureExtractor,
+    image: torch.Tensor,
+    mask: torch.Tensor,
+    outputs: Mapping[str, torch.Tensor],
+    losses: dict[str, torch.Tensor],
+    cfg: ConsistencyConfig,
+    amp: bool,
+    amp_dtype: torch.dtype,
+) -> None:
+    """Affine + photometric equivariance: S(warp(x)) should equal warp(S(x))."""
+    device = image.device
+    batch = image.shape[0]
+    image_f = image.float()
+    mask_f = mask.float()
+    theta = make_affine_theta(
+        batch, cfg.max_rot_deg, cfg.max_shift_frac, cfg.max_scale_delta, device, dtype=torch.float32
+    )
+    warped_image = warp_tensor(image_f, theta, mode="bilinear")
+    warped_mask = (warp_tensor(mask_f, theta, mode="nearest") > 0.5).float()
+    warped_image = apply_gpu_photometric(warped_image, warped_mask, cfg)
+
+    with _autocast_context(device, amp, amp_dtype):
+        outputs2 = model(warped_image.to(image.dtype), mask=warped_mask.to(image.dtype))
+
+    with _loss_context(device):
+        prob1 = torch.sigmoid(outputs["minutia_score"].float())
+        prob2 = torch.sigmoid(outputs2["minutia_score"].float())
+        reference = warp_tensor(prob1, theta, mode="bilinear").detach()
+        score_mask = F.interpolate(mask_f, size=prob1.shape[-2:], mode="nearest")
+        warped_score_mask = warp_tensor(score_mask, theta, mode="nearest")
+        consistency_loss = masked_mse(prob2, reference, warped_score_mask)
+
+    losses["consistency"] = consistency_loss
+    losses["total"] = losses["total"] + cfg.weight * consistency_loss
 
 
 def train_one_epoch(
@@ -640,6 +692,7 @@ def train_one_epoch(
     grad_accum_steps: int = 1,
     max_grad_norm: float | None = None,
     skip_non_finite_target_batches: bool = True,
+    consistency: ConsistencyConfig | None = None,
 ) -> dict[str, float]:
     model.train()
     resolved_device = torch.device(device)
@@ -690,7 +743,9 @@ def train_one_epoch(
         host_to_device_seconds += time.perf_counter() - host_to_device_started
 
         forward_loss_started = time.perf_counter()
-        losses = _run_model_step(model, criterion, inputs, targets, amp=amp, amp_dtype=amp_dtype)
+        losses = _run_model_step(
+            model, criterion, inputs, targets, amp=amp, amp_dtype=amp_dtype, consistency=consistency
+        )
         forward_loss_seconds += time.perf_counter() - forward_loss_started
         total_loss = losses["total"]
         if not torch.isfinite(total_loss):
@@ -1321,6 +1376,7 @@ def _make_augmentation_config(args: argparse.Namespace) -> AugmentationConfig:
     pitch_roll_values = tuple(float(value) for value in args.pitch_roll_jitter_deg)
     translation_typical, translation_strong = sorted(translation_values)
     _, pitch_roll_strong = sorted(pitch_roll_values)
+    scale_min, scale_max = sorted(float(value) for value in args.scale_jitter)
     return AugmentationConfig(
         count=args.augmentation_count,
         translation_typical_px=translation_typical,
@@ -1334,6 +1390,9 @@ def _make_augmentation_config(args: argparse.Namespace) -> AugmentationConfig:
         reconstruction_cache_size=args.augmentation_reconstruction_cache_size,
         sample_cache_size=args.augmentation_sample_cache_size,
         group_variants=bool(args.augmentation_group_variants),
+        photometric=bool(args.augmentation_photometric),
+        scale_jitter_min=scale_min,
+        scale_jitter_max=scale_max,
     )
 
 
@@ -1495,13 +1554,28 @@ def train_model(args: argparse.Namespace) -> dict[str, Any]:
         m1_neg_weight=args.m1_neg_weight,
         m1_side_pos_weight=args.m1_side_pos_weight,
     ).to(resolved_device)
-    optimizer = optim.Adam(
+    optimizer = optim.AdamW(
         model.parameters(),
         lr=args.lr,
         betas=(0.9, 0.999),
-        weight_decay=0.0,
+        weight_decay=float(args.weight_decay),
     )
     scaler = _make_grad_scaler(use_amp and amp_dtype == torch.float16)
+
+    consistency_config: ConsistencyConfig | None = None
+    if args.consistency:
+        consistency_config = ConsistencyConfig(
+            weight=float(args.consistency_weight),
+            max_rot_deg=float(args.consistency_max_rot_deg),
+            max_shift_frac=float(args.consistency_max_shift_frac),
+            max_scale_delta=float(args.consistency_max_scale),
+        )
+        print(
+            "[train_model] in-step consistency loss enabled: "
+            f"weight={consistency_config.weight}, max_rot_deg={consistency_config.max_rot_deg}, "
+            f"max_shift_frac={consistency_config.max_shift_frac}, max_scale_delta={consistency_config.max_scale_delta}",
+            flush=True,
+        )
 
     resume_epoch = 0
     resume_metrics: Mapping[str, Any] = {}
@@ -1566,6 +1640,7 @@ def train_model(args: argparse.Namespace) -> dict[str, Any]:
             grad_accum_steps=args.grad_accum_steps,
             max_grad_norm=args.max_grad_norm,
             skip_non_finite_target_batches=args.skip_non_finite_target_batches,
+            consistency=consistency_config,
         )
         record: dict[str, Any] = {
             "epoch": epoch,
@@ -1750,7 +1825,11 @@ def train_model(args: argparse.Namespace) -> dict[str, Any]:
         "prefetch_factor": train_prefetch_factor,
         "adam_beta1": 0.9,
         "adam_beta2": 0.999,
-        "weight_decay": 0.0,
+        "weight_decay": float(args.weight_decay),
+        "consistency_enabled": bool(args.consistency),
+        "consistency_weight": float(args.consistency_weight) if args.consistency else 0.0,
+        "augmentation_photometric": bool(args.augmentation_photometric) if args.train_augmentations else False,
+        "scale_jitter": list(args.scale_jitter) if args.train_augmentations else None,
         "seed": args.seed,
         "strict_gradient_targets": bool(args.strict_gradient_targets),
         "strict_finite_targets": bool(args.strict_finite_targets),
@@ -1905,7 +1984,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--yaw-jitter-deg",
         type=float,
-        default=5.0,
+        default=15.0,
         help="Maximum residual in-plane yaw degrees sampled uniformly from [-value,+value].",
     )
     parser.add_argument(
@@ -1944,6 +2023,30 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Shuffle base samples, then emit original plus all augmentation variants together for better worker cache hits.",
     )
+    parser.add_argument(
+        "--augmentation-photometric",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Apply photometric jitter (brightness/contrast/gamma/blur/noise/JPEG/illumination/glare) to synthetic variants.",
+    )
+    parser.add_argument(
+        "--scale-jitter",
+        type=float,
+        nargs=2,
+        default=(0.9, 1.1),
+        metavar=("MIN", "MAX"),
+        help="Uniform in-plane scale jitter range applied to synthetic 2D-affine variants.",
+    )
+    parser.add_argument(
+        "--consistency",
+        action="store_true",
+        help="Enable the in-step affine+photometric equivariance loss on the minutia score head.",
+    )
+    parser.add_argument("--consistency-weight", type=float, default=25.0, help="Weight of the consistency term added to the total loss.")
+    parser.add_argument("--consistency-max-rot-deg", type=float, default=15.0, help="Max in-plane rotation (deg) of the consistency partner view.")
+    parser.add_argument("--consistency-max-shift-frac", type=float, default=0.06, help="Max translation (fraction of half-size) of the consistency partner view.")
+    parser.add_argument("--consistency-max-scale", type=float, default=0.10, help="Max scale delta of the consistency partner view.")
+    parser.add_argument("--weight-decay", type=float, default=0.0, help="AdamW weight decay; 0 disables decay (equivalent to Adam).")
     parser.add_argument(
         "--augmentation-probe",
         action="store_true",
@@ -1998,6 +2101,18 @@ def parse_args() -> argparse.Namespace:
         parser.error("--m1-hard-neg-min must be non-negative")
     if not 0.0 <= args.m1_hard_neg_fraction <= 1.0:
         parser.error("--m1-hard-neg-fraction must be in [0.0, 1.0]")
+    if any(float(value) <= 0.0 for value in args.scale_jitter):
+        parser.error("--scale-jitter values must be positive")
+    if args.consistency_weight < 0.0:
+        parser.error("--consistency-weight must be non-negative")
+    if args.consistency_max_rot_deg < 0.0:
+        parser.error("--consistency-max-rot-deg must be non-negative")
+    if args.consistency_max_shift_frac < 0.0:
+        parser.error("--consistency-max-shift-frac must be non-negative")
+    if args.consistency_max_scale < 0.0:
+        parser.error("--consistency-max-scale must be non-negative")
+    if args.weight_decay < 0.0:
+        parser.error("--weight-decay must be non-negative")
     return args
 
 

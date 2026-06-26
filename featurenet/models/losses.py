@@ -1,8 +1,90 @@
+import math
+from dataclasses import dataclass
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 MINUTIA_ORIENTATION_BINS = 360
+
+
+@dataclass
+class ConsistencyConfig:
+    """Knobs for the in-step affine + photometric equivariance loss."""
+
+    weight: float = 25.0
+    max_rot_deg: float = 15.0
+    max_shift_frac: float = 0.06
+    max_scale_delta: float = 0.10
+    brightness: float = 0.10
+    contrast: float = 0.20
+    gamma_min: float = 0.70
+    gamma_max: float = 1.40
+    noise_std: float = 0.03
+
+
+def make_affine_theta(
+    batch_size: int,
+    max_rot_deg: float,
+    max_shift_frac: float,
+    max_scale_delta: float,
+    device: torch.device,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Random per-sample affine ``theta`` ([B,2,3]) for ``F.affine_grid``.
+
+    Uses normalized coordinates, so the same ``theta`` warps both the full-res
+    image and the /8 score map consistently.
+    """
+    angle = (torch.rand(batch_size, device=device, dtype=dtype) * 2.0 - 1.0) * math.radians(max_rot_deg)
+    scale = 1.0 + (torch.rand(batch_size, device=device, dtype=dtype) * 2.0 - 1.0) * max_scale_delta
+    tx = (torch.rand(batch_size, device=device, dtype=dtype) * 2.0 - 1.0) * max_shift_frac
+    ty = (torch.rand(batch_size, device=device, dtype=dtype) * 2.0 - 1.0) * max_shift_frac
+    cos = torch.cos(angle) * scale
+    sin = torch.sin(angle) * scale
+    theta = torch.zeros(batch_size, 2, 3, device=device, dtype=dtype)
+    theta[:, 0, 0] = cos
+    theta[:, 0, 1] = -sin
+    theta[:, 0, 2] = tx
+    theta[:, 1, 0] = sin
+    theta[:, 1, 1] = cos
+    theta[:, 1, 2] = ty
+    return theta
+
+
+def warp_tensor(x: torch.Tensor, theta: torch.Tensor, mode: str = "bilinear") -> torch.Tensor:
+    grid = F.affine_grid(theta.to(dtype=x.dtype), list(x.shape), align_corners=False)
+    return F.grid_sample(x, grid, mode=mode, padding_mode="zeros", align_corners=False)
+
+
+def masked_mse(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    if mask.dim() == 3:
+        mask = mask.unsqueeze(1)
+    mask = mask.to(dtype=pred.dtype)
+    diff = (pred - target) ** 2 * mask
+    return diff.sum() / mask.sum().clamp_min(eps)
+
+
+def apply_gpu_photometric(image: torch.Tensor, mask: torch.Tensor, cfg: ConsistencyConfig) -> torch.Tensor:
+    """Differentiable-free appearance jitter for the consistency partner image."""
+    batch = image.shape[0]
+    device = image.device
+    dtype = image.dtype
+
+    def _rand(*shape: int) -> torch.Tensor:
+        return torch.rand(*shape, device=device, dtype=dtype)
+
+    brightness = (_rand(batch, 1, 1, 1) * 2.0 - 1.0) * cfg.brightness
+    contrast = 1.0 + (_rand(batch, 1, 1, 1) * 2.0 - 1.0) * cfg.contrast
+    gamma = cfg.gamma_min + _rand(batch, 1, 1, 1) * (cfg.gamma_max - cfg.gamma_min)
+
+    img = image.clamp(0.0, 1.0)
+    img = (img - 0.5) * contrast + 0.5 + brightness
+    img = img.clamp(1e-4, 1.0).pow(gamma)
+    if cfg.noise_std > 0.0:
+        img = img + torch.randn_like(img) * cfg.noise_std
+    img = img.clamp(0.0, 1.0)
+    return img * mask
 
 
 def soft_bce_logits_loss(
