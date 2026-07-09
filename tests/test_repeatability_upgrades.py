@@ -175,18 +175,28 @@ class FeatureExtractorBlurPoolTests(unittest.TestCase):
 
 
 class ConsistencyTrainStepTests(unittest.TestCase):
-    def test_consistency_term_added_and_backpropagates(self) -> None:
+    @staticmethod
+    def _make_targets(batch: int, out_h: int, out_w: int) -> dict[str, torch.Tensor]:
+        targets = {
+            "minutia_score": torch.zeros(batch, out_h, out_w),
+            "minutia_score_weight_map": torch.ones(batch, out_h, out_w),
+        }
+        targets["minutia_score"][:, out_h // 2, out_w // 2] = 1.0
+        return targets
+
+    def _run_mode(self, mode: str) -> None:
         torch.manual_seed(0)
         model = FeatureExtractor()
         model.train()
         image = torch.rand(2, 1, 64, 64)
         mask = torch.ones(2, 1, 64, 64)
         outputs = model(image, mask=mask)
+        targets = self._make_targets(2, 8, 8)
         losses = {"total": outputs["minutia_score"].mean()}
-        cfg = ConsistencyConfig(weight=10.0)
+        cfg = ConsistencyConfig(weight=10.0, mode=mode)
 
         _augment_losses_with_consistency(
-            model, image, mask, outputs, losses, cfg, amp=False, amp_dtype=torch.float16
+            model, image, mask, outputs, targets, losses, cfg, amp=False, amp_dtype=torch.float16
         )
 
         self.assertIn("consistency", losses)
@@ -196,6 +206,66 @@ class ConsistencyTrainStepTests(unittest.TestCase):
         losses["total"].backward()
         grads = [param.grad for param in model.parameters() if param.grad is not None]
         self.assertGreater(len(grads), 0)
+
+    def test_consistency_term_added_and_backpropagates(self) -> None:
+        self._run_mode("supervised")
+
+    def test_legacy_self_mode_still_works(self) -> None:
+        self._run_mode("self")
+
+    def test_supervised_mode_penalizes_score_collapse(self) -> None:
+        """Suppressing every score must cost far more than predicting the
+        warped GT — the collapse shortcut of the legacy self mode is gone.
+        Uses a zero-magnitude warp so the warped target is deterministic."""
+        torch.manual_seed(0)
+        inner = FeatureExtractor()
+        inner.train()
+        image = torch.rand(1, 1, 64, 64)
+        mask = torch.ones(1, 1, 64, 64)
+        outputs = inner(image, mask=mask)
+        targets = self._make_targets(1, 8, 8)
+        cfg = ConsistencyConfig(
+            weight=1.0,
+            self_weight=0.0,
+            orientation_weight=0.0,
+            max_rot_deg=0.0,
+            max_shift_frac=0.0,
+            max_scale_delta=0.0,
+        )
+
+        target_logits = torch.where(
+            targets["minutia_score"].unsqueeze(1) > 0.5,
+            torch.full((1, 1, 8, 8), 12.0),
+            torch.full((1, 1, 8, 8), -12.0),
+        )
+
+        class _FixedScoreModel(torch.nn.Module):
+            def __init__(self, wrapped: torch.nn.Module, score_logits: torch.Tensor):
+                super().__init__()
+                self.wrapped = wrapped
+                self.score_logits = score_logits
+
+            def forward(self, x, mask=None):
+                out = dict(self.wrapped(x, mask=mask))
+                out["minutia_score"] = self.score_logits.clone().requires_grad_(True)
+                return out
+
+        losses_ideal = {"total": torch.zeros(())}
+        _augment_losses_with_consistency(
+            _FixedScoreModel(inner, target_logits), image, mask, outputs, targets, losses_ideal, cfg,
+            amp=False, amp_dtype=torch.float16,
+        )
+        losses_collapsed = {"total": torch.zeros(())}
+        _augment_losses_with_consistency(
+            _FixedScoreModel(inner, torch.full((1, 1, 8, 8), -12.0)), image, mask, outputs, targets,
+            losses_collapsed, cfg, amp=False, amp_dtype=torch.float16,
+        )
+
+        ideal = float(losses_ideal["consistency"].detach())
+        collapsed = float(losses_collapsed["consistency"].detach())
+        self.assertLess(ideal, 0.01)
+        self.assertGreater(collapsed, 0.5)
+        self.assertGreater(collapsed, ideal * 100)
 
 
 if __name__ == "__main__":

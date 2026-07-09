@@ -2542,7 +2542,7 @@ def _cell_is_valid(
 
 def _required_neighbor_count(
     raw_minutiae_count: int,
-    adaptive_neighbor_support: bool = True,
+    adaptive_neighbor_support: bool = False,
 ) -> int:
     if not adaptive_neighbor_support:
         return MCC_MIN_M
@@ -2590,7 +2590,10 @@ def build_descriptors(
     path: Path | pd.DataFrame,
     validity_mask_path: Path | np.ndarray | None = None,
     validity_mode: str = "auto",
-    adaptive_neighbor_support: bool = True,
+    # Sparse-image neighbor relaxation is off by default: a cylinder supported
+    # by a single neighbor carries almost no structure and produces spuriously
+    # confident pair similarities on sparse (often impostor) images.
+    adaptive_neighbor_support: bool = False,
 ) -> list[MCCCylinder]:
     if isinstance(path, pd.DataFrame):
         minutiae_df = path.copy()
@@ -2788,6 +2791,17 @@ def _compute_n_pairs(n_a: int, n_b: int) -> int:
         return 0
     scaled = _sigmoid(float(min(n_a, n_b)), MCC_MU_P, MCC_TAU_P)
     return int(round(MCC_MIN_NP + (scaled * (MCC_MAX_NP - MCC_MIN_NP))))
+
+
+def _consolidate_pair_score(similarities: list[float] | np.ndarray, n_pairs: int) -> float:
+    """Classic MCC consolidation: sum of selected pair similarities divided by
+    the *target* pair count, not the realized one. Slots the assignment could
+    not fill contribute zero, so sparse minutiae sets cannot inflate the score
+    with a handful of lucky pairs."""
+    if n_pairs <= 0:
+        return 0.0
+    total = float(np.sum(similarities)) if len(similarities) > 0 else 0.0
+    return total / float(n_pairs)
 
 
 def _select_lss_pairs(sim_matrix: np.ndarray, n_pairs: int) -> list[tuple[int, int, float]]:
@@ -3108,14 +3122,14 @@ def match_descriptors(
     if normalized_method == "LSS":
         pairs = _select_lss_pairs(sim_matrix, n_pairs)
         return (
-            float(np.mean([pair[2] for pair in pairs])) if pairs else 0.0,
+            _consolidate_pair_score([pair[2] for pair in pairs], n_pairs),
             sim_matrix,
         )
 
     if normalized_method == "LSA":
         pairs = _select_lsa_pairs(sim_matrix, n_pairs)
         return (
-            float(np.mean([pair[2] for pair in pairs])) if pairs else 0.0,
+            _consolidate_pair_score([pair[2] for pair in pairs], n_pairs),
             sim_matrix,
         )
 
@@ -3132,7 +3146,7 @@ def match_descriptors(
         return 0.0, sim_matrix
 
     top_indices = np.argsort(efficiency)[::-1][: min(n_pairs, len(pairs))]
-    score = float(np.mean(relaxed[top_indices])) if len(top_indices) > 0 else 0.0
+    score = _consolidate_pair_score(relaxed[top_indices], n_pairs)
     return score, sim_matrix
 
 
@@ -3206,6 +3220,124 @@ def match_minutiae_csv(
         mask_path_b=mask_path_b,
         overlap_mode=overlap_mode,
     )
+
+
+def _match_status_from_details(details: dict) -> str:
+    """Classify a match outcome so a 0.0 score is distinguishable from a
+    confident impostor rejection.
+
+    - ``ok``: descriptors were built on both sides and the matcher ran.
+    - ``reject_insufficient:<reason>``: descriptor building failed or too few
+      minutiae — the score is a non-informative 0.0, not evidence of impostor.
+    - ``fallback_legacy:<reason>``: pose normalization fell back to the legacy
+      frame; the score is valid but came from a different code path.
+    """
+    reason = details.get("fallback_reason")
+    insufficient_reasons = {
+        "too_few_minutiae_for_centroid",
+        "no_descriptors_after_centroid_normalization",
+        "no_descriptors_after_normalization",
+        "no_descriptors",
+        "too_few_overlap_minutiae",
+    }
+    if reason in insufficient_reasons:
+        return f"reject_insufficient:{reason}"
+    if details.get("fallback_to_legacy"):
+        return f"fallback_legacy:{reason or 'unknown'}"
+    return "ok"
+
+
+def match_minutiae_csv_with_details(
+    path_a: Path,
+    path_b: Path,
+    method: str = "LSA-R",
+    mask_path_a: Path | None = None,
+    mask_path_b: Path | None = None,
+    orientation_path_a: Path | np.ndarray | None = None,
+    orientation_path_b: Path | np.ndarray | None = None,
+    ridge_period_path_a: Path | np.ndarray | None = None,
+    ridge_period_path_b: Path | np.ndarray | None = None,
+    overlap_mode: str = "auto",
+) -> tuple[float, np.ndarray, dict]:
+    """Same routing as :func:`match_minutiae_csv`, but always returns a details
+    dict carrying ``match_status``, descriptor counts, and selected pair count
+    so downstream evaluation can separate real 0.0 scores from failed matches."""
+    normalized_method = method.upper()
+    if normalized_method in {"LSA-CENTROID", "LSA-R-CENTROID"}:
+        score, sim_matrix, details = match_minutiae_csv_centroid_details(
+            path_a,
+            path_b,
+            method=method,
+            orientation_path_a=orientation_path_a,
+            orientation_path_b=orientation_path_b,
+            ridge_period_path_a=ridge_period_path_a,
+            ridge_period_path_b=ridge_period_path_b,
+        )
+    elif normalized_method in {"LSA-OVERLAP", "LSA-R-OVERLAP"}:
+        score, sim_matrix, details = match_minutiae_csv_overlap_details(
+            path_a,
+            path_b,
+            mask_path_a,
+            mask_path_b,
+            method=method,
+            overlap_mode=overlap_mode,
+        )
+    elif normalized_method in {
+        "LSA-CANONICAL",
+        "LSA-R-CANONICAL",
+        "LSA-CANONICAL-OVERLAP",
+        "LSA-R-CANONICAL-OVERLAP",
+    }:
+        canonical_use_overlap = _canonical_method_uses_overlap(method)
+        score, sim_matrix, details = match_minutiae_csv_pose_normalized_details(
+            path_a,
+            path_b,
+            mask_path_a,
+            mask_path_b,
+            method=_base_method_for_canonical(method),
+            strategy="canonical",
+            use_common_region_filter=canonical_use_overlap,
+            overlap_mode=overlap_mode if canonical_use_overlap else "off",
+        )
+    elif normalized_method in {"LSA", "LSA-R"} and mask_path_a is not None and mask_path_b is not None:
+        score, sim_matrix, details = match_minutiae_csv_pose_normalized_details(
+            path_a,
+            path_b,
+            mask_path_a,
+            mask_path_b,
+            method=method,
+            overlap_mode=overlap_mode,
+        )
+    else:
+        base_method = _base_method_for_legacy(method)
+        descriptors_a = build_descriptors(path_a, validity_mask_path=mask_path_a)
+        descriptors_b = build_descriptors(path_b, validity_mask_path=mask_path_b)
+        details = {
+            "fallback_to_legacy": False,
+            "fallback_reason": None,
+            "method": normalized_method,
+            "base_method": base_method,
+            "left_descriptor_count_after": int(len(descriptors_a)),
+            "right_descriptor_count_after": int(len(descriptors_b)),
+            "selected_pair_count": 0,
+        }
+        if len(descriptors_a) == 0 or len(descriptors_b) == 0:
+            details["fallback_reason"] = "no_descriptors"
+            details["match_status"] = _match_status_from_details(details)
+            return 0.0, np.zeros((len(descriptors_a), len(descriptors_b)), dtype=np.float32), details
+        score, sim_matrix = match_descriptors(
+            descriptors_a,
+            descriptors_b,
+            method=base_method,
+            overlap_mode=overlap_mode,
+        )
+        selected_pairs, _, _ = _select_report_pairs(descriptors_a, descriptors_b, sim_matrix, base_method)
+        details["selected_pair_count"] = int(len(selected_pairs))
+        details["match_status"] = _match_status_from_details(details)
+        return score, sim_matrix, details
+
+    details["match_status"] = _match_status_from_details(details)
+    return score, sim_matrix, details
 
 
 def _extract_minutiae_csv_from_image(

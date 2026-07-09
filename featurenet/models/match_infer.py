@@ -17,6 +17,7 @@ from .infer import (
     preprocess_input_image,
     print_output_stats,
     run_inference,
+    run_inference_tta,
     save_minutiae_csv,
     save_pose_sidecars,
     unwarp_minutiae_rows,
@@ -347,6 +348,9 @@ def _run_single_image_inference(
     solov2_input_mode: str = "raw",
     allow_distal_fallback: bool = False,
     unwarp: str = "none",
+    tta_rot_degrees: tuple[float, ...] | None = None,
+    soft_peak: bool = True,
+    top_k: int | None = None,
 ) -> dict[str, Any]:
     preprocess_dir = image_output_dir / "preprocess"
     solov2_input_artifacts: dict[str, Any]
@@ -497,12 +501,21 @@ def _run_single_image_inference(
             "crop": fallback["crop"],
         }
         mask_source = fallback_mask_source
-    outputs = run_inference(
-        model=model,
-        image_tensor=image_tensor,
-        mask_tensor=mask_tensor,
-        device=device,
-    )
+    if tta_rot_degrees:
+        outputs = run_inference_tta(
+            model=model,
+            image_tensor=image_tensor,
+            mask_tensor=mask_tensor,
+            device=device,
+            tta_rot_degrees=tuple(tta_rot_degrees),
+        )
+    else:
+        outputs = run_inference(
+            model=model,
+            image_tensor=image_tensor,
+            mask_tensor=mask_tensor,
+            device=device,
+        )
     print(f"[{label}] FeatureNet raw logit stats:")
     print_output_stats(outputs)
 
@@ -511,26 +524,39 @@ def _run_single_image_inference(
         input_shape_hw=input_shape_hw,
         score_threshold=score_threshold,
         apply_nms=apply_nms,
+        soft_peak=soft_peak,
+        top_k=top_k,
     )
 
     minutiae_csv = image_output_dir / "minutiae.csv"
     mask_png = image_output_dir / "mask.png"
+    minutiae_raw_csv = image_output_dir / "minutiae_raw.csv"
+    mask_raw_png = image_output_dir / "mask_raw.png"
     unwarp_applied = False
+    unwarp_status = "not_requested"
     if unwarp == "gradient":
+        # Keep the raw-frame extraction on disk so a pair whose other side
+        # failed to unwarp can fall back to matching both sides in raw frames.
+        save_minutiae_csv(minutiae_rows, minutiae_raw_csv)
+        _save_mask_png(mask_tensor, mask_raw_png)
         gray_full = image_tensor.detach().cpu().numpy()[0, 0]
+        status_out: dict[str, str] = {}
         warped_rows, unwarped_mask = unwarp_minutiae_rows(
             rows=minutiae_rows,
             gradient_tensor=outputs["gradient"],
             mask_tensor=mask_tensor,
             input_shape_hw=input_shape_hw,
             gray_image=gray_full,
+            status_out=status_out,
         )
-        if warped_rows is not minutiae_rows:
+        unwarp_status = status_out.get("status", "unknown")
+        if unwarp_status == "ok":
             unwarp_applied = True
             minutiae_rows = warped_rows
             save_minutiae_csv(minutiae_rows, minutiae_csv)
             _save_mask_array_png(unwarped_mask, mask_png)
         else:
+            print(f"[{label}] WARNING: gradient unwarp failed ({unwarp_status}); using raw frame", flush=True)
             save_minutiae_csv(minutiae_rows, minutiae_csv)
             _save_mask_png(mask_tensor, mask_png)
     else:
@@ -542,6 +568,8 @@ def _run_single_image_inference(
         "minutiae_rows": minutiae_rows,
         "minutiae_csv": minutiae_csv,
         "mask_png": mask_png,
+        "minutiae_raw_csv": minutiae_raw_csv if unwarp == "gradient" else None,
+        "mask_raw_png": mask_raw_png if unwarp == "gradient" else None,
         "orientation_npy": orientation_npy,
         "ridge_period_npy": ridge_period_npy,
         "preprocess_dir": preprocess_dir,
@@ -553,6 +581,7 @@ def _run_single_image_inference(
         "finger_pad": finger_pad_artifacts,
         "unwarp": unwarp,
         "unwarp_applied": unwarp_applied,
+        "unwarp_status": unwarp_status,
     }
 
 
@@ -608,6 +637,24 @@ def parse_args() -> argparse.Namespace:
         help="Route A: warp decoded minutiae into the predicted-gradient canonical frame before MCC.",
     )
     parser.add_argument(
+        "--disable-soft-peak-decoding",
+        action="store_true",
+        help="Disable 3x3 score-weighted soft-peak position/orientation decoding.",
+    )
+    parser.add_argument(
+        "--minutia-top-k",
+        type=int,
+        default=None,
+        help="Keep only the top-K minutiae by score after decoding (use with a lower score threshold).",
+    )
+    parser.add_argument(
+        "--tta-rot-degrees",
+        type=float,
+        nargs="*",
+        default=None,
+        help="Test-time rotation ensemble angles in degrees (e.g. -6 -3 3 6). Averages the score map across rotations.",
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         default=None,
@@ -641,6 +688,7 @@ def main() -> None:
     device = _resolve_device(args.device)
     model = load_checkpoint_model(weights_path, device)
 
+    tta_rot_degrees = tuple(args.tta_rot_degrees) if args.tta_rot_degrees else None
     result_a = _run_single_image_inference(
         image_path=image_a,
         label="A",
@@ -653,6 +701,9 @@ def main() -> None:
         allow_distal_fallback=bool(args.allow_distal_fallback),
         unwarp=str(args.unwarp),
         image_output_dir=a_dir,
+        tta_rot_degrees=tta_rot_degrees,
+        soft_peak=not bool(args.disable_soft_peak_decoding),
+        top_k=args.minutia_top_k,
     )
     result_b = _run_single_image_inference(
         image_path=image_b,
@@ -666,18 +717,41 @@ def main() -> None:
         allow_distal_fallback=bool(args.allow_distal_fallback),
         unwarp=str(args.unwarp),
         image_output_dir=b_dir,
+        tta_rot_degrees=tta_rot_degrees,
+        soft_peak=not bool(args.disable_soft_peak_decoding),
+        top_k=args.minutia_top_k,
     )
 
     import main as mcc_main
 
-    score, sim_matrix = mcc_main.match_minutiae_csv(
-        path_a=result_a["minutiae_csv"],
-        path_b=result_b["minutiae_csv"],
+    # Never match an unwarped side against a raw side: if exactly one image
+    # failed the gradient unwarp, fall back to the raw frame for BOTH sides.
+    match_path_a, match_mask_a = result_a["minutiae_csv"], result_a["mask_png"]
+    match_path_b, match_mask_b = result_b["minutiae_csv"], result_b["mask_png"]
+    frame_fallback_applied = False
+    if str(args.unwarp) == "gradient":
+        a_ok = result_a.get("unwarp_status") == "ok"
+        b_ok = result_b.get("unwarp_status") == "ok"
+        if a_ok != b_ok:
+            frame_fallback_applied = True
+            print(
+                "[match_infer] WARNING: unwarp succeeded on only one image "
+                f"(A={result_a.get('unwarp_status')}, B={result_b.get('unwarp_status')}); "
+                "matching both sides in the raw frame instead.",
+                flush=True,
+            )
+            match_path_a, match_mask_a = result_a["minutiae_raw_csv"], result_a["mask_raw_png"]
+            match_path_b, match_mask_b = result_b["minutiae_raw_csv"], result_b["mask_raw_png"]
+
+    score, sim_matrix, match_details = mcc_main.match_minutiae_csv_with_details(
+        path_a=match_path_a,
+        path_b=match_path_b,
         method=args.method,
-        mask_path_a=result_a["mask_png"],
-        mask_path_b=result_b["mask_png"],
+        mask_path_a=match_mask_a,
+        mask_path_b=match_mask_b,
         overlap_mode="auto",
     )
+    print(f"[match_infer] match_status={match_details.get('match_status')}")
 
     summary = {
         "image_a": str(image_a),
@@ -692,7 +766,14 @@ def main() -> None:
         "unwarp": str(args.unwarp),
         "unwarp_applied_a": bool(result_a.get("unwarp_applied", False)),
         "unwarp_applied_b": bool(result_b.get("unwarp_applied", False)),
+        "unwarp_status_a": str(result_a.get("unwarp_status", "")),
+        "unwarp_status_b": str(result_b.get("unwarp_status", "")),
+        "frame_fallback_applied": bool(frame_fallback_applied),
+        "match_status": str(match_details.get("match_status", "ok")),
         "minutia_nms_enabled": not bool(args.disable_minutia_nms),
+        "soft_peak_decoding": not bool(args.disable_soft_peak_decoding),
+        "minutia_top_k": args.minutia_top_k,
+        "tta_rot_degrees": list(tta_rot_degrees) if tta_rot_degrees else None,
         "mask_source_a": result_a["mask_source"],
         "mask_source_b": result_b["mask_source"],
         "minutiae_count_a": len(result_a["minutiae_rows"]),

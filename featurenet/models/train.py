@@ -29,6 +29,10 @@ def ensure_stdlib_copy_module() -> None:
 
 ensure_stdlib_copy_module()
 
+# stdlib `dataclasses` imports `copy`, so it must come after the shim above
+# (the repo-level copy.py would otherwise shadow the stdlib module).
+import dataclasses
+
 import torch
 import torch.nn.functional as F
 from torch import optim
@@ -51,6 +55,8 @@ from .losses import (
     apply_gpu_photometric,
     make_affine_theta,
     masked_mse,
+    orientation_equivariance_loss,
+    soft_bce_logits_loss,
     warp_tensor,
 )
 from .augmentation import (
@@ -76,7 +82,7 @@ FLOAT_TARGET_KEYS = {
     "minutia_orientation_vec",
 }
 LONG_TARGET_KEYS = {"minutia_x", "minutia_y", "minutia_orientation"}
-LOSS_KEYS = ("total", "orientation", "ridge", "gradient", "minutia", "m1", "m2", "m3", "m4", "consistency")
+LOSS_KEYS = ("total", "orientation", "ridge", "gradient", "minutia", "m1", "m1_candidate", "m2", "m3", "m4", "consistency")
 TARGET_FINITE_KEYS = frozenset(FLOAT_TARGET_KEYS | LONG_TARGET_KEYS)
 EARLY_STOPPING_METRICS = (
     "val_total",
@@ -635,7 +641,7 @@ def _run_model_step(
         losses = criterion(_float_outputs(outputs), targets)
     if consistency is not None and consistency.weight > 0.0:
         _augment_losses_with_consistency(
-            model, image, mask, outputs, losses, consistency, amp=amp, amp_dtype=amp_dtype
+            model, image, mask, outputs, targets, losses, consistency, amp=amp, amp_dtype=amp_dtype
         )
     elif "consistency" not in losses:
         losses["consistency"] = outputs["minutia_score"].new_tensor(0.0)
@@ -647,12 +653,21 @@ def _augment_losses_with_consistency(
     image: torch.Tensor,
     mask: torch.Tensor,
     outputs: Mapping[str, torch.Tensor],
+    targets: Mapping[str, torch.Tensor],
     losses: dict[str, torch.Tensor],
     cfg: ConsistencyConfig,
     amp: bool,
     amp_dtype: torch.dtype,
 ) -> None:
-    """Affine + photometric equivariance: S(warp(x)) should equal warp(S(x))."""
+    """Affine + photometric equivariance on a second, warped forward pass.
+
+    ``supervised`` mode (default): the warped view's score head is supervised
+    against the GT score map warped with the same theta, plus a small
+    peak-weighted self-consistency term and a minutia-orientation equivariance
+    term. Pure self-consistency (``self`` mode) can be satisfied by lowering
+    all scores — that collapse produced the sparser extraction observed with
+    the v4_consistency checkpoint — so supervised mode anchors the scale to GT.
+    """
     device = image.device
     batch = image.shape[0]
     image_f = image.float()
@@ -670,10 +685,51 @@ def _augment_losses_with_consistency(
     with _loss_context(device):
         prob1 = torch.sigmoid(outputs["minutia_score"].float())
         prob2 = torch.sigmoid(outputs2["minutia_score"].float())
-        reference = warp_tensor(prob1, theta, mode="bilinear").detach()
+        reference_prob = warp_tensor(prob1, theta, mode="bilinear").detach()
         score_mask = F.interpolate(mask_f, size=prob1.shape[-2:], mode="nearest")
         warped_score_mask = warp_tensor(score_mask, theta, mode="nearest")
-        consistency_loss = masked_mse(prob2, reference, warped_score_mask)
+
+        if cfg.mode == "self":
+            consistency_loss = masked_mse(prob2, reference_prob, warped_score_mask)
+        else:
+            target_score = targets["minutia_score"].float()
+            if target_score.dim() == 3:
+                target_score = target_score.unsqueeze(1)
+            warped_target = warp_tensor(target_score, theta, mode="bilinear").clamp(0.0, 1.0)
+
+            sup_weight = warped_score_mask
+            weight_map = targets.get("minutia_score_weight_map")
+            if weight_map is not None:
+                weight_map = weight_map.float()
+                if weight_map.dim() == 3:
+                    weight_map = weight_map.unsqueeze(1)
+                sup_weight = sup_weight * warp_tensor(weight_map, theta, mode="nearest")
+            if cfg.pos_boost > 0.0:
+                # Positive cells are sparse; boost them so suppressing every
+                # score (the collapse shortcut) stays expensive.
+                sup_weight = sup_weight * (1.0 + cfg.pos_boost * warped_target)
+
+            consistency_loss = soft_bce_logits_loss(
+                outputs2["minutia_score"].float(),
+                warped_target,
+                sup_weight,
+            )
+
+            if cfg.self_weight > 0.0:
+                # Peak-weighted so background agreement cannot dominate and
+                # jointly lowering both peaks does not reduce the loss.
+                peak_weight = (torch.maximum(reference_prob, prob2) * warped_score_mask).detach()
+                self_term = ((prob2 - reference_prob) ** 2 * peak_weight).sum() / peak_weight.sum().clamp_min(1e-6)
+                consistency_loss = consistency_loss + cfg.self_weight * self_term
+
+            if cfg.orientation_weight > 0.0:
+                ori_term = orientation_equivariance_loss(
+                    outputs["minutia_orientation"],
+                    outputs2["minutia_orientation"],
+                    theta,
+                    weight=warped_target * warped_score_mask,
+                )
+                consistency_loss = consistency_loss + cfg.orientation_weight * ori_term
 
     losses["consistency"] = consistency_loss
     losses["total"] = losses["total"] + cfg.weight * consistency_loss
@@ -1553,6 +1609,10 @@ def train_model(args: argparse.Namespace) -> dict[str, Any]:
         m1_hard_neg_fraction=args.m1_hard_neg_fraction,
         m1_neg_weight=args.m1_neg_weight,
         m1_side_pos_weight=args.m1_side_pos_weight,
+        m1_candidate_loss_weight=float(args.m1_candidate_weight),
+        m1_candidate_topk=int(args.m1_candidate_topk),
+        m1_candidate_match_radius=int(args.m1_candidate_match_radius),
+        m1_candidate_focal_gamma=float(args.m1_candidate_focal_gamma),
     ).to(resolved_device)
     optimizer = optim.AdamW(
         model.parameters(),
@@ -1569,10 +1629,19 @@ def train_model(args: argparse.Namespace) -> dict[str, Any]:
             max_rot_deg=float(args.consistency_max_rot_deg),
             max_shift_frac=float(args.consistency_max_shift_frac),
             max_scale_delta=float(args.consistency_max_scale),
+            mode=str(args.consistency_mode),
+            self_weight=float(args.consistency_self_weight),
+            orientation_weight=float(args.consistency_orientation_weight),
+            warmup_epochs=int(args.consistency_warmup_epochs),
+            pos_boost=float(args.consistency_pos_boost),
         )
         print(
             "[train_model] in-step consistency loss enabled: "
-            f"weight={consistency_config.weight}, max_rot_deg={consistency_config.max_rot_deg}, "
+            f"mode={consistency_config.mode}, weight={consistency_config.weight}, "
+            f"self_weight={consistency_config.self_weight}, "
+            f"orientation_weight={consistency_config.orientation_weight}, "
+            f"warmup_epochs={consistency_config.warmup_epochs}, "
+            f"max_rot_deg={consistency_config.max_rot_deg}, "
             f"max_shift_frac={consistency_config.max_shift_frac}, max_scale_delta={consistency_config.max_scale_delta}",
             flush=True,
         )
@@ -1627,6 +1696,22 @@ def train_model(args: argparse.Namespace) -> dict[str, Any]:
 
     for epoch in range(resume_epoch + 1, args.epochs + 1):
         epoch_started_at = time.time()
+
+        if str(args.lr_schedule) == "cosine":
+            min_lr = float(args.lr) * float(args.lr_min_factor)
+            progress = (epoch - 1) / max(1, args.epochs - 1)
+            epoch_lr = min_lr + 0.5 * (float(args.lr) - min_lr) * (1.0 + math.cos(math.pi * progress))
+            for group in optimizer.param_groups:
+                group["lr"] = epoch_lr
+
+        effective_consistency = consistency_config
+        if consistency_config is not None and consistency_config.warmup_epochs > 0:
+            warmup_scale = min(1.0, epoch / float(consistency_config.warmup_epochs))
+            if warmup_scale < 1.0:
+                effective_consistency = dataclasses.replace(
+                    consistency_config, weight=consistency_config.weight * warmup_scale
+                )
+
         train_metrics = train_one_epoch(
             model,
             train_loader,
@@ -1640,10 +1725,11 @@ def train_model(args: argparse.Namespace) -> dict[str, Any]:
             grad_accum_steps=args.grad_accum_steps,
             max_grad_norm=args.max_grad_norm,
             skip_non_finite_target_batches=args.skip_non_finite_target_batches,
-            consistency=consistency_config,
+            consistency=effective_consistency,
         )
         record: dict[str, Any] = {
             "epoch": epoch,
+            "lr": float(optimizer.param_groups[0]["lr"]),
             "train": train_metrics,
             "seconds": round(time.time() - epoch_started_at, 3),
             "validation_ran": False,
@@ -1828,6 +1914,14 @@ def train_model(args: argparse.Namespace) -> dict[str, Any]:
         "weight_decay": float(args.weight_decay),
         "consistency_enabled": bool(args.consistency),
         "consistency_weight": float(args.consistency_weight) if args.consistency else 0.0,
+        "consistency_mode": str(args.consistency_mode) if args.consistency else None,
+        "consistency_self_weight": float(args.consistency_self_weight) if args.consistency else 0.0,
+        "consistency_orientation_weight": float(args.consistency_orientation_weight) if args.consistency else 0.0,
+        "consistency_warmup_epochs": int(args.consistency_warmup_epochs) if args.consistency else 0,
+        "m1_candidate_weight": float(args.m1_candidate_weight),
+        "m1_candidate_topk": int(args.m1_candidate_topk),
+        "lr_schedule": str(args.lr_schedule),
+        "lr_min_factor": float(args.lr_min_factor),
         "augmentation_photometric": bool(args.augmentation_photometric) if args.train_augmentations else False,
         "scale_jitter": list(args.scale_jitter) if args.train_augmentations else None,
         "seed": args.seed,
@@ -2046,6 +2140,61 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--consistency-max-rot-deg", type=float, default=15.0, help="Max in-plane rotation (deg) of the consistency partner view.")
     parser.add_argument("--consistency-max-shift-frac", type=float, default=0.06, help="Max translation (fraction of half-size) of the consistency partner view.")
     parser.add_argument("--consistency-max-scale", type=float, default=0.10, help="Max scale delta of the consistency partner view.")
+    parser.add_argument(
+        "--consistency-mode",
+        choices=("supervised", "self"),
+        default="supervised",
+        help=(
+            "supervised: warped view supervised against warped GT (no score-collapse shortcut), "
+            "plus peak-weighted self-consistency and orientation equivariance. "
+            "self: legacy masked-MSE between the two score maps."
+        ),
+    )
+    parser.add_argument(
+        "--consistency-self-weight",
+        type=float,
+        default=0.2,
+        help="Relative weight of the peak-weighted self-consistency term inside supervised mode.",
+    )
+    parser.add_argument(
+        "--consistency-orientation-weight",
+        type=float,
+        default=1.0,
+        help="Relative weight of the minutia-orientation equivariance term inside supervised mode.",
+    )
+    parser.add_argument(
+        "--consistency-warmup-epochs",
+        type=int,
+        default=5,
+        help="Linearly ramp the consistency weight from 0 to full over this many epochs (0 disables warmup).",
+    )
+    parser.add_argument(
+        "--consistency-pos-boost",
+        type=float,
+        default=20.0,
+        help="Up-weight of warped positive cells in the supervised consistency term (keeps score collapse expensive).",
+    )
+    parser.add_argument(
+        "--m1-candidate-weight",
+        type=float,
+        default=10.0,
+        help="Absolute weight of the candidate-level focal FP-suppression loss (0 disables it).",
+    )
+    parser.add_argument("--m1-candidate-topk", type=int, default=512, help="Top-K model-scored cells fed to the candidate loss.")
+    parser.add_argument("--m1-candidate-match-radius", type=int, default=1, help="Cell radius around GT positives counted as candidate positives.")
+    parser.add_argument("--m1-candidate-focal-gamma", type=float, default=2.0, help="Focal gamma of the candidate loss.")
+    parser.add_argument(
+        "--lr-schedule",
+        choices=("constant", "cosine"),
+        default="constant",
+        help="Learning-rate schedule over epochs (cosine anneals from --lr to --lr * --lr-min-factor).",
+    )
+    parser.add_argument(
+        "--lr-min-factor",
+        type=float,
+        default=0.05,
+        help="Final LR as a fraction of --lr when --lr-schedule cosine is used.",
+    )
     parser.add_argument("--weight-decay", type=float, default=0.0, help="AdamW weight decay; 0 disables decay (equivalent to Adam).")
     parser.add_argument(
         "--augmentation-probe",

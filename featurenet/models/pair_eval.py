@@ -164,16 +164,20 @@ def _extract_sample(
     minutiae_csv = cache_dir / "minutiae.csv"
     mask_png = cache_dir / "mask.png"
 
+    unwarp_status = "not_requested"
     if unwarp == "gradient":
         gray_full = image_tensor.detach().cpu().numpy()[0, 0]
+        status_out: dict[str, str] = {}
         warped_rows, unwarped_mask = unwarp_minutiae_rows(
             rows=rows,
             gradient_tensor=outputs["gradient"],
             mask_tensor=mask_tensor,
             input_shape_hw=input_shape_hw,
             gray_image=gray_full,
+            status_out=status_out,
         )
-        if warped_rows is not rows:
+        unwarp_status = status_out.get("status", "unknown")
+        if unwarp_status == "ok":
             rows = warped_rows
             save_minutiae_csv(rows, minutiae_csv)
             _save_mask_array_png(unwarped_mask, mask_png)
@@ -188,6 +192,7 @@ def _extract_sample(
         "minutiae_csv": minutiae_csv,
         "mask_png": mask_png,
         "rows": rows,
+        "unwarp_status": unwarp_status,
     }
 
 
@@ -198,6 +203,12 @@ def _mcc_score(
     method: str,
 ) -> float | None:
     import main as mcc_main
+
+    # An unwarped frame must never be matched against a raw frame.
+    status_a = str(extract_a.get("unwarp_status", "not_requested"))
+    status_b = str(extract_b.get("unwarp_status", "not_requested"))
+    if (status_a == "ok") != (status_b == "ok"):
+        return None
 
     try:
         score, _ = mcc_main.match_minutiae_csv(

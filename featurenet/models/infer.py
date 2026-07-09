@@ -235,6 +235,94 @@ def run_inference(
     return {key: outputs[key] for key in HEAD_KEYS}
 
 
+def _rotation_theta(
+    angle_rad: float,
+    height: int,
+    width: int,
+    device: torch.device,
+    dtype: torch.dtype = torch.float32,
+    inverse: bool = False,
+) -> torch.Tensor:
+    """Affine theta ([1,2,3]) for a pixel-space rotation about the image center.
+
+    ``F.affine_grid`` works in per-axis normalized coordinates, so a naive
+    rotation matrix only rotates pixels correctly on square images. The H/W and
+    W/H factors below conjugate the rotation with the normalization so the warp
+    is a true Euclidean rotation for any aspect ratio.
+    """
+    if inverse:
+        angle_rad = -angle_rad
+    cos = math.cos(angle_rad)
+    sin = math.sin(angle_rad)
+    aspect_hw = float(height) / max(float(width), 1.0)
+    theta = torch.tensor(
+        [[cos, -sin * aspect_hw, 0.0], [sin / aspect_hw, cos, 0.0]],
+        device=device,
+        dtype=dtype,
+    )
+    return theta.unsqueeze(0)
+
+
+def _warp_with_theta(x: torch.Tensor, theta: torch.Tensor, mode: str = "bilinear") -> torch.Tensor:
+    grid = F.affine_grid(theta.to(dtype=x.dtype), list(x.shape), align_corners=False)
+    return F.grid_sample(x, grid, mode=mode, padding_mode="zeros", align_corners=False)
+
+
+@torch.no_grad()
+def run_inference_tta(
+    model: FeatureExtractor,
+    image_tensor: torch.Tensor,
+    mask_tensor: torch.Tensor,
+    device: torch.device,
+    tta_rot_degrees: tuple[float, ...] = (-6.0, -3.0, 3.0, 6.0),
+) -> dict[str, torch.Tensor]:
+    """Test-time rotation ensemble for the minutia score map.
+
+    Runs the model on small rotated copies of the input, rotates each score
+    map back into the original frame, and averages the probabilities. Only the
+    ``minutia_score`` head is ensembled — offsets and orientations are
+    cell-local and stay from the unrotated pass. This directly attacks the
+    score-map instability under small rotations without retraining.
+    """
+    outputs = run_inference(model, image_tensor, mask_tensor, device)
+    angles = [float(a) for a in tta_rot_degrees if abs(float(a)) > 1e-6]
+    if not angles:
+        return outputs
+
+    image_tensor = image_tensor.to(device, non_blocking=True)
+    mask_tensor = mask_tensor.to(device, non_blocking=True)
+    in_h, in_w = int(image_tensor.shape[-2]), int(image_tensor.shape[-1])
+
+    base_prob = torch.sigmoid(outputs["minutia_score"].detach().float())
+    out_h, out_w = int(base_prob.shape[-2]), int(base_prob.shape[-1])
+    mask8 = F.interpolate(mask_tensor.float(), size=(out_h, out_w), mode="nearest")
+    prob_sum = base_prob * mask8
+    weight_sum = mask8.clone()
+
+    for angle_deg in angles:
+        angle_rad = math.radians(angle_deg)
+        theta_full = _rotation_theta(angle_rad, in_h, in_w, device)
+        rotated_image = _warp_with_theta(image_tensor.float(), theta_full, mode="bilinear")
+        rotated_mask = (_warp_with_theta(mask_tensor.float(), theta_full, mode="nearest") > 0.5).float()
+        rotated_image = rotated_image * rotated_mask
+
+        rotated_outputs = model(rotated_image, mask=rotated_mask)
+        rotated_prob = torch.sigmoid(rotated_outputs["minutia_score"].detach().float())
+
+        theta_back = _rotation_theta(angle_rad, out_h, out_w, device, inverse=True)
+        prob_back = _warp_with_theta(rotated_prob, theta_back, mode="bilinear")
+        rotated_mask8 = F.interpolate(rotated_mask, size=(out_h, out_w), mode="nearest")
+        valid_back = (_warp_with_theta(rotated_mask8, theta_back, mode="nearest") > 0.5).float() * mask8
+        prob_sum = prob_sum + prob_back * valid_back
+        weight_sum = weight_sum + valid_back
+
+    averaged = torch.where(weight_sum > 0, prob_sum / weight_sum.clamp_min(1.0), base_prob)
+    averaged = averaged.clamp(1e-4, 1.0 - 1e-4)
+    outputs = dict(outputs)
+    outputs["minutia_score"] = torch.log(averaged / (1.0 - averaged))
+    return outputs
+
+
 def serialize_outputs(outputs: dict[str, torch.Tensor], output_npz: Path) -> None:
     arrays = {key: value.detach().cpu().numpy() for key, value in outputs.items()}
     output_npz.parent.mkdir(parents=True, exist_ok=True)
@@ -294,6 +382,8 @@ def decode_minutiae_rows(
     input_shape_hw: tuple[int, int],
     score_threshold: float = 0.5,
     apply_nms: bool = True,
+    soft_peak: bool = True,
+    top_k: int | None = None,
 ) -> list[dict[str, float]]:
     score = torch.sigmoid(outputs["minutia_score"].detach().float())
     x_offsets = torch.sigmoid(outputs["minutia_x"].detach().float())
@@ -308,7 +398,8 @@ def decode_minutiae_rows(
     y_map = y_offsets[0, 0]
     angle_map = ori_radians[0]
 
-    active = score_map >= float(score_threshold)
+    thresholded = score_map >= float(score_threshold)
+    active = thresholded
     if apply_nms:
         pooled = F.max_pool2d(score_map.unsqueeze(0).unsqueeze(0), kernel_size=3, stride=1, padding=1).squeeze(0).squeeze(0)
         active = active & (score_map >= (pooled - 1e-8))
@@ -322,14 +413,52 @@ def decode_minutiae_rows(
     scale_x = float(in_w) / max(float(out_w), 1.0)
     scale_y = float(in_h) / max(float(out_h), 1.0)
 
+    peak_mask = active
+
     rows: list[dict[str, float]] = []
     for row_col in indices:
         row = int(row_col[0].item())
         col = int(row_col[1].item())
-        x = (float(col) + float(x_map[row, col].item())) * scale_x
-        y = (float(row) + float(y_map[row, col].item())) * scale_y
-        angle = float(angle_map[row, col].item())
         point_score = float(score_map[row, col].item())
+
+        if soft_peak:
+            # Score-weighted centroid over the 3x3 neighborhood of the peak.
+            # Individual cells flicker across the /8 grid under tiny geometric
+            # perturbations (cell-boundary effects); the weighted average of the
+            # neighbors' own position/orientation estimates is far more stable.
+            weight_total = 0.0
+            x_acc = 0.0
+            y_acc = 0.0
+            cos_acc = 0.0
+            sin_acc = 0.0
+            for rr in range(max(0, row - 1), min(out_h, row + 2)):
+                for cc in range(max(0, col - 1), min(out_w, col + 2)):
+                    # Skip neighboring cells that are peaks in their own right:
+                    # a second minutia inside the window must not drag this one.
+                    if (rr != row or cc != col) and bool(peak_mask[rr, cc].item()):
+                        continue
+                    weight = float(score_map[rr, cc].item())
+                    if weight <= 0.0:
+                        continue
+                    x_acc += weight * (float(cc) + float(x_map[rr, cc].item()))
+                    y_acc += weight * (float(rr) + float(y_map[rr, cc].item()))
+                    cell_angle = float(angle_map[rr, cc].item())
+                    cos_acc += weight * math.cos(cell_angle)
+                    sin_acc += weight * math.sin(cell_angle)
+                    weight_total += weight
+            if weight_total > 0.0:
+                x = (x_acc / weight_total) * scale_x
+                y = (y_acc / weight_total) * scale_y
+                angle = math.atan2(sin_acc, cos_acc)
+            else:
+                x = (float(col) + float(x_map[row, col].item())) * scale_x
+                y = (float(row) + float(y_map[row, col].item())) * scale_y
+                angle = float(angle_map[row, col].item())
+        else:
+            x = (float(col) + float(x_map[row, col].item())) * scale_x
+            y = (float(row) + float(y_map[row, col].item())) * scale_y
+            angle = float(angle_map[row, col].item())
+
         rows.append(
             {
                 "x": x,
@@ -340,6 +469,8 @@ def decode_minutiae_rows(
         )
 
     rows.sort(key=lambda item: item["score"], reverse=True)
+    if top_k is not None and top_k > 0:
+        rows = rows[: int(top_k)]
     return rows
 
 
@@ -396,6 +527,7 @@ def unwarp_minutiae_rows(
     input_shape_hw: tuple[int, int],
     gray_image: np.ndarray | None = None,
     orient_delta_px: float = 4.0,
+    status_out: dict[str, str] | None = None,
 ) -> tuple[list[dict[str, float]], np.ndarray]:
     """Route A: warp decoded minutiae into the predicted-gradient unwarped frame.
 
@@ -405,7 +537,18 @@ def unwarp_minutiae_rows(
     contactless view; only the geometry is transported, mirroring how the ground
     truth reprojects minutiae. Returns the warped rows and the unwarped mask that
     matches the new coordinate frame (for MCC overlap gating).
+
+    On failure the ORIGINAL rows are returned (raw frame). Callers matching two
+    images must never mix an unwarped side with a raw side — pass ``status_out``
+    (a dict) to observe whether the unwarp actually ran: it is filled with
+    ``{"status": "ok"}`` or ``{"status": "failed:<reason>"}``.
     """
+    def _record_status(value: str) -> None:
+        if status_out is not None:
+            status_out["status"] = value
+        if value != "ok":
+            print(f"[unwarp_minutiae_rows] WARNING: unwarp {value}; returning raw-frame minutiae", flush=True)
+
     height, width = int(input_shape_hw[0]), int(input_shape_hw[1])
     mask = mask_tensor.detach().float().cpu().numpy()
     while mask.ndim > 2:
@@ -424,10 +567,12 @@ def unwarp_minutiae_rows(
         image = np.zeros((height, width), dtype=np.float32)
 
     if int(mask_u8.sum()) == 0:
+        _record_status("failed:empty_mask")
         return rows, mask_u8
     try:
         maps = center_unwarping.run_center_unwarping(image, mask_u8, gx, gy)
-    except (ValueError, FloatingPointError):
+    except (ValueError, FloatingPointError) as exc:
+        _record_status(f"failed:{type(exc).__name__}:{exc}")
         return rows, mask_u8
 
     x_out = np.asarray(maps["x_out"], dtype=np.float32)
@@ -470,6 +615,7 @@ def unwarp_minutiae_rows(
                 "score": float(row.get("score", 1.0)),
             }
         )
+    _record_status("ok")
     return warped_rows, unwarped_mask
 
 
@@ -536,6 +682,24 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable 3x3 local-maximum suppression during minutia decoding.",
     )
+    parser.add_argument(
+        "--disable-soft-peak-decoding",
+        action="store_true",
+        help="Disable 3x3 score-weighted soft-peak position/orientation decoding (fall back to hard cell+offset).",
+    )
+    parser.add_argument(
+        "--minutia-top-k",
+        type=int,
+        default=None,
+        help="Keep only the top-K minutiae by score after decoding (use with a lower score threshold).",
+    )
+    parser.add_argument(
+        "--tta-rot-degrees",
+        type=float,
+        nargs="*",
+        default=None,
+        help="Test-time rotation ensemble angles in degrees (e.g. -6 -3 3 6). Averages the score map across rotations.",
+    )
     return parser.parse_args()
 
 
@@ -565,7 +729,12 @@ def main() -> None:
         solov2_device=args.solov2_device,
         solov2_score_thr=float(args.solov2_score_thr),
     )
-    outputs = run_inference(model, image_tensor, mask_tensor, device)
+    if args.tta_rot_degrees:
+        outputs = run_inference_tta(
+            model, image_tensor, mask_tensor, device, tta_rot_degrees=tuple(args.tta_rot_degrees)
+        )
+    else:
+        outputs = run_inference(model, image_tensor, mask_tensor, device)
     print_output_stats(outputs)
     serialize_outputs(outputs, output_npz)
     minutiae_rows = decode_minutiae_rows(
@@ -573,6 +742,8 @@ def main() -> None:
         input_shape_hw=input_shape_hw,
         score_threshold=float(args.minutia_score_threshold),
         apply_nms=not bool(args.disable_minutia_nms),
+        soft_peak=not bool(args.disable_soft_peak_decoding),
+        top_k=args.minutia_top_k,
     )
     save_minutiae_csv(minutiae_rows, output_minutiae_csv)
     orientation_path, ridge_period_path = save_pose_sidecars(outputs, output_minutiae_csv.parent)

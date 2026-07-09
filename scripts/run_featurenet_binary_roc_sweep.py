@@ -23,7 +23,8 @@ if str(REPO_ROOT) not in sys.path:
 DEFAULT_ARCHIVE_ROOT = Path("/media/milab-5/82002d9e-66a9-4739-925b-e2b789ec5641/archive")
 DEFAULT_WEIGHTS_PATH = REPO_ROOT / "runs" / "featurenet_v4" / "best.pt"
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "match_outputs"
-CACHE_VERSION = 3
+# v4: soft-peak decoding, optional TTA rotation ensemble, unwarp status tracking
+CACHE_VERSION = 4
 DEFAULT_MCC_METHODS = ("LSA", "LSA-R", "LSA-CENTROID")
 DEFAULT_FEATURE_SCORE_THRESHOLDS = (0.5, 0.6, 0.7, 0.8, 0.9)
 
@@ -133,6 +134,7 @@ class ExtractedImage:
     ridge_period_npy: str
     minutiae_count: int | None
     error: str
+    unwarp_status: str = ""
 
 
 def _slug(value: str) -> str:
@@ -416,6 +418,7 @@ def _load_infer_helpers() -> dict[str, Any]:
         preprocess_input_image,
         preprocess_saved_masked_input,
         run_inference,
+        run_inference_tta,
         save_minutiae_csv,
         save_pose_sidecars,
         unwarp_minutiae_rows,
@@ -429,6 +432,7 @@ def _load_infer_helpers() -> dict[str, Any]:
         "preprocess_input_image": preprocess_input_image,
         "preprocess_saved_masked_input": preprocess_saved_masked_input,
         "run_inference": run_inference,
+        "run_inference_tta": run_inference_tta,
         "save_minutiae_csv": save_minutiae_csv,
         "save_pose_sidecars": save_pose_sidecars,
         "unwarp_minutiae_rows": unwarp_minutiae_rows,
@@ -465,35 +469,44 @@ def _cached_extraction_is_complete(
     apply_nms: bool,
     solov2_score_thr: float,
     unwarp: str,
-) -> tuple[bool, int | None]:
+    tta_rot_degrees: tuple[float, ...] | None = None,
+) -> tuple[bool, int | None, str]:
     required = ("minutiae_csv", "mask_png", "orientation_npy", "ridge_period_npy", "metadata_json")
     if not all(files[name].exists() and files[name].stat().st_size > 0 for name in required):
-        return False, None
+        return False, None, ""
     try:
         metadata = json.loads(files["metadata_json"].read_text(encoding="utf-8"))
     except Exception:
-        return False, None
+        return False, None, ""
     if metadata.get("cache_version") != CACHE_VERSION:
-        return False, None
+        return False, None, ""
     if metadata.get("sample_uid") != record.sample_uid:
-        return False, None
+        return False, None, ""
     if metadata.get("image_path") != record.image_path:
-        return False, None
+        return False, None, ""
     if metadata.get("mask_path", "") != record.mask_path:
-        return False, None
+        return False, None, ""
     if metadata.get("source_kind", "archive") != record.source_kind:
-        return False, None
+        return False, None, ""
     if metadata.get("weights_path") != str(weights_path.resolve()):
-        return False, None
+        return False, None, ""
     if float(metadata.get("feature_score_threshold", -1.0)) != float(score_threshold):
-        return False, None
+        return False, None, ""
     if bool(metadata.get("minutia_nms_enabled")) != bool(apply_nms):
-        return False, None
+        return False, None, ""
     if str(metadata.get("unwarp", "none")) != str(unwarp):
-        return False, None
+        return False, None, ""
+    cached_tta = metadata.get("tta_rot_degrees") or []
+    requested_tta = [float(a) for a in (tta_rot_degrees or [])]
+    if [float(a) for a in cached_tta] != requested_tta:
+        return False, None, ""
     if record.source_kind != "gt_bundle" and float(metadata.get("solov2_score_thr", -1.0)) != float(solov2_score_thr):
-        return False, None
-    return True, int(metadata.get("minutiae_count", _count_minutiae_csv_rows(files["minutiae_csv"])))
+        return False, None, ""
+    return (
+        True,
+        int(metadata.get("minutiae_count", _count_minutiae_csv_rows(files["minutiae_csv"]))),
+        str(metadata.get("unwarp_status", "")),
+    )
 
 
 def _extraction_row(
@@ -506,8 +519,10 @@ def _extraction_row(
     files: dict[str, Path],
     minutiae_count: int | None,
     error: str = "",
+    unwarp_status: str = "",
 ) -> dict[str, Any]:
     return {
+        "unwarp_status": unwarp_status,
         "feature_score_threshold": _threshold_label(feature_score_threshold),
         "sample_uid": record.sample_uid,
         "dataset": record.dataset,
@@ -543,12 +558,13 @@ def extract_image(
     reuse_cache: bool,
     apply_nms: bool,
     unwarp: str = "none",
+    tta_rot_degrees: tuple[float, ...] | None = None,
 ) -> dict[str, Any]:
     cache_dir = cache_root / f"score_{_threshold_label(score_threshold)}" / record.cache_key
     files = _cache_files(cache_dir)
     try:
         if reuse_cache:
-            complete, cached_count = _cached_extraction_is_complete(
+            complete, cached_count, cached_unwarp_status = _cached_extraction_is_complete(
                 files,
                 record=record,
                 weights_path=weights_path,
@@ -556,6 +572,7 @@ def extract_image(
                 apply_nms=apply_nms,
                 solov2_score_thr=solov2_score_thr,
                 unwarp=unwarp,
+                tta_rot_degrees=tta_rot_degrees,
             )
             if complete:
                 return _extraction_row(
@@ -566,6 +583,7 @@ def extract_image(
                     cache_dir=cache_dir,
                     files=files,
                     minutiae_count=cached_count,
+                    unwarp_status=cached_unwarp_status,
                 )
 
         image_path = Path(record.image_path)
@@ -588,12 +606,21 @@ def extract_image(
                 save_preprocess_dir=cache_dir / "preprocess",
                 solov2_score_thr=solov2_score_thr,
             )
-        outputs = helpers["run_inference"](
-            model=model,
-            image_tensor=image_tensor,
-            mask_tensor=mask_tensor,
-            device=device,
-        )
+        if tta_rot_degrees:
+            outputs = helpers["run_inference_tta"](
+                model=model,
+                image_tensor=image_tensor,
+                mask_tensor=mask_tensor,
+                device=device,
+                tta_rot_degrees=tuple(tta_rot_degrees),
+            )
+        else:
+            outputs = helpers["run_inference"](
+                model=model,
+                image_tensor=image_tensor,
+                mask_tensor=mask_tensor,
+                device=device,
+            )
         minutiae_rows = helpers["decode_minutiae_rows"](
             outputs=outputs,
             input_shape_hw=input_shape_hw,
@@ -601,16 +628,20 @@ def extract_image(
             apply_nms=apply_nms,
         )
         unwarp_applied = False
+        unwarp_status = "not_requested"
         if unwarp == "gradient":
             gray_full = image_tensor.detach().cpu().numpy()[0, 0]
+            unwarp_status_out: dict[str, str] = {}
             warped_rows, unwarped_mask = helpers["unwarp_minutiae_rows"](
                 rows=minutiae_rows,
                 gradient_tensor=outputs["gradient"],
                 mask_tensor=mask_tensor,
                 input_shape_hw=input_shape_hw,
                 gray_image=gray_full,
+                status_out=unwarp_status_out,
             )
-            if warped_rows is not minutiae_rows:
+            unwarp_status = unwarp_status_out.get("status", "unknown")
+            if unwarp_status == "ok":
                 unwarp_applied = True
                 minutiae_rows = warped_rows
                 helpers["save_minutiae_csv"](minutiae_rows, files["minutiae_csv"])
@@ -636,6 +667,8 @@ def extract_image(
             "minutia_nms_enabled": bool(apply_nms),
             "unwarp": unwarp,
             "unwarp_applied": bool(unwarp_applied),
+            "unwarp_status": unwarp_status,
+            "tta_rot_degrees": [float(a) for a in (tta_rot_degrees or [])],
             "minutiae_count": len(minutiae_rows),
             "artifacts": {
                 "minutiae_csv": str(files["minutiae_csv"].resolve()),
@@ -662,6 +695,7 @@ def extract_image(
             cache_dir=cache_dir,
             files=files,
             minutiae_count=len(minutiae_rows),
+            unwarp_status=unwarp_status,
         )
     except Exception as exc:
         return _extraction_row(
@@ -690,13 +724,14 @@ def run_inference_for_records(
     reuse_cache: bool,
     apply_nms: bool,
     unwarp: str = "none",
+    tta_rot_degrees: tuple[float, ...] | None = None,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for index, record in enumerate(records, start=1):
         cache_dir = cache_root / f"score_{_threshold_label(score_threshold)}" / record.cache_key
         files = _cache_files(cache_dir)
         if reuse_cache:
-            complete, cached_count = _cached_extraction_is_complete(
+            complete, cached_count, cached_unwarp_status = _cached_extraction_is_complete(
                 files,
                 record=record,
                 weights_path=weights_path,
@@ -704,6 +739,7 @@ def run_inference_for_records(
                 apply_nms=apply_nms,
                 solov2_score_thr=solov2_score_thr,
                 unwarp=unwarp,
+                tta_rot_degrees=tta_rot_degrees,
             )
             if complete:
                 rows.append(
@@ -715,6 +751,7 @@ def run_inference_for_records(
                         cache_dir=cache_dir,
                         files=files,
                         minutiae_count=cached_count,
+                        unwarp_status=cached_unwarp_status,
                     )
                 )
                 if index == 1 or index % 25 == 0 or index == len(records):
@@ -746,6 +783,7 @@ def run_inference_for_records(
                 reuse_cache=reuse_cache,
                 apply_nms=apply_nms,
                 unwarp=unwarp,
+                tta_rot_degrees=tta_rot_degrees,
             )
         )
         if index == 1 or index % 25 == 0 or index == len(records):
@@ -770,6 +808,7 @@ def _extracted_from_row(row: dict[str, Any]) -> ExtractedImage:
         ridge_period_npy=str(row.get("ridge_period_npy") or ""),
         minutiae_count=count,
         error=str(row.get("error") or ""),
+        unwarp_status=str(row.get("unwarp_status") or ""),
     )
 
 
@@ -779,7 +818,7 @@ def _match_pair_task(job: dict[str, Any]) -> dict[str, Any]:
             sys.path.insert(0, str(REPO_ROOT))
         import main as mcc_main
 
-        score, sim_matrix = mcc_main.match_minutiae_csv(
+        score, sim_matrix, details = mcc_main.match_minutiae_csv_with_details(
             path_a=Path(job["a_minutiae_csv"]),
             path_b=Path(job["b_minutiae_csv"]),
             method=str(job["method"]),
@@ -797,6 +836,10 @@ def _match_pair_task(job: dict[str, Any]) -> dict[str, Any]:
                 "status": "ok",
                 "score": float(score),
                 "similarity_matrix_shape": "x".join(str(dim) for dim in shape),
+                "match_status": str(details.get("match_status", "ok")),
+                "a_descriptor_count": details.get("left_descriptor_count_after", ""),
+                "b_descriptor_count": details.get("right_descriptor_count_after", ""),
+                "selected_pair_count": details.get("selected_pair_count", ""),
                 "error": "",
             }
         )
@@ -806,6 +849,10 @@ def _match_pair_task(job: dict[str, Any]) -> dict[str, Any]:
                 "status": "error",
                 "score": "",
                 "similarity_matrix_shape": "",
+                "match_status": "error",
+                "a_descriptor_count": "",
+                "b_descriptor_count": "",
+                "selected_pair_count": "",
                 "error": str(exc),
             }
         )
@@ -869,6 +916,7 @@ def _make_match_jobs(
                     "status": "error",
                     "score": "",
                     "similarity_matrix_shape": "",
+                    "match_status": "error_extraction",
                     "a_minutiae_count": "" if a is None else a.minutiae_count,
                     "b_minutiae_count": "" if b is None else b.minutiae_count,
                     "a_minutiae_csv": "" if a is None else a.minutiae_csv,
@@ -876,6 +924,35 @@ def _make_match_jobs(
                     "a_mask_png": "" if a is None else a.mask_png,
                     "b_mask_png": "" if b is None else b.mask_png,
                     "error": "; ".join(missing),
+                }
+            )
+            immediate_rows.append(row)
+            continue
+
+        # Never match an unwarped frame against a raw frame: if the gradient
+        # unwarp succeeded on exactly one side, the two coordinate frames are
+        # incompatible and any score would be meaningless.
+        a_unwarped = a.unwarp_status == "ok"
+        b_unwarped = b.unwarp_status == "ok"
+        if a_unwarped != b_unwarped:
+            row.update(
+                {
+                    "method": method,
+                    "status": "error",
+                    "score": "",
+                    "similarity_matrix_shape": "",
+                    "match_status": "unwarp_frame_mismatch",
+                    "a_minutiae_count": a.minutiae_count,
+                    "b_minutiae_count": b.minutiae_count,
+                    "a_minutiae_csv": a.minutiae_csv,
+                    "b_minutiae_csv": b.minutiae_csv,
+                    "a_mask_png": a.mask_png,
+                    "b_mask_png": b.mask_png,
+                    "error": (
+                        "unwarp_frame_mismatch: "
+                        f"a_unwarp_status={a.unwarp_status or 'unknown'}, "
+                        f"b_unwarp_status={b.unwarp_status or 'unknown'}"
+                    ),
                 }
             )
             immediate_rows.append(row)
@@ -1144,6 +1221,13 @@ def parse_args() -> argparse.Namespace:
         help="Route A: warp decoded minutiae into the predicted-gradient canonical frame before MCC.",
     )
     parser.add_argument(
+        "--tta-rot-degrees",
+        type=float,
+        nargs="*",
+        default=None,
+        help="Test-time rotation ensemble angles in degrees (e.g. -6 -3 3 6). Averages the minutia score map across rotations.",
+    )
+    parser.add_argument(
         "--solov2-score-thr",
         type=float,
         default=0.15,
@@ -1252,6 +1336,7 @@ def main() -> int:
             reuse_cache=bool(args.reuse_cache),
             apply_nms=apply_nms,
             unwarp=str(args.unwarp),
+            tta_rot_degrees=tuple(args.tta_rot_degrees) if args.tta_rot_degrees else None,
         )
         inference_rows_by_threshold[score_threshold] = inference_rows
         inference_manifest_path = output_dir / f"inference_manifest_score_{label}.csv"

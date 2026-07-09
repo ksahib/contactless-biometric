@@ -10,7 +10,18 @@ MINUTIA_ORIENTATION_BINS = 360
 
 @dataclass
 class ConsistencyConfig:
-    """Knobs for the in-step affine + photometric equivariance loss."""
+    """Knobs for the in-step affine + photometric equivariance loss.
+
+    ``mode``:
+      - ``"supervised"`` (default): the warped view is supervised against the
+        GT score map warped with the same affine. GT anchors the score scale,
+        so the model cannot satisfy the loss by lowering all scores — the
+        collapse shortcut of pure self-consistency. A small peak-weighted
+        self-consistency term (``self_weight``) and a minutia-orientation
+        equivariance term (``orientation_weight``) are added on top.
+      - ``"self"``: legacy behavior — masked MSE between sigmoid score maps of
+        the two views only.
+    """
 
     weight: float = 25.0
     max_rot_deg: float = 15.0
@@ -21,6 +32,14 @@ class ConsistencyConfig:
     gamma_min: float = 0.70
     gamma_max: float = 1.40
     noise_std: float = 0.03
+    mode: str = "supervised"
+    self_weight: float = 0.2
+    orientation_weight: float = 1.0
+    warmup_epochs: int = 5
+    # Up-weights (warped) positive cells in the supervised term. Minutia cells
+    # are a tiny fraction of the map, so without this an all-negative
+    # prediction is cheap — the very collapse this mode is meant to prevent.
+    pos_boost: float = 20.0
 
 
 def make_affine_theta(
@@ -63,6 +82,67 @@ def masked_mse(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor, eps
     mask = mask.to(dtype=pred.dtype)
     diff = (pred - target) ** 2 * mask
     return diff.sum() / mask.sum().clamp_min(eps)
+
+
+def rotate_vector_field_for_theta(vectors: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
+    """Transform per-pixel direction vectors into the frame produced by
+    ``warp_tensor(..., theta)``.
+
+    ``warp_tensor`` builds ``warped(p) = orig(A p)`` in per-axis normalized
+    coordinates (A = theta[:, :2, :2]), so a pixel-space direction ``v`` in the
+    original image appears as ``J v`` in the warped image with
+    ``J = D^-1 A^-1 D`` and ``D = diag(2/W, 2/H)``. The conjugation with D makes
+    this exact for non-square maps; the scale component of A cancels once the
+    result is normalized.
+    """
+    if vectors.dim() != 4 or vectors.shape[1] != 2:
+        raise ValueError(f"expected vector field with shape [B,2,H,W], got {tuple(vectors.shape)}")
+    height = float(vectors.shape[-2])
+    width = float(vectors.shape[-1])
+
+    a = theta[:, :2, :2].to(dtype=vectors.dtype)
+    det = (a[:, 0, 0] * a[:, 1, 1] - a[:, 0, 1] * a[:, 1, 0]).clamp_min(1e-8)
+    inv00 = a[:, 1, 1] / det
+    inv01 = -a[:, 0, 1] / det
+    inv10 = -a[:, 1, 0] / det
+    inv11 = a[:, 0, 0] / det
+
+    j00 = inv00.view(-1, 1, 1)
+    j01 = (inv01 * (width / height)).view(-1, 1, 1)
+    j10 = (inv10 * (height / width)).view(-1, 1, 1)
+    j11 = inv11.view(-1, 1, 1)
+
+    vx = vectors[:, 0]
+    vy = vectors[:, 1]
+    return torch.stack([j00 * vx + j01 * vy, j10 * vx + j11 * vy], dim=1)
+
+
+def orientation_equivariance_loss(
+    vectors_original: torch.Tensor,
+    vectors_warped_view: torch.Tensor,
+    theta: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Minutia-orientation equivariance under a known affine warp.
+
+    The warped view's predicted orientation vectors should equal the original
+    view's vectors, rotated by the warp and transported to the warped grid.
+    ``weight`` (e.g. the warped GT score map) concentrates the loss on minutia
+    cells, where orientation is actually supervised and meaningful.
+    """
+    v1 = F.normalize(vectors_original.float(), dim=1, eps=1e-8)
+    v1_rotated = rotate_vector_field_for_theta(v1, theta.float())
+    reference = warp_tensor(v1_rotated, theta, mode="bilinear").detach()
+    reference = F.normalize(reference, dim=1, eps=1e-8)
+
+    v2 = F.normalize(vectors_warped_view.float(), dim=1, eps=1e-8)
+    cos_sim = (v2 * reference).sum(dim=1, keepdim=True).clamp(-1.0, 1.0)
+
+    if weight.dim() == 3:
+        weight = weight.unsqueeze(1)
+    weight = weight.to(dtype=cos_sim.dtype).clamp_min(0.0)
+    return ((1.0 - cos_sim) * weight).sum() / weight.sum().clamp_min(eps)
 
 
 def apply_gpu_photometric(image: torch.Tensor, mask: torch.Tensor, cfg: ConsistencyConfig) -> torch.Tensor:
@@ -729,7 +809,17 @@ class FeatureNetLoss(nn.Module):
             score_weight=targets.get("minutia_score_weight_map"),
         )
 
-        L_m1_candidate = outputs["minutia_score"].new_tensor(0.0)
+        # --- M1 candidate: focal BCE on the model's own top-scored cells.
+        # Directly attacks confident false positives that the dense M1 loss
+        # dilutes across the whole map.
+        if self.m1_candidate_loss_weight > 0.0:
+            L_m1_candidate = self._compute_m1_candidate_score_loss(
+                outputs["minutia_score"],
+                targets["minutia_score"],
+                minutia_score_mask,
+            )
+        else:
+            L_m1_candidate = outputs["minutia_score"].new_tensor(0.0)
 
         # --- M2: x offset regression (continuous within-cell target)
         L_m2 = self._compute_xy_offset_loss(
@@ -791,6 +881,7 @@ class FeatureNetLoss(nn.Module):
         # combine minutiae
         L_minu = (
             self.mu_score * L_m1 +
+            self.m1_candidate_loss_weight * L_m1_candidate +
             self.mu_x * L_m2 +
             self.mu_y * L_m3 +
             self.mu_ori * L_m4
