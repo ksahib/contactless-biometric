@@ -1592,7 +1592,9 @@ def train_model(args: argparse.Namespace) -> dict[str, Any]:
             train_augmentations=False,
         )
 
-    model = _maybe_channels_last(FeatureExtractor().to(resolved_device), args.channels_last)
+    model = _maybe_channels_last(
+        FeatureExtractor(grad_checkpointing=args.grad_checkpointing).to(resolved_device), args.channels_last
+    )
     criterion = FeatureNetLoss(
         orientation_weight=args.orientation_weight,
         ridge_weight=args.ridge_weight,
@@ -1901,6 +1903,7 @@ def train_model(args: argparse.Namespace) -> dict[str, Any]:
         "amp": use_amp,
         "amp_dtype": args.amp_dtype,
         "channels_last": bool(args.channels_last),
+        "grad_checkpointing": bool(args.grad_checkpointing),
         "compile": bool(args.compile and resolved_device.type == "cuda"),
         "grad_accum_steps": args.grad_accum_steps,
         "max_grad_norm": args.max_grad_norm,
@@ -1986,6 +1989,11 @@ def parse_args() -> argparse.Namespace:
         help="Floating dtype to use inside CUDA autocast when --amp is enabled.",
     )
     parser.add_argument("--channels-last", action="store_true")
+    parser.add_argument(
+        "--grad-checkpointing",
+        action="store_true",
+        help="Trade compute for memory by recomputing activations during backward instead of storing them.",
+    )
     parser.add_argument("--compile", action="store_true", help="Use torch.compile on supported CUDA runtimes.")
     parser.add_argument("--persistent-workers", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--prefetch-factor", type=int, default=2)

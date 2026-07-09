@@ -1,13 +1,15 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from .blocks import ConvBlock, MaxBlurPool2d
 
 
 class FeatureExtractor(nn.Module):
-    def __init__(self):
+    def __init__(self, grad_checkpointing: bool = False):
         super().__init__()
+        self.grad_checkpointing = grad_checkpointing
         # branch 1
         self.branch1 = nn.Sequential(
             ConvBlock(2, 64, kernel_size=3, stride=1, padding=1),
@@ -87,6 +89,11 @@ class FeatureExtractor(nn.Module):
             nn.Conv2d(256, 1, kernel_size=1, stride=1, padding=0),
         )
 
+    def _ckpt(self, fn, *args):
+        if self.grad_checkpointing and self.training and torch.is_grad_enabled():
+            return checkpoint(fn, *args, use_reentrant=False)
+        return fn(*args)
+
     @staticmethod
     def _pad_bottom_right_to_even(x: torch.Tensor) -> torch.Tensor:
         pad_h = x.shape[-2] % 2
@@ -117,20 +124,20 @@ class FeatureExtractor(nn.Module):
             raise ValueError(f"expected 2 input channels (masked image + mask), got {x.shape[1]}")
 
         # branch 2 staged features
-        branch2_stage1 = self.branch2_conv1(x)
+        branch2_stage1 = self._ckpt(self.branch2_conv1, x)
         branch2_stage1_pooled = self.branch2_pool1(branch2_stage1)
-        branch2_stage2 = self.branch2_conv2(branch2_stage1_pooled)
+        branch2_stage2 = self._ckpt(self.branch2_conv2, branch2_stage1_pooled)
         branch2_feat_4x = self.branch2_pool2(branch2_stage2)
-        branch2_stage3 = self.branch2_conv3(branch2_feat_4x)
+        branch2_stage3 = self._ckpt(self.branch2_conv3, branch2_feat_4x)
         branch2_feat_8x = self.branch2_pool3(branch2_stage3)
 
         # branch 1 features for orientation/ridge/gradient and minutia orientation
-        x = self.branch1(x)
-        ridge_interim = self.branch_stem_ridge(x)
-        orient_interim = self.branch_stem_orient(x)
+        x = self._ckpt(self.branch1, x)
+        ridge_interim = self._ckpt(self.branch_stem_ridge, x)
+        orient_interim = self._ckpt(self.branch_stem_orient, x)
 
         ridge_period = self.ridge_conv(ridge_interim)
-        grad = self.gradient_conv(ridge_interim)
+        grad = self._ckpt(self.gradient_conv, ridge_interim)
         orient = self.orientation_conv(orient_interim)
 
         orient_at_4x = F.interpolate(
@@ -140,7 +147,7 @@ class FeatureExtractor(nn.Module):
             align_corners=False,
         )
         minu_orient_input = torch.cat([branch2_feat_4x, orient_at_4x], dim=1)
-        minu_orient = self.minuiae_orient_head(minu_orient_input)
+        minu_orient = self._ckpt(self.minuiae_orient_head, minu_orient_input)
         # minu_orient is now at /4 resolution; downsample to /8 to match score head
         minu_orient = F.avg_pool2d(minu_orient, kernel_size=2, stride=2)
         minu_orient = self._crop_to_spatial_shape(minu_orient, branch2_feat_8x.shape[-2:])
@@ -150,7 +157,7 @@ class FeatureExtractor(nn.Module):
         score_4x = self._crop_to_spatial_shape(score_4x, branch2_feat_8x.shape[-2:])
 
         score_input = torch.cat([branch2_feat_8x, score_4x], dim=1)
-        minu_score = self.minutiae_score_head(score_input)
+        minu_score = self._ckpt(self.minutiae_score_head, score_input)
 
         # x/y localization from fused /4 + /8 context.
         # We keep explicit 2x2 /4 geometry for each /8 cell using pixel_unshuffle.
@@ -161,12 +168,16 @@ class FeatureExtractor(nn.Module):
             align_corners=False,
         )
         xy_fuse_input = torch.cat([branch2_feat_4x, branch2_feat_8x_up], dim=1)
-        xy_feat_4x = self.xy_fuse_conv2(self.xy_fuse_conv1(xy_fuse_input))
+        xy_feat_4x = self._ckpt(
+            lambda t: self.xy_fuse_conv2(self.xy_fuse_conv1(t)), xy_fuse_input
+        )
 
         # Pad bottom/right if /4 spatial dims are odd, then regroup 2x2 /4 patches into channels.
         xy_feat_4x_padded = self._pad_bottom_right_to_even(xy_feat_4x)
         xy_patch_feat_8x = F.pixel_unshuffle(xy_feat_4x_padded, downscale_factor=2)
-        xy_feat_8x = self.xy_patch_refine2(self.xy_patch_refine1(xy_patch_feat_8x))
+        xy_feat_8x = self._ckpt(
+            lambda t: self.xy_patch_refine2(self.xy_patch_refine1(t)), xy_patch_feat_8x
+        )
         # Align x/y logits to the exact score-grid resolution.
         xy_feat_8x = self._crop_to_spatial_shape(xy_feat_8x, branch2_feat_8x.shape[-2:])
         xy_context = torch.cat([
@@ -176,9 +187,9 @@ class FeatureExtractor(nn.Module):
             ridge_interim,
         ], dim=1)
 
-        xy_feat_8x = self.xy_context_refine(xy_context)
-        minu_x = self.minutia_head_x(xy_feat_8x)
-        minu_y = self.minutia_head_y(xy_feat_8x)
+        xy_feat_8x = self._ckpt(self.xy_context_refine, xy_context)
+        minu_x = self._ckpt(self.minutia_head_x, xy_feat_8x)
+        minu_y = self._ckpt(self.minutia_head_y, xy_feat_8x)
 
         return {
             "orientation": orient,
