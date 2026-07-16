@@ -91,7 +91,10 @@ EARLY_STOPPING_METRICS = (
     "minutia_y_accuracy",
     "minutia_orientation_accuracy",
     "pair_auc",
+    "repeatability_rate",
 )
+# Metrics that come from the pair evaluation (require pair_metrics each check).
+PAIR_MONITOR_METRICS = {"pair_auc", "repeatability_rate"}
 
 
 def _read_grayscale_image(source: str | Path | np.ndarray) -> np.ndarray:
@@ -1401,6 +1404,11 @@ def _select_monitored_metric(
             raise ValueError("pair metrics are required to monitor pair_auc")
         return float(pair_metrics["pair_auc"]), "max"
 
+    if metric_name == "repeatability_rate":
+        if pair_metrics is None or pair_metrics.get("repeatability_rate") is None:
+            raise ValueError("pair metrics are required to monitor repeatability_rate")
+        return float(pair_metrics["repeatability_rate"]), "max"
+
     if val_metrics is None:
         raise ValueError(f"validation metrics are required to monitor {metric_name}")
 
@@ -1781,7 +1789,7 @@ def train_model(args: argparse.Namespace) -> dict[str, Any]:
                 record["val_metrics"] = extended_val_metrics
 
             pair_metrics: dict[str, Any] | None = None
-            want_pair_for_selection = monitor_name == "pair_auc"
+            want_pair_for_selection = monitor_name in PAIR_MONITOR_METRICS
             pair_eval_enabled = bool(args.pair_eval) or want_pair_for_selection
             run_pair_this_epoch = bool(
                 pair_eval_enabled
@@ -1820,9 +1828,9 @@ def train_model(args: argparse.Namespace) -> dict[str, Any]:
                     )
 
             monitor_available = True
-            if monitor_name == "pair_auc":
-                pair_auc_value = None if pair_metrics is None else pair_metrics.get("pair_auc")
-                monitor_available = pair_auc_value is not None and bool(np.isfinite(float(pair_auc_value)))
+            if monitor_name in PAIR_MONITOR_METRICS:
+                pair_monitor_value = None if pair_metrics is None else pair_metrics.get(monitor_name)
+                monitor_available = pair_monitor_value is not None and bool(np.isfinite(float(pair_monitor_value)))
 
             if monitor_available:
                 current_monitor_value, monitor_mode = _select_monitored_metric(

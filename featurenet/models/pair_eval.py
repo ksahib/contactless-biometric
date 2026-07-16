@@ -418,9 +418,16 @@ def evaluate_pairs(
     pair_auc = compute_auc(genuine_scores, impostor_scores)
     pair_eer = compute_eer(genuine_scores, impostor_scores)
     repeatability_rate = float(np.mean(repeat_rates)) if repeat_rates else float("nan")
+    pair_auc_se = _auc_standard_error(float(pair_auc), len(genuine_scores), len(impostor_scores))
 
     return {
         "pair_auc": float(pair_auc),
+        "pair_auc_se": pair_auc_se,
+        "pair_auc_ci95": (
+            [round(float(pair_auc) - 1.96 * pair_auc_se, 4), round(float(pair_auc) + 1.96 * pair_auc_se, 4)]
+            if math.isfinite(pair_auc_se)
+            else None
+        ),
         "pair_eer": float(pair_eer),
         "repeatability_rate": repeatability_rate,
         "n_genuine": len(genuine_pairs),
@@ -431,3 +438,22 @@ def evaluate_pairs(
         "method": method,
         "unwarp": unwarp,
     }
+
+
+def _auc_standard_error(auc: float, n_positive: int, n_negative: int) -> float:
+    """Hanley-McNeil (1982) standard error of the Mann-Whitney AUC.
+
+    Epoch-to-epoch AUC swings smaller than ~2 SE are indistinguishable from
+    noise; log this next to pair_auc so the monitor's volatility is visible.
+    """
+    if n_positive <= 0 or n_negative <= 0 or not math.isfinite(auc):
+        return float("nan")
+    auc = min(max(auc, 1e-6), 1.0 - 1e-6)
+    q1 = auc / (2.0 - auc)
+    q2 = (2.0 * auc * auc) / (1.0 + auc)
+    variance = (
+        auc * (1.0 - auc)
+        + (n_positive - 1) * (q1 - auc * auc)
+        + (n_negative - 1) * (q2 - auc * auc)
+    ) / (n_positive * n_negative)
+    return math.sqrt(max(variance, 0.0))
