@@ -336,23 +336,72 @@ def sample_genuine_pairs(
     return rng.sample(deduped, count)
 
 
-def sample_impostor_pairs(
+def sample_genuine_pairs_same_view(
     records: list[ImageRecord],
     *,
     count: int,
     rng: random.Random,
 ) -> list[PairSpec]:
-    fronts = [record for record in records if record.view_index == 0]
-    if len({record.identity_key for record in fronts}) < 2:
-        raise RuntimeError("not enough distinct front-view identities for impostor sampling")
+    """Same-pose genuine pairs: same identity, SAME view index, different
+    acquisition. This is the geometry regime where cross-capture minutia
+    correspondence is actually achievable (diagnosed 2026-07: cross-view
+    front-side correspondence sits at the chance floor)."""
+    candidates: list[PairSpec] = []
+    for group_records in _group_by_identity(records).values():
+        by_view: dict[int, list[ImageRecord]] = {}
+        for record in group_records:
+            by_view.setdefault(record.view_index, []).append(record)
+        for view_records in by_view.values():
+            for i in range(len(view_records)):
+                for j in range(i + 1, len(view_records)):
+                    a, b = view_records[i], view_records[j]
+                    if a.acquisition_id == b.acquisition_id:
+                        continue
+                    candidates.append(PairSpec(label="genuine", a=a, b=b))
+
+    deduped = _dedupe_pairs(candidates)
+    if len(deduped) < count:
+        raise RuntimeError(
+            f"not enough genuine same-view pairs: requested {count}, found {len(deduped)}"
+        )
+    return rng.sample(deduped, count)
+
+
+def sample_impostor_pairs(
+    records: list[ImageRecord],
+    *,
+    count: int,
+    rng: random.Random,
+    views: set[int] | None = None,
+) -> list[PairSpec]:
+    """Impostor pairs with matching view indices (view-matched floor).
+
+    ``views=None`` keeps the historical behavior (front-front only); passing a
+    view set samples same-view impostors across those views so the impostor
+    distribution matches the same-view genuine distribution."""
+    if views is None:
+        views = {0}
+    pool_by_view: dict[int, list[ImageRecord]] = {}
+    for record in records:
+        if record.view_index in views:
+            pool_by_view.setdefault(record.view_index, []).append(record)
+    pool_by_view = {
+        view: pool
+        for view, pool in pool_by_view.items()
+        if len({record.identity_key for record in pool}) >= 2
+    }
+    if not pool_by_view:
+        raise RuntimeError("not enough distinct identities for view-matched impostor sampling")
 
     pairs: list[PairSpec] = []
     seen: set[tuple[str, str, str]] = set()
     attempts = 0
     max_attempts = max(1000, count * 500)
+    view_choices = sorted(pool_by_view.keys())
     while len(pairs) < count and attempts < max_attempts:
         attempts += 1
-        a, b = rng.sample(fronts, 2)
+        view = rng.choice(view_choices)
+        a, b = rng.sample(pool_by_view[view], 2)
         if a.identity_key == b.identity_key:
             continue
         pair = PairSpec(label="impostor", a=a, b=b)
@@ -362,7 +411,7 @@ def sample_impostor_pairs(
         pairs.append(pair)
 
     if len(pairs) < count:
-        raise RuntimeError(f"not enough impostor front-front pairs: requested {count}, sampled {len(pairs)}")
+        raise RuntimeError(f"not enough same-view impostor pairs: requested {count}, sampled {len(pairs)}")
     return pairs
 
 
@@ -373,10 +422,27 @@ def sample_binary_pairs(
     genuine_count: int,
     impostor_count: int,
     seed: int,
+    genuine_mode: str = "cross-view",
 ) -> list[PairSpec]:
     rng = random.Random(seed)
-    genuine = sample_genuine_pairs(records, side_views=side_views, count=genuine_count, rng=rng)
-    impostor = sample_impostor_pairs(records, count=impostor_count, rng=rng)
+    genuine: list[PairSpec] = []
+    impostor_views: set[int] = set()
+    if genuine_mode in ("cross-view", "both"):
+        genuine.extend(
+            sample_genuine_pairs(records, side_views=side_views, count=genuine_count, rng=rng)
+        )
+        impostor_views.add(0)
+    if genuine_mode in ("same-view", "both"):
+        genuine.extend(sample_genuine_pairs_same_view(records, count=genuine_count, rng=rng))
+        impostor_views.update({0} | side_views)
+    if genuine_mode not in ("cross-view", "same-view", "both"):
+        raise ValueError(f"unsupported genuine mode: {genuine_mode}")
+    impostor = sample_impostor_pairs(
+        records,
+        count=impostor_count,
+        rng=rng,
+        views=impostor_views,
+    )
     pairs = genuine + impostor
     pairs.sort(key=lambda pair: (pair.label, pair.a.image_path, pair.b.image_path))
     return pairs
@@ -1189,6 +1255,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--impostor-pairs", type=int, default=100)
     parser.add_argument("--side-views", type=int, nargs="+", default=[1, 2])
     parser.add_argument(
+        "--genuine-mode",
+        choices=("cross-view", "same-view", "both"),
+        default="cross-view",
+        help=(
+            "cross-view: genuine = front x side (historical). "
+            "same-view: genuine = same view across acquisitions, with view-matched impostors "
+            "(the geometry regime where correspondence is achievable). "
+            "both: --genuine-pairs of each."
+        ),
+    )
+    parser.add_argument(
         "--methods",
         type=str,
         nargs="+",
@@ -1286,6 +1363,7 @@ def main() -> int:
         genuine_count=int(args.genuine_pairs),
         impostor_count=int(args.impostor_pairs),
         seed=int(args.seed),
+        genuine_mode=str(args.genuine_mode),
     )
     unique_records = unique_records_from_pairs(pairs)
 

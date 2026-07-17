@@ -1816,6 +1816,7 @@ def train_model(args: argparse.Namespace) -> dict[str, Any]:
                     seed=int(args.seed),
                     repeat_dist_px=float(args.pair_eval_dist_px),
                     repeat_angle_deg=float(args.pair_eval_angle_deg),
+                    pair_view_mode=str(args.pair_eval_view_mode),
                 )
                 if pair_metrics is not None:
                     record["pair_metrics"] = pair_metrics
@@ -2042,6 +2043,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--pair-eval-every", type=int, default=1, help="Run pair evaluation every N validation epochs (logging only; selection on pair_auc always runs).")
     parser.add_argument("--pair-eval-method", type=str, default="LSA", help="MCC method for pair scoring.")
+    parser.add_argument(
+        "--pair-eval-view-mode",
+        choices=("cross-view", "same-view", "all"),
+        default="cross-view",
+        help=(
+            "Pair construction for pair AUC/repeatability. cross-view (historical) sits at the "
+            "correspondence chance floor; same-view (same view across acquisitions) measures the "
+            "achievable regime and is the recommended monitor."
+        ),
+    )
     parser.add_argument(
         "--pair-eval-unwarp",
         choices=("none", "gradient"),

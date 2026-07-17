@@ -112,21 +112,90 @@ def build_pairs(
     rng = random.Random(seed)
 
     impostor_candidates: list[tuple[int, int]] = []
-    if len(identity_keys) >= 2:
-        seen: set[tuple[int, int]] = set()
-        max_attempts = max(1000, max_impostor * 500)
-        attempts = 0
-        target_impostor = max_impostor if max_impostor > 0 else 0
-        while len(impostor_candidates) < target_impostor and attempts < max_attempts:
-            attempts += 1
-            key_a, key_b = rng.sample(identity_keys, 2)
-            a = rng.choice(by_identity[key_a])
-            b = rng.choice(by_identity[key_b])
-            pair = (a, b) if a < b else (b, a)
-            if pair in seen:
-                continue
-            seen.add(pair)
-            impostor_candidates.append(pair)
+    _fill_impostor_pairs(
+        samples,
+        by_identity,
+        impostor_candidates,
+        rng=rng,
+        max_impostor=max_impostor,
+        require_same_view=False,
+    )
+
+    rng.shuffle(genuine_candidates)
+    if max_genuine > 0:
+        genuine_candidates = genuine_candidates[:max_genuine]
+    return genuine_candidates, impostor_candidates
+
+
+def _fill_impostor_pairs(
+    samples: Sequence[Mapping[str, Any]],
+    by_identity: dict[Any, list[int]],
+    impostor_candidates: list[tuple[int, int]],
+    *,
+    rng: random.Random,
+    max_impostor: int,
+    require_same_view: bool,
+) -> None:
+    identity_keys = list(by_identity.keys())
+    if len(identity_keys) < 2:
+        return
+    seen: set[tuple[int, int]] = set()
+    max_attempts = max(1000, max_impostor * 500)
+    attempts = 0
+    target_impostor = max_impostor if max_impostor > 0 else 0
+    while len(impostor_candidates) < target_impostor and attempts < max_attempts:
+        attempts += 1
+        key_a, key_b = rng.sample(identity_keys, 2)
+        a = rng.choice(by_identity[key_a])
+        b = rng.choice(by_identity[key_b])
+        if require_same_view and _view_index(samples[a]) != _view_index(samples[b]):
+            continue
+        pair = (a, b) if a < b else (b, a)
+        if pair in seen:
+            continue
+        seen.add(pair)
+        impostor_candidates.append(pair)
+
+
+def build_same_view_pairs(
+    samples: Sequence[Mapping[str, Any]],
+    *,
+    max_genuine: int,
+    max_impostor: int,
+    seed: int,
+) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
+    """Same-pose pairs: genuine = same identity, SAME view index, different
+    acquisition; impostor = different identity, same view index.
+
+    Cross-view (front x side) correspondence sits at the chance floor with the
+    current labels/transport, so monitoring it measures noise. Same-view pairs
+    are the geometry regime where capture-to-capture repeatability is real.
+    """
+    by_identity: dict[Any, list[int]] = {}
+    for index, sample in enumerate(samples):
+        by_identity.setdefault(_identity_key(sample), []).append(index)
+
+    genuine_candidates: list[tuple[int, int]] = []
+    for indices in by_identity.values():
+        for i_pos in range(len(indices)):
+            for j_pos in range(i_pos + 1, len(indices)):
+                a, b = indices[i_pos], indices[j_pos]
+                if _view_index(samples[a]) != _view_index(samples[b]):
+                    continue
+                if samples[a].get("acquisition_id") == samples[b].get("acquisition_id"):
+                    continue
+                genuine_candidates.append((a, b))
+
+    rng = random.Random(seed)
+    impostor_candidates: list[tuple[int, int]] = []
+    _fill_impostor_pairs(
+        samples,
+        by_identity,
+        impostor_candidates,
+        rng=rng,
+        max_impostor=max_impostor,
+        require_same_view=True,
+    )
 
     rng.shuffle(genuine_candidates)
     if max_genuine > 0:
@@ -342,17 +411,38 @@ def evaluate_pairs(
     side_views: Sequence[int] = (1, 2),
     repeat_dist_px: float = 25.0,
     repeat_angle_deg: float = 30.0,
+    pair_view_mode: str = "cross-view",
 ) -> dict[str, Any] | None:
     """Evaluate held-out pair AUC/EER + repeatability. Returns ``None`` if no
-    genuine pairs can be formed (caller should fall back to another metric)."""
+    genuine pairs can be formed (caller should fall back to another metric).
+
+    ``pair_view_mode``: "cross-view" (front x side / side x side — historical),
+    "same-view" (same view across acquisitions — the regime where minutia
+    correspondence is achievable), or "all" (both)."""
     resolved_device = torch.device(device)
-    genuine_pairs, impostor_pairs = build_pairs(
-        samples,
-        max_genuine=max_genuine,
-        max_impostor=max_impostor,
-        seed=seed,
-        side_views=side_views,
-    )
+    genuine_pairs: list[tuple[int, int]] = []
+    impostor_pairs: list[tuple[int, int]] = []
+    if pair_view_mode in ("cross-view", "all"):
+        cross_genuine, cross_impostor = build_pairs(
+            samples,
+            max_genuine=max_genuine,
+            max_impostor=max_impostor,
+            seed=seed,
+            side_views=side_views,
+        )
+        genuine_pairs.extend(cross_genuine)
+        impostor_pairs.extend(cross_impostor)
+    if pair_view_mode in ("same-view", "all"):
+        same_genuine, same_impostor = build_same_view_pairs(
+            samples,
+            max_genuine=max_genuine,
+            max_impostor=max_impostor,
+            seed=seed + 1,
+        )
+        genuine_pairs.extend(same_genuine)
+        impostor_pairs.extend(same_impostor)
+    if pair_view_mode not in ("cross-view", "same-view", "all"):
+        raise ValueError(f"unsupported pair_view_mode: {pair_view_mode}")
     if not genuine_pairs:
         return None
 
@@ -437,6 +527,7 @@ def evaluate_pairs(
         "n_repeat_pairs": len(repeat_rates),
         "method": method,
         "unwarp": unwarp,
+        "pair_view_mode": pair_view_mode,
     }
 
 

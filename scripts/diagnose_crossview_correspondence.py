@@ -62,7 +62,7 @@ from featurenet.models.infer import (  # noqa: E402  (imports ensure_stdlib_copy
     unwarp_minutiae_rows,
     _resolve_device,
 )
-from featurenet.models.pair_eval import build_pairs, _angle_diff  # noqa: E402
+from featurenet.models.pair_eval import build_pairs, build_same_view_pairs, _angle_diff  # noqa: E402
 from featurenet.models.train import load_bundle_samples, split_samples  # noqa: E402
 
 import numpy as np  # noqa: E402
@@ -433,63 +433,6 @@ def _summarize(rows: list[dict[str, Any]], label: str) -> dict[str, Any]:
         values = [float(r[key]) for r in rows if r.get(key) not in ("", None)]
         summary[key] = round(float(np.mean(values)), 4) if values else ""
     return summary
-
-
-def build_same_view_pairs(
-    samples: Sequence[Mapping[str, Any]],
-    *,
-    max_genuine: int,
-    max_impostor: int,
-    seed: int,
-) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
-    """Same-pose pairs: genuine = same identity, SAME view index, different
-    acquisition; impostor = different identity, same view index. This is the
-    case the cross-view pair builder never produces (it has no front x front),
-    and it isolates capture-to-capture detection repeatability from cross-view
-    geometry."""
-    from featurenet.models.pair_eval import _identity_key, _view_index
-
-    by_identity: dict[Any, list[int]] = {}
-    for index, sample in enumerate(samples):
-        by_identity.setdefault(_identity_key(sample), []).append(index)
-
-    genuine: list[tuple[int, int]] = []
-    for indices in by_identity.values():
-        for i_pos in range(len(indices)):
-            for j_pos in range(i_pos + 1, len(indices)):
-                a, b = indices[i_pos], indices[j_pos]
-                if _view_index(samples[a]) != _view_index(samples[b]):
-                    continue
-                if samples[a].get("acquisition_id") == samples[b].get("acquisition_id"):
-                    continue
-                genuine.append((a, b))
-
-    rng = random.Random(seed)
-    rng.shuffle(genuine)
-    if max_genuine > 0:
-        genuine = genuine[:max_genuine]
-
-    by_view: dict[int, list[int]] = {}
-    for index, sample in enumerate(samples):
-        by_view.setdefault(_view_index(sample), []).append(index)
-    impostor: list[tuple[int, int]] = []
-    seen: set[tuple[int, int]] = set()
-    attempts = 0
-    while len(impostor) < max_impostor and attempts < max(1000, max_impostor * 500):
-        attempts += 1
-        view = rng.choice(sorted(by_view.keys()))
-        candidates = by_view[view]
-        if len(candidates) < 2:
-            continue
-        a, b = rng.sample(candidates, 2)
-        if _identity_key(samples[a]) == _identity_key(samples[b]):
-            continue
-        pair = (a, b) if a < b else (b, a)
-        if pair in seen:
-            continue
-        seen.add(pair)
-        impostor.append(pair)
-    return genuine, impostor
 
 
 def main() -> None:

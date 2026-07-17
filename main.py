@@ -31,6 +31,7 @@ import pandas as pd
 import cv2
 import numpy as np
 import math
+from typing import Any
 from descriptor import MCCCell, MCCCylinder, MCCOverlapContext
 import pose_normalization as pose_norm
 
@@ -2181,6 +2182,194 @@ def match_minutiae_csv_centroid_details(
     return score, sim_matrix, details
 
 
+MCC_RANSAC_ITERATIONS = 3000
+MCC_RANSAC_INLIER_DIST_PX = 25.0
+MCC_RANSAC_ANGLE_TOL = math.pi / 6.0
+MCC_RANSAC_MIN_SEGMENT_PX = 30.0
+MCC_RANSAC_SCALE_RANGE = (0.6, 1.6)
+MCC_RANSAC_SEED = 13
+
+
+def _estimate_ransac_similarity(
+    frame_a: pd.DataFrame,
+    frame_b: pd.DataFrame,
+    *,
+    iterations: int = MCC_RANSAC_ITERATIONS,
+    inlier_dist_px: float = MCC_RANSAC_INLIER_DIST_PX,
+    angle_tol_rad: float = MCC_RANSAC_ANGLE_TOL,
+    min_segment_px: float = MCC_RANSAC_MIN_SEGMENT_PX,
+    scale_range: tuple[float, float] = MCC_RANSAC_SCALE_RANGE,
+    seed: int = MCC_RANSAC_SEED,
+) -> dict[str, float] | None:
+    """Best global similarity mapping frame_b onto frame_a, found by RANSAC
+    over minutia segment correspondences.
+
+    Diagnostics showed this prealignment roughly doubles the genuine
+    counterpart rate versus centroid-only, while the ridge-orientation
+    rotation estimate used by LSA-CENTROID actively misaligns. Parameters
+    follow ``_transform_minutiae_frame`` conventions (scale/rotation about the
+    origin, then translation; angles shifted by the rotation).
+    """
+    pts_a = frame_a[["x", "y"]].to_numpy(dtype=np.float64)
+    pts_b = frame_b[["x", "y"]].to_numpy(dtype=np.float64)
+    ang_a = frame_a["angle"].to_numpy(dtype=np.float64)
+    ang_b = frame_b["angle"].to_numpy(dtype=np.float64)
+    n_a, n_b = pts_a.shape[0], pts_b.shape[0]
+    if n_a < 2 or n_b < 2:
+        return None
+
+    rng = np.random.default_rng(seed)
+    best_inliers = -1
+    best_params: tuple[float, float, float, float] | None = None
+
+    def _angle_delta(a: float, b: float) -> float:
+        diff = abs((a - b) % (2.0 * math.pi))
+        return min(diff, 2.0 * math.pi - diff)
+
+    def _count_inliers(scale: float, rotation: float, tx: float, ty: float) -> int:
+        cos_r = math.cos(rotation) * scale
+        sin_r = math.sin(rotation) * scale
+        moved_x = cos_r * pts_b[:, 0] - sin_r * pts_b[:, 1] + tx
+        moved_y = sin_r * pts_b[:, 0] + cos_r * pts_b[:, 1] + ty
+        moved_ang = ang_b + rotation
+        inliers = 0
+        for index in range(n_a):
+            distances = np.hypot(moved_x - pts_a[index, 0], moved_y - pts_a[index, 1])
+            for cand in np.nonzero(distances <= inlier_dist_px)[0]:
+                if _angle_delta(float(ang_a[index]), float(moved_ang[cand])) <= angle_tol_rad:
+                    inliers += 1
+                    break
+        return inliers
+
+    for _ in range(int(iterations)):
+        i, j = rng.choice(n_a, size=2, replace=False)
+        k, l = rng.choice(n_b, size=2, replace=False)
+        seg_a = pts_a[j] - pts_a[i]
+        seg_b = pts_b[l] - pts_b[k]
+        len_a = float(np.hypot(seg_a[0], seg_a[1]))
+        len_b = float(np.hypot(seg_b[0], seg_b[1]))
+        if len_a < min_segment_px or len_b < min_segment_px:
+            continue
+        scale = len_a / len_b
+        if not (scale_range[0] <= scale <= scale_range[1]):
+            continue
+        rotation = math.atan2(seg_a[1], seg_a[0]) - math.atan2(seg_b[1], seg_b[0])
+        if _angle_delta(float(ang_b[k]) + rotation, float(ang_a[i])) > angle_tol_rad:
+            continue
+        cos_r = math.cos(rotation) * scale
+        sin_r = math.sin(rotation) * scale
+        tx = float(pts_a[i, 0]) - (cos_r * float(pts_b[k, 0]) - sin_r * float(pts_b[k, 1]))
+        ty = float(pts_a[i, 1]) - (sin_r * float(pts_b[k, 0]) + cos_r * float(pts_b[k, 1]))
+        inliers = _count_inliers(scale, rotation, tx, ty)
+        if inliers > best_inliers:
+            best_inliers = inliers
+            best_params = (scale, rotation, tx, ty)
+
+    if best_params is None:
+        return None
+    scale, rotation, tx, ty = best_params
+    return {
+        "scale": float(scale),
+        "rotation": float(rotation),
+        "translation_x": float(tx),
+        "translation_y": float(ty),
+        "inliers": float(best_inliers),
+    }
+
+
+def _base_method_for_ransac(method: str) -> str:
+    normalized = method.upper()
+    if normalized == "LSA-RANSAC":
+        return "LSA"
+    if normalized == "LSA-R-RANSAC":
+        return "LSA-R"
+    raise ValueError(f"unsupported RANSAC MCC method: {method}")
+
+
+def match_minutiae_csv_ransac_details(
+    path_a: Path | pd.DataFrame,
+    path_b: Path | pd.DataFrame,
+    method: str = "LSA-RANSAC",
+) -> tuple[float, np.ndarray, dict]:
+    """RANSAC-similarity prealignment + MCC matching.
+
+    Estimates the best global similarity between the two minutiae sets
+    directly from the points (no masks/sidecars needed), transforms B into A's
+    frame, and matches with the base LSA/LSA-R method.
+    """
+    base_method = _base_method_for_ransac(method)
+    frame_a = _load_minutiae_frame_for_centroid(path_a)
+    frame_b = _load_minutiae_frame_for_centroid(path_b)
+    details: dict[str, Any] = {
+        "fallback_to_legacy": False,
+        "fallback_reason": None,
+        "method": method.upper(),
+        "base_method": base_method,
+        "left_raw_minutiae_count": int(len(frame_a)),
+        "right_raw_minutiae_count": int(len(frame_b)),
+        "left_descriptor_count_after": 0,
+        "right_descriptor_count_after": 0,
+        "selected_pair_count": 0,
+        "selected_pairs": [],
+        "selected_pair_scores": [],
+        "relaxed_top_scores": [],
+        "relaxation_details": None,
+        "transform": None,
+    }
+
+    if len(frame_a) < 2 or len(frame_b) < 2:
+        details["fallback_reason"] = "too_few_minutiae_for_ransac"
+        return 0.0, np.zeros((0, 0), dtype=np.float32), details
+
+    transform = _estimate_ransac_similarity(frame_a, frame_b)
+    if transform is None:
+        details["fallback_reason"] = "ransac_no_transform"
+        return 0.0, np.zeros((0, 0), dtype=np.float32), details
+    details["transform"] = {
+        **{key: float(value) for key, value in transform.items()},
+        "rotation_degrees": math.degrees(float(transform["rotation"])),
+    }
+
+    normalized_b = _transform_minutiae_frame(
+        frame_b,
+        scale=float(transform["scale"]),
+        rotation=float(transform["rotation"]),
+        translation_x=float(transform["translation_x"]),
+        translation_y=float(transform["translation_y"]),
+    )
+
+    descriptors_a = build_descriptors(frame_a, validity_mask_path=None, validity_mode="auto")
+    descriptors_b = build_descriptors(normalized_b, validity_mask_path=None, validity_mode="auto")
+    details["left_descriptor_count_after"] = int(len(descriptors_a))
+    details["right_descriptor_count_after"] = int(len(descriptors_b))
+    if len(descriptors_a) == 0 or len(descriptors_b) == 0:
+        details["fallback_reason"] = "no_descriptors_after_ransac_normalization"
+        return 0.0, np.zeros((len(descriptors_a), len(descriptors_b)), dtype=np.float32), details
+
+    score, sim_matrix = match_descriptors(
+        descriptors_a,
+        descriptors_b,
+        method=base_method,
+        overlap_mode="off",
+    )
+    selected_pairs, relaxed_top_scores, relaxation_details = _select_report_pairs(
+        descriptors_a,
+        descriptors_b,
+        sim_matrix,
+        base_method,
+    )
+    details["selected_pair_count"] = int(len(selected_pairs))
+    details["selected_pairs"] = [
+        {"row": int(row), "col": int(col), "score": float(pair_score)}
+        for row, col, pair_score in selected_pairs
+    ]
+    details["selected_pair_scores"] = [float(pair_score) for _, _, pair_score in selected_pairs]
+    details["relaxed_top_scores"] = relaxed_top_scores
+    details["relaxation_details"] = relaxation_details
+    details["final_score"] = float(score)
+    return score, sim_matrix, details
+
+
 def match_minutiae_csv_legacy(
     path_a: Path | pd.DataFrame,
     path_b: Path | pd.DataFrame,
@@ -3115,6 +3304,8 @@ def match_descriptors(
         "LSA-R-CANONICAL-OVERLAP",
         "LSA-CENTROID",
         "LSA-R-CENTROID",
+        "LSA-RANSAC",
+        "LSA-R-RANSAC",
     }:
         raise ValueError(
             f"{normalized_method} requires minutiae CSV inputs, not prebuilt descriptors"
@@ -3163,6 +3354,13 @@ def match_minutiae_csv(
     overlap_mode: str = "auto",
 ) -> tuple[float, np.ndarray]:
     normalized_method = method.upper()
+    if normalized_method in {"LSA-RANSAC", "LSA-R-RANSAC"}:
+        score, sim_matrix, _ = match_minutiae_csv_ransac_details(
+            path_a,
+            path_b,
+            method=method,
+        )
+        return score, sim_matrix
     if normalized_method in {"LSA-CENTROID", "LSA-R-CENTROID"}:
         score, sim_matrix, _ = match_minutiae_csv_centroid_details(
             path_a,
@@ -3239,6 +3437,9 @@ def _match_status_from_details(details: dict) -> str:
         "no_descriptors_after_normalization",
         "no_descriptors",
         "too_few_overlap_minutiae",
+        "too_few_minutiae_for_ransac",
+        "ransac_no_transform",
+        "no_descriptors_after_ransac_normalization",
     }
     if reason in insufficient_reasons:
         return f"reject_insufficient:{reason}"
@@ -3263,7 +3464,13 @@ def match_minutiae_csv_with_details(
     dict carrying ``match_status``, descriptor counts, and selected pair count
     so downstream evaluation can separate real 0.0 scores from failed matches."""
     normalized_method = method.upper()
-    if normalized_method in {"LSA-CENTROID", "LSA-R-CENTROID"}:
+    if normalized_method in {"LSA-RANSAC", "LSA-R-RANSAC"}:
+        score, sim_matrix, details = match_minutiae_csv_ransac_details(
+            path_a,
+            path_b,
+            method=method,
+        )
+    elif normalized_method in {"LSA-CENTROID", "LSA-R-CENTROID"}:
         score, sim_matrix, details = match_minutiae_csv_centroid_details(
             path_a,
             path_b,
