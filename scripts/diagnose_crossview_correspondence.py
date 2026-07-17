@@ -435,12 +435,79 @@ def _summarize(rows: list[dict[str, Any]], label: str) -> dict[str, Any]:
     return summary
 
 
+def build_same_view_pairs(
+    samples: Sequence[Mapping[str, Any]],
+    *,
+    max_genuine: int,
+    max_impostor: int,
+    seed: int,
+) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
+    """Same-pose pairs: genuine = same identity, SAME view index, different
+    acquisition; impostor = different identity, same view index. This is the
+    case the cross-view pair builder never produces (it has no front x front),
+    and it isolates capture-to-capture detection repeatability from cross-view
+    geometry."""
+    from featurenet.models.pair_eval import _identity_key, _view_index
+
+    by_identity: dict[Any, list[int]] = {}
+    for index, sample in enumerate(samples):
+        by_identity.setdefault(_identity_key(sample), []).append(index)
+
+    genuine: list[tuple[int, int]] = []
+    for indices in by_identity.values():
+        for i_pos in range(len(indices)):
+            for j_pos in range(i_pos + 1, len(indices)):
+                a, b = indices[i_pos], indices[j_pos]
+                if _view_index(samples[a]) != _view_index(samples[b]):
+                    continue
+                if samples[a].get("acquisition_id") == samples[b].get("acquisition_id"):
+                    continue
+                genuine.append((a, b))
+
+    rng = random.Random(seed)
+    rng.shuffle(genuine)
+    if max_genuine > 0:
+        genuine = genuine[:max_genuine]
+
+    by_view: dict[int, list[int]] = {}
+    for index, sample in enumerate(samples):
+        by_view.setdefault(_view_index(sample), []).append(index)
+    impostor: list[tuple[int, int]] = []
+    seen: set[tuple[int, int]] = set()
+    attempts = 0
+    while len(impostor) < max_impostor and attempts < max(1000, max_impostor * 500):
+        attempts += 1
+        view = rng.choice(sorted(by_view.keys()))
+        candidates = by_view[view]
+        if len(candidates) < 2:
+            continue
+        a, b = rng.sample(candidates, 2)
+        if _identity_key(samples[a]) == _identity_key(samples[b]):
+            continue
+        pair = (a, b) if a < b else (b, a)
+        if pair in seen:
+            continue
+        seen.add(pair)
+        impostor.append(pair)
+    return genuine, impostor
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument("--ground-truth-root", type=Path, required=True)
     parser.add_argument("--weights-path", type=Path, required=True)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--max-pairs", type=int, default=100, help="Genuine cross-view pairs to evaluate.")
+    parser.add_argument(
+        "--pair-mode",
+        choices=("cross-view", "same-view", "all"),
+        default="cross-view",
+        help=(
+            "cross-view: front x side / side x side (pair_eval's genuine set). "
+            "same-view: same view index across acquisitions (front x front etc.) — "
+            "isolates capture repeatability from cross-view geometry. all: both."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=13, help="Must match training seed to reproduce the val split.")
     parser.add_argument(
         "--val-fraction",
@@ -466,16 +533,31 @@ def main() -> None:
         val_samples = samples
     print(f"[diag] loaded {len(samples)} samples, {len(val_samples)} in the pair pool", flush=True)
 
-    genuine_pairs, impostor_pairs = build_pairs(
-        val_samples,
-        max_genuine=int(args.max_pairs),
-        max_impostor=int(args.max_pairs),
-        seed=int(args.seed),
-    )
+    genuine_pairs: list[tuple[int, int]] = []
+    impostor_pairs: list[tuple[int, int]] = []
+    if args.pair_mode in ("cross-view", "all"):
+        cross_genuine, cross_impostor = build_pairs(
+            val_samples,
+            max_genuine=int(args.max_pairs),
+            max_impostor=int(args.max_pairs),
+            seed=int(args.seed),
+        )
+        genuine_pairs.extend(cross_genuine)
+        impostor_pairs.extend(cross_impostor)
+    if args.pair_mode in ("same-view", "all"):
+        same_genuine, same_impostor = build_same_view_pairs(
+            val_samples,
+            max_genuine=int(args.max_pairs),
+            max_impostor=int(args.max_pairs),
+            seed=int(args.seed) + 1,
+        )
+        genuine_pairs.extend(same_genuine)
+        impostor_pairs.extend(same_impostor)
     if not genuine_pairs:
-        raise SystemExit("no genuine cross-view pairs could be formed from the val split")
+        raise SystemExit(f"no genuine pairs could be formed from the pool (pair mode {args.pair_mode})")
     print(
-        f"[diag] evaluating {len(genuine_pairs)} genuine + {len(impostor_pairs)} impostor pairs",
+        f"[diag] evaluating {len(genuine_pairs)} genuine + {len(impostor_pairs)} impostor pairs "
+        f"(mode {args.pair_mode})",
         flush=True,
     )
 
@@ -503,7 +585,13 @@ def main() -> None:
         if ex_a is None or ex_b is None:
             continue
         view_a, view_b = ex_a["raw_view_index"], ex_b["raw_view_index"]
-        view_combo = "front_side" if 0 in (view_a, view_b) else "side_side"
+        if view_a == view_b:
+            view_combo = "same_view"
+        elif 0 in (view_a, view_b):
+            view_combo = "front_side"
+        else:
+            view_combo = "side_side"
+        view_pair = f"v{min(view_a, view_b)}v{max(view_a, view_b)}"
         same_acquisition = (
             label == "genuine"
             and ex_a.get("acquisition_id") is not None
@@ -517,6 +605,7 @@ def main() -> None:
             "a_view": view_a,
             "b_view": view_b,
             "view_combo": view_combo,
+            "view_pair": view_pair,
             "same_acquisition": str(same_acquisition).lower(),
             "a_model_count": len(ex_a["model_raw"]),
             "b_model_count": len(ex_b["model_raw"]),
@@ -559,12 +648,16 @@ def main() -> None:
     groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in pair_rows:
         label = row["label"]
+        prefix = "gen" if label == "genuine" else "imp"
         groups[label].append(row)
+        groups[f"{prefix}_{row['view_combo']}"].append(row)
+        groups[f"{prefix}_{row['view_pair']}"].append(row)
         if label == "genuine":
-            groups[f"gen_{row['view_combo']}"].append(row)
             groups["gen_same_acq" if row["same_acquisition"] == "true" else "gen_cross_acq"].append(row)
 
-    summaries = [_summarize(rows, label) for label, rows in groups.items()]
+    ordered_labels = [key for key in ("genuine", "impostor") if key in groups]
+    ordered_labels += sorted(key for key in groups if key not in ("genuine", "impostor"))
+    summaries = [_summarize(groups[label], label) for label in ordered_labels]
     summary_csv = output_dir / "crossview_summary.csv"
     summary_fields = ["group", "pairs"] + [f"{s}_{f}_{a}" for s, f, a in CELLS]
     with summary_csv.open("w", newline="", encoding="utf-8") as handle:
