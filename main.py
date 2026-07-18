@@ -2277,11 +2277,14 @@ def _estimate_ransac_similarity(
     }
 
 
+RANSAC_METHOD_NAMES = {"LSA-RANSAC", "LSA-R-RANSAC", "LSA-RANSAC-FUSED", "LSA-R-RANSAC-FUSED"}
+
+
 def _base_method_for_ransac(method: str) -> str:
     normalized = method.upper()
-    if normalized == "LSA-RANSAC":
+    if normalized in {"LSA-RANSAC", "LSA-RANSAC-FUSED"}:
         return "LSA"
-    if normalized == "LSA-R-RANSAC":
+    if normalized in {"LSA-R-RANSAC", "LSA-R-RANSAC-FUSED"}:
         return "LSA-R"
     raise ValueError(f"unsupported RANSAC MCC method: {method}")
 
@@ -2325,6 +2328,14 @@ def match_minutiae_csv_ransac_details(
     if transform is None:
         details["fallback_reason"] = "ransac_no_transform"
         return 0.0, np.zeros((0, 0), dtype=np.float32), details
+    # Fraction of A-minutiae with an aligned counterpart. Genuine same-pose
+    # pairs align ~0.5 of their minutiae, impostors ~0.25 — evidence that is
+    # largely independent of descriptor similarity, so the FUSED variants blend
+    # it into the final score instead of discarding it after alignment.
+    inlier_ratio = float(
+        min(1.0, max(0.0, transform["inliers"]) / max(1.0, float(len(frame_a))))
+    )
+    details["ransac_inlier_ratio"] = inlier_ratio
     details["transform"] = {
         **{key: float(value) for key, value in transform.items()},
         "rotation_degrees": math.degrees(float(transform["rotation"])),
@@ -2366,6 +2377,14 @@ def match_minutiae_csv_ransac_details(
     details["selected_pair_scores"] = [float(pair_score) for _, _, pair_score in selected_pairs]
     details["relaxed_top_scores"] = relaxed_top_scores
     details["relaxation_details"] = relaxation_details
+    details["descriptor_score"] = float(score)
+
+    if method.upper().endswith("-FUSED"):
+        # Geometric mean keeps the score in [0,1], monotone in both signals,
+        # and pulls impostors (high sim floor x low inlier ratio) down harder
+        # than genuine pairs.
+        score = math.sqrt(max(0.0, float(score)) * inlier_ratio)
+
     details["final_score"] = float(score)
     return score, sim_matrix, details
 
@@ -3304,8 +3323,7 @@ def match_descriptors(
         "LSA-R-CANONICAL-OVERLAP",
         "LSA-CENTROID",
         "LSA-R-CENTROID",
-        "LSA-RANSAC",
-        "LSA-R-RANSAC",
+        *RANSAC_METHOD_NAMES,
     }:
         raise ValueError(
             f"{normalized_method} requires minutiae CSV inputs, not prebuilt descriptors"
@@ -3354,7 +3372,7 @@ def match_minutiae_csv(
     overlap_mode: str = "auto",
 ) -> tuple[float, np.ndarray]:
     normalized_method = method.upper()
-    if normalized_method in {"LSA-RANSAC", "LSA-R-RANSAC"}:
+    if normalized_method in RANSAC_METHOD_NAMES:
         score, sim_matrix, _ = match_minutiae_csv_ransac_details(
             path_a,
             path_b,
@@ -3464,7 +3482,7 @@ def match_minutiae_csv_with_details(
     dict carrying ``match_status``, descriptor counts, and selected pair count
     so downstream evaluation can separate real 0.0 scores from failed matches."""
     normalized_method = method.upper()
-    if normalized_method in {"LSA-RANSAC", "LSA-R-RANSAC"}:
+    if normalized_method in RANSAC_METHOD_NAMES:
         score, sim_matrix, details = match_minutiae_csv_ransac_details(
             path_a,
             path_b,

@@ -897,6 +897,7 @@ def _match_pair_task(job: dict[str, Any]) -> dict[str, Any]:
             overlap_mode="auto",
         )
         shape = getattr(sim_matrix, "shape", ())
+        transform = details.get("transform") or {}
         job.update(
             {
                 "status": "ok",
@@ -906,6 +907,11 @@ def _match_pair_task(job: dict[str, Any]) -> dict[str, Any]:
                 "a_descriptor_count": details.get("left_descriptor_count_after", ""),
                 "b_descriptor_count": details.get("right_descriptor_count_after", ""),
                 "selected_pair_count": details.get("selected_pair_count", ""),
+                "descriptor_score": details.get("descriptor_score", ""),
+                "ransac_inlier_ratio": details.get("ransac_inlier_ratio", ""),
+                "ransac_inliers": transform.get("inliers", ""),
+                "ransac_rotation_deg": transform.get("rotation_degrees", ""),
+                "ransac_scale": transform.get("scale", ""),
                 "error": "",
             }
         )
