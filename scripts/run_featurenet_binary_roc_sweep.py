@@ -415,6 +415,35 @@ def sample_impostor_pairs(
     return pairs
 
 
+def filter_records_to_holdout_identities(
+    records: list[ImageRecord],
+    ground_truth_root: Path,
+    *,
+    val_fraction: float,
+    split_seed: int,
+) -> list[ImageRecord]:
+    """Keep only records whose identity is in the training pipeline's held-out
+    validation split, so the benchmark identities are disjoint from the
+    detector's training identities. Uses the exact same
+    load_bundle_samples + split_samples grouping (finger_class_id) as training,
+    matched via resolved masked-image paths (the merged GT root uses symlinks)."""
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT))
+    from featurenet.models.train import load_bundle_samples, split_samples
+
+    samples = load_bundle_samples(ground_truth_root)
+    _, val_samples = split_samples(samples, val_fraction=float(val_fraction), seed=int(split_seed))
+    val_paths = {str(Path(sample["masked_image"]).resolve()) for sample in val_samples}
+    kept = [record for record in records if str(Path(record.image_path).resolve()) in val_paths]
+    print(
+        f"[identity-holdout] kept {len(kept)}/{len(records)} images "
+        f"({len(val_samples)} held-out val samples, split seed {split_seed}, "
+        f"val fraction {val_fraction})",
+        flush=True,
+    )
+    return kept
+
+
 def sample_binary_pairs(
     records: list[ImageRecord],
     *,
@@ -1311,6 +1340,18 @@ def parse_args() -> argparse.Namespace:
         help="Test-time rotation ensemble angles in degrees (e.g. -6 -3 3 6). Averages the minutia score map across rotations.",
     )
     parser.add_argument(
+        "--identity-holdout",
+        choices=("none", "val"),
+        default="none",
+        help=(
+            "val: restrict the benchmark to identities in the training pipeline's held-out "
+            "validation split (identity-disjoint from the detector's training set). "
+            "Requires --ground-truth-root."
+        ),
+    )
+    parser.add_argument("--holdout-val-fraction", type=float, default=0.2, help="Must match the training --val-fraction.")
+    parser.add_argument("--holdout-seed", type=int, default=13, help="Must match the training --seed.")
+    parser.add_argument(
         "--solov2-score-thr",
         type=float,
         default=0.15,
@@ -1363,6 +1404,17 @@ def main() -> int:
         records = discover_archive_images(archive_root, side_views=side_views)
         if not records:
             raise RuntimeError(f"no raw images discovered under archive root: {archive_root}")
+    if str(args.identity_holdout) == "val":
+        if ground_truth_root is None:
+            raise ValueError("--identity-holdout val requires --ground-truth-root")
+        records = filter_records_to_holdout_identities(
+            records,
+            ground_truth_root,
+            val_fraction=float(args.holdout_val_fraction),
+            split_seed=int(args.holdout_seed),
+        )
+        if not records:
+            raise RuntimeError("identity holdout filter removed all records")
     pairs = sample_binary_pairs(
         records,
         side_views=side_views,
@@ -1537,6 +1589,10 @@ def main() -> int:
             "minutia_nms_enabled": bool(apply_nms),
             "unwarp": str(args.unwarp),
             "solov2_score_thr": float(args.solov2_score_thr),
+            "genuine_mode": str(args.genuine_mode),
+            "identity_holdout": str(args.identity_holdout),
+            "holdout_val_fraction": float(args.holdout_val_fraction),
+            "holdout_seed": int(args.holdout_seed),
         },
         "counts": {
             "discovered_image_count": len(records),
